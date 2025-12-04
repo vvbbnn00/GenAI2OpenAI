@@ -4,9 +4,18 @@ import json
 import uuid
 from datetime import datetime
 import re
+import argparse
 from icecream import ic 
 
 app = Flask(__name__)
+
+# 解析命令行参数
+parser = argparse.ArgumentParser(description='GenAI Flask API Server')
+parser.add_argument('--token', type=str, default='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3NjMzNjA2MzgsInVzZXJuYW1lIjoiMjAyNDEzNDAyMiJ9.b4E5VzUxkn0Kc1pxkKVipybRFCw47NcppBognTD39e8',
+                    help='GenAI API Access Token')
+parser.add_argument('--port', type=int, default=5000,
+                    help='Flask server port (default: 5000)')
+args = parser.parse_args()
 
 # GenAI API 配置
 GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"
@@ -21,7 +30,7 @@ GENAI_HEADERS = {
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-    "X-Access-Token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3NjMzNjA2MzgsInVzZXJuYW1lIjoiMjAyNDEzNDAyMiJ9.b4E5VzUxkn0Kc1pxkKVipybRFCw47NcppBognTD39e8",
+    "X-Access-Token": args.token,
     "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
@@ -75,8 +84,6 @@ def stream_genai_response(chat_info, messages, model, max_tokens):
     }
     
     try:
-        # 打印请求体
-        print(f"DEBUG: GenAI API Request Body: {json.dumps(genai_data, ensure_ascii=False)}")
         
         # 调用GenAI API
         response = requests.post(
@@ -291,4 +298,4 @@ def health_check():
 
 if __name__ == '__main__':
     # 运行Flask应用
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=args.port, debug=False)
