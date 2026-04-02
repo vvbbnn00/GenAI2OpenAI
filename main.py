@@ -9,14 +9,19 @@ import argparse
 import logging
 import time
 import os
+import base64
+import threading
+from urllib.parse import urlparse, parse_qs, quote
 
 app = Flask(__name__)
 CORS(app)
 
 # 解析命令行参数
 parser = argparse.ArgumentParser(description='GenAI Flask API Server')
-parser.add_argument('--token', type=str, default='eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3NjMzNjA2MzgsInVzZXJuYW1lIjoiMjAyNDEzNDAyMiJ9.b4E5VzUxkn0Kc1pxkKVipybRFCw47NcppBognTD39e8',
-                    help='GenAI API Access Token')
+parser.add_argument('--token', type=str, default=None,
+                    help='GenAI API Access Token (JWT)')
+parser.add_argument('--keystore', type=str, default=None,
+                    help='Path to shanghaitech-ids-passkey keystore file for auto-login/refresh')
 parser.add_argument('--port', type=int, default=5000,
                     help='Flask server port (default: 5000)')
 parser.add_argument('--debug', action='store_true',
@@ -24,6 +29,9 @@ parser.add_argument('--debug', action='store_true',
 parser.add_argument('--api-key', type=str, default=None,
                     help='API key for client authentication (or set API_KEY env var)')
 args = parser.parse_args()
+
+if not args.token and not args.keystore:
+    parser.error("At least one of --token or --keystore must be provided")
 
 # ============================================================
 # Logging 配置
@@ -41,6 +49,161 @@ if API_KEY:
     logger.info("API key authentication enabled")
 else:
     logger.info("No API key set — running in open mode (no auth)")
+
+
+# ============================================================
+# JWT Token 解析与管理
+# ============================================================
+
+def parse_jwt_payload(token):
+    """解析 JWT token payload（不验证签名），返回 dict"""
+    parts = token.split('.')
+    if len(parts) != 3:
+        raise ValueError("Invalid JWT token format")
+    payload_b64 = parts[1]
+    # 补齐 base64 padding
+    payload_b64 += '=' * (4 - len(payload_b64) % 4)
+    payload_bytes = base64.urlsafe_b64decode(payload_b64)
+    return json.loads(payload_bytes)
+
+
+# GenAI 通过 CAS 登录的 service URL
+GENAI_LOGIN_URL = "https://genai.shanghaitech.edu.cn/htk/user/login"
+GENAI_CAS_SERVICE_URL = (
+    "https://ids.shanghaitech.edu.cn/authserver/login"
+    "?service=" + quote(GENAI_LOGIN_URL, safe='')
+)
+
+
+class TokenManager:
+    """管理 GenAI JWT token 的获取与自动刷新。
+
+    支持两种模式：
+    1. 仅 --token：使用静态 token，过期后发出警告但无法自动刷新
+    2. --keystore（可选配合 --token）：使用 passkey 自动刷新 token
+    """
+
+    REFRESH_MARGIN = 300  # 距过期 5 分钟提前刷新
+
+    def __init__(self, token=None, keystore_path=None):
+        self._token = token
+        self._keystore_path = keystore_path
+        self._token_exp = None
+        self._lock = threading.Lock()
+
+        if token:
+            self._update_expiry()
+
+        # 如果只有 keystore 没有初始 token，立即获取
+        if not token and keystore_path:
+            logger.info("No initial token provided, logging in via passkey...")
+            self._refresh_token()
+
+    def _update_expiry(self):
+        """从当前 token 解析过期时间"""
+        if not self._token:
+            self._token_exp = None
+            return
+        try:
+            payload = parse_jwt_payload(self._token)
+            self._token_exp = payload.get('exp')
+            if self._token_exp:
+                exp_dt = datetime.fromtimestamp(self._token_exp)
+                remaining = self._token_exp - time.time()
+                logger.info("Token expires at %s (%.0f minutes remaining)",
+                            exp_dt.strftime('%Y-%m-%d %H:%M:%S'), remaining / 60)
+            username = payload.get('username')
+            if username:
+                logger.info("Token username: %s", username)
+        except Exception as e:
+            logger.warning("Failed to parse JWT token: %s", e)
+            self._token_exp = None
+
+    def _needs_refresh(self):
+        """检查 token 是否需要刷新"""
+        if not self._keystore_path:
+            return False  # 无法刷新
+        if not self._token:
+            return True
+        if not self._token_exp:
+            return False  # 无法判断过期时间，假设有效
+        return time.time() >= (self._token_exp - self.REFRESH_MARGIN)
+
+    def _refresh_token(self):
+        """使用 passkey 登录 IDS 并获取新的 GenAI token"""
+        if not self._keystore_path:
+            logger.warning("Token expired or missing, but no keystore configured for refresh")
+            return
+
+        try:
+            from shanghaitech_ids_passkey import IDSClient, PasskeyKeystore
+
+            logger.info("Refreshing GenAI token via passkey login...")
+            keystore = PasskeyKeystore.load(self._keystore_path)
+            client = IDSClient(keystore)
+            client.login()
+            logger.info("IDS passkey login successful for user: %s", keystore.username)
+
+            # 访问 GenAI 的 CAS service URL，让 IDS 签发 ticket 并跳转回 GenAI
+            response = client.session.get(
+                GENAI_CAS_SERVICE_URL,
+                allow_redirects=True,
+                timeout=30
+            )
+
+            # 从最终跳转 URL 中提取 token
+            final_url = response.url
+            logger.debug("Final redirect URL: %s", final_url)
+
+            parsed = urlparse(final_url)
+            params = parse_qs(parsed.query)
+
+            if 'token' in params:
+                self._token = params['token'][0]
+                self._update_expiry()
+                # 保存 keystore（sign_count 递增）
+                keystore.dump(self._keystore_path)
+                logger.info("GenAI token refreshed successfully")
+            else:
+                # 可能 token 在响应体中或其他位置
+                logger.error("Failed to extract token from redirect URL: %s", final_url)
+                # 尝试从响应历史中查找
+                for resp in response.history:
+                    loc = resp.headers.get('Location', '')
+                    if 'token=' in loc:
+                        parsed_loc = urlparse(loc)
+                        params_loc = parse_qs(parsed_loc.query)
+                        if 'token' in params_loc:
+                            self._token = params_loc['token'][0]
+                            self._update_expiry()
+                            keystore.dump(self._keystore_path)
+                            logger.info("GenAI token extracted from redirect history")
+                            return
+                raise RuntimeError(f"Could not extract GenAI token from login flow. Final URL: {final_url}")
+
+        except ImportError:
+            logger.error("shanghaitech-ids-passkey not installed. Install with: pip install shanghaitech-ids-passkey")
+            raise
+        except Exception as e:
+            logger.exception("Failed to refresh token via passkey")
+            raise
+
+    @property
+    def token(self):
+        """获取当前有效的 token，必要时自动刷新"""
+        with self._lock:
+            if self._needs_refresh():
+                self._refresh_token()
+            elif self._token and self._token_exp and not self._keystore_path:
+                # 仅 token 模式，检查是否即将过期
+                remaining = self._token_exp - time.time()
+                if remaining < self.REFRESH_MARGIN:
+                    logger.warning("Token expires in %.0f seconds but no keystore for auto-refresh!", remaining)
+            return self._token
+
+
+# 初始化 TokenManager
+token_manager = TokenManager(token=args.token, keystore_path=args.keystore)
 
 
 # ============================================================
@@ -111,7 +274,7 @@ def check_api_key():
 
 # GenAI API 配置
 GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"
-GENAI_HEADERS = {
+GENAI_BASE_HEADERS = {
     "Accept": "*/*, text/event-stream",
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
@@ -122,11 +285,17 @@ GENAI_HEADERS = {
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-    "X-Access-Token": args.token,
     "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
 }
+
+
+def get_genai_headers():
+    """获取带有当前有效 token 的 GenAI 请求 headers"""
+    headers = dict(GENAI_BASE_HEADERS)
+    headers["X-Access-Token"] = token_manager.token
+    return headers
 
 
 # ============================================================
@@ -407,7 +576,7 @@ def stream_genai_response(chat_info, messages, model, max_tokens):
         # 调用GenAI API
         response = requests.post(
             GENAI_URL,
-            headers=GENAI_HEADERS,
+            headers=get_genai_headers(),
             json=genai_data,
             stream=True,
             timeout=60
@@ -818,4 +987,8 @@ def health_check():
 if __name__ == '__main__':
     logger.info("Starting GenAI2OpenAI proxy on port %d", args.port)
     logger.info("Debug: %s, Auth: %s", args.debug, "enabled" if API_KEY else "disabled")
+    logger.info("Token mode: %s",
+                "passkey auto-refresh" if args.keystore else "static token (no auto-refresh)")
+    if args.keystore:
+        logger.info("Keystore: %s", args.keystore)
     app.run(host='0.0.0.0', port=args.port, debug=False)

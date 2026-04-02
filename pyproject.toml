@@ -8,4 +8,5 @@ dependencies = [
     "flask>=3.1.2",
     "flask-cors>=4.0.0",
     "requests>=2.32.5",
+    "shanghaitech-ids-passkey>=0.1.0",
 ]
