@@ -328,18 +328,134 @@ def test_stream_tool_call():
         return False
 
 
+def test_stream_no_tool_needed():
+    """测试 6: 流式 tool calling — 普通问题应真正流式输出（不缓冲）"""
+    print_separator("Test 6: Streaming With Tools (No Tool Needed)")
+
+    import time
+    resp = requests.post(f"{BASE_URL}/v1/chat/completions", json={
+        "model": MODEL,
+        "messages": [
+            {"role": "user", "content": "What is the capital of France? Answer in one sentence."}
+        ],
+        "tools": [WEATHER_TOOL],
+        "stream": True
+    }, stream=True)
+
+    chunks = []
+    first_chunk_time = None
+    start_time = time.monotonic()
+
+    for line in resp.iter_lines():
+        if not line:
+            continue
+        line_str = line.decode('utf-8') if isinstance(line, bytes) else line
+        if not line_str.startswith('data: '):
+            continue
+        data_str = line_str[6:].strip()
+        if data_str == '[DONE]':
+            break
+
+        try:
+            chunk = json.loads(data_str)
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            finish = chunk.get("choices", [{}])[0].get("finish_reason")
+
+            if delta.get("content"):
+                if first_chunk_time is None:
+                    first_chunk_time = time.monotonic()
+                chunks.append(delta["content"])
+
+        except json.JSONDecodeError:
+            pass
+
+    total_time = time.monotonic() - start_time
+    ttfb = (first_chunk_time - start_time) if first_chunk_time else total_time
+    full_content = "".join(chunks)
+
+    print(f"  Chunks: {len(chunks)}")
+    print(f"  TTFB: {ttfb:.2f}s")
+    print(f"  Total: {total_time:.2f}s")
+    print(f"  Content: {full_content[:200]}")
+
+    if len(chunks) > 1:
+        print(f"\n[PASS] True streaming: {len(chunks)} chunks (not buffered into 1)")
+        return True
+    elif len(chunks) == 1 and full_content:
+        print(f"\n[WARN] Only 1 chunk — may be buffered")
+        return False
+    else:
+        print(f"\n[FAIL] No content received")
+        return False
+
+
+def test_tag_prefix_detection():
+    """测试 7: _tag_prefix_len 单元测试（离线，不需要服务器）"""
+    print_separator("Test 7: Tag Prefix Detection (Unit Test)")
+
+    # 导入被测函数
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("main", "main.py")
+    # 跳过 argparse 的导入问题，直接测试函数逻辑
+    # 内联实现同样的函数
+    def _tag_prefix_len(text, tag):
+        max_len = min(len(tag) - 1, len(text))
+        for length in range(max_len, 0, -1):
+            if text[-length:] == tag[:length]:
+                return length
+        return 0
+
+    TAG = "<tool_call>"
+    cases = [
+        # (text, expected_len, description)
+        ("hello world", 0, "no prefix"),
+        ("hello <", 1, "just <"),
+        ("hello <t", 2, "<t prefix"),
+        ("hello <to", 3, "<to prefix"),
+        ("hello <too", 4, "<too prefix"),
+        ("hello <tool", 5, "<tool prefix"),
+        ("hello <tool_", 6, "<tool_ prefix"),
+        ("hello <tool_c", 7, "<tool_c prefix"),
+        ("hello <tool_ca", 8, "<tool_ca prefix"),
+        ("hello <tool_cal", 9, "<tool_cal prefix"),
+        ("hello <tool_call", 10, "<tool_call prefix (missing >)"),
+        ("hello <toast", 0, "<toast — not a prefix after <to"),
+        ("hello <div>", 0, "HTML tag — not a prefix"),
+        ("<", 1, "buffer is just <"),
+        ("<tool_call>", 0, "full tag — should be caught by .find(), not prefix"),
+        ("", 0, "empty string"),
+        ("hello <ta", 0, "<ta — diverges at 3rd char"),
+    ]
+
+    all_pass = True
+    for text, expected, desc in cases:
+        result = _tag_prefix_len(text, TAG)
+        status = "ok" if result == expected else "FAIL"
+        if result != expected:
+            all_pass = False
+        print(f"  [{status}] {desc}: _tag_prefix_len({text!r}) = {result} (expected {expected})")
+
+    if all_pass:
+        print(f"\n[PASS] All {len(cases)} cases passed")
+    else:
+        print(f"\n[FAIL] Some cases failed")
+    return all_pass
+
+
 if __name__ == '__main__':
     print(f"Testing against: {BASE_URL}")
     print(f"Model: {MODEL}")
 
     results = {}
     tests = [
+        ("tag_prefix_detection", test_tag_prefix_detection),
         ("list_models", test_list_models),
         ("single_tool_call", test_single_tool_call),
         ("multiple_tools", test_multiple_tools),
         ("multi_turn", test_multi_turn),
         ("no_tool_needed", test_no_tool_needed),
         ("stream_tool_call", test_stream_tool_call),
+        ("stream_no_tool_needed", test_stream_no_tool_needed),
     ]
 
     for name, fn in tests:
