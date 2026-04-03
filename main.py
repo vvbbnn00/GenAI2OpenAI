@@ -499,6 +499,20 @@ def extract_tool_calls(content):
     return tool_calls, remaining or None
 
 
+def _tag_prefix_len(text, tag):
+    """返回 text 末尾与 tag 前缀的最长匹配长度。
+
+    用于流式检测中识别可能被截断的标签前缀，避免将
+    "<tool_call>" 的前几个字符（如 "<to"）误输出为普通文本。
+    例如 _tag_prefix_len("hello <to", "<tool_call>") → 3
+    """
+    max_len = min(len(tag) - 1, len(text))
+    for length in range(max_len, 0, -1):
+        if text[-length:] == tag[:length]:
+            return length
+    return 0
+
+
 # ============================================================
 # 原有函数（略有修改）
 # ============================================================
@@ -610,6 +624,14 @@ def stream_genai_response(chat_info, messages, model, max_tokens):
                     if line_str:
                         genai_json = json.loads(line_str)
 
+                        # 检查上游是否返回业务级错误（HTTP 200 但 success=false）
+                        if isinstance(genai_json, dict) and genai_json.get("success") is False:
+                            err_msg = genai_json.get("message", "Unknown upstream error")
+                            err_code = genai_json.get("code", 500)
+                            logger.warning("GenAI business error (code=%s): %s", err_code, err_msg)
+                            yield make_error_chunk(f"Upstream error: {err_msg}", model)
+                            return
+
                         # 检查是否已经完成
                         if "choices" in genai_json and len(genai_json["choices"]) > 0:
                             choice = genai_json["choices"][0]
@@ -688,130 +710,155 @@ def stream_genai_response(chat_info, messages, model, max_tokens):
 
 
 # ============================================================
-# 流式 Tool Calling：缓冲 + 检测状态机
+# 流式 Tool Calling：类 Ollama 状态机 + 标签前缀检测
 # ============================================================
 
 def stream_genai_response_with_tools(chat_info, messages, model, max_tokens):
-    """流式调用 GenAI，支持 tool call 检测与缓冲"""
+    """流式调用 GenAI，支持 tool call 检测 — 文本部分实时流式输出
 
+    采用类 Ollama 的两阶段方案：
+    1. STREAMING: 正常流式输出文本，同时检测 <tool_call> 标签
+       - 标签前的文本实时输出，无额外延迟
+       - 缓冲区末尾若匹配标签前缀（如 "<to"）则暂不输出
+    2. BUFFERING: 检测到 <tool_call> 后缓冲剩余内容
+       - 上游结束后统一解析 tool call 并输出结构化 chunk
+    """
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(datetime.now().timestamp())
 
-    # 先收集全部内容（因为流式中要检测 tool_call 标签跨 chunk 的情况）
-    # 对于 tool calling 场景，采用"收集完整响应再判断"的策略
-    # 这比纯流式延迟略高，但可靠性远高于状态机方案
-    complete_content = ""
+    OPEN_TAG = "<tool_call>"
+
+    buffer = ""              # 待检测缓冲区（可能含标签前缀）
+    tool_buffer = ""         # tool call 内容缓冲区
+    sent_role = False        # 是否已发送 role: assistant
+    tool_detected = False    # 是否已进入 tool call 缓冲模式
+
+    def make_chunk(delta, finish_reason=None):
+        """构造 OpenAI 格式的 SSE chunk"""
+        chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason
+            }]
+        }
+        return f"data: {json.dumps(chunk)}\n\n"
+
+    def emit_text(text):
+        """发送文本 chunk，首次自动附加 role: assistant"""
+        nonlocal sent_role
+        delta = {"content": text}
+        if not sent_role:
+            delta["role"] = "assistant"
+            sent_role = True
+        return make_chunk(delta)
+
+    # ── 消费上游流式响应 ──
     for line in stream_genai_response(chat_info, messages, model, max_tokens):
-        if line.startswith('data: '):
-            data_str = line[6:].strip()
-            if data_str == '[DONE]':
-                continue
-            try:
-                data = json.loads(data_str)
-                if 'choices' in data and data['choices']:
-                    delta = data['choices'][0].get('delta', {})
-                    content = delta.get('content', '')
-                    if content:
-                        complete_content += content
-            except json.JSONDecodeError:
-                pass
+        if not line.startswith("data: "):
+            continue
+        data_str = line[6:].strip()
+        if data_str == "[DONE]":
+            continue
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        if "choices" not in data or not data["choices"]:
+            continue
+        chunk_delta = data["choices"][0].get("delta", {})
+        content = chunk_delta.get("content", "")
+        if not content:
+            continue
 
-    logger.debug("Tool calling: collected %d chars of content", len(complete_content))
-    if complete_content:
-        logger.debug("Tool calling: content preview: %s", complete_content[:500])
+        # ── 已进入 tool call 缓冲模式，直接追加 ──
+        if tool_detected:
+            tool_buffer += content
+            continue
 
-    # 检测是否包含 tool_call
-    tool_calls, remaining_text = extract_tool_calls(complete_content)
+        # ── 正常流式模式：追加并检测标签 ──
+        buffer += content
 
-    if tool_calls:
-        logger.debug("Tool calling: emitting %d tool_call chunk(s)", len(tool_calls))
+        # 1) 检查完整的 <tool_call> 标签
+        tag_pos = buffer.find(OPEN_TAG)
+        if tag_pos >= 0:
+            # 标签前的文本立即流式输出
+            pre = buffer[:tag_pos]
+            if pre.strip():
+                yield emit_text(pre)
 
-        # 第一个 chunk 必须携带 role: assistant（OpenAI 流式协议要求）
-        # 如果有剩余文本，放在 content 里；否则发一个空 role chunk
-        first_delta = {"role": "assistant"}
-        if remaining_text:
-            first_delta["content"] = remaining_text
-        role_chunk = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": first_delta,
-                "finish_reason": None
-            }]
-        }
-        yield f"data: {json.dumps(role_chunk)}\n\n"
+            # 切换到缓冲模式
+            tool_detected = True
+            tool_buffer = buffer[tag_pos:]
+            buffer = ""
+            continue
 
-        # 发送 tool_calls chunk
-        for i, tc in enumerate(tool_calls):
-            tc_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "tool_calls": [{
-                            "index": i,
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["function"]["name"],
-                                "arguments": tc["function"]["arguments"]
-                            }
-                        }]
-                    },
-                    "finish_reason": None
-                }]
-            }
-            yield f"data: {json.dumps(tc_chunk)}\n\n"
+        # 2) 检查末尾是否可能是标签前缀（如 "<to"）
+        plen = _tag_prefix_len(buffer, OPEN_TAG)
+        if plen > 0:
+            # 前缀之前的部分安全输出，前缀保留等待后续确认
+            safe = buffer[:-plen]
+            if safe:
+                yield emit_text(safe)
+            buffer = buffer[-plen:]
+        else:
+            # 全部安全，直接输出
+            if buffer:
+                yield emit_text(buffer)
+            buffer = ""
 
-        # 发送结束 chunk
-        final_chunk = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "tool_calls"
-            }]
-        }
-        yield f"data: {json.dumps(final_chunk)}\n\n"
-        yield "data: [DONE]\n\n"
+    # ── 上游响应结束，处理剩余内容 ──
+    if tool_detected:
+        # 解析所有 tool calls（含 think 块剥离、markdown 解包）
+        tool_calls, remaining = extract_tool_calls(tool_buffer)
 
+        if tool_calls:
+            logger.debug("Streaming tool calling: detected %d tool_call(s)", len(tool_calls))
+
+            # tool call 之间的剩余文本
+            if remaining and remaining.strip():
+                yield emit_text(remaining.strip())
+
+            # 确保已发送 role chunk（OpenAI 协议要求首 chunk 带 role）
+            if not sent_role:
+                yield make_chunk({"role": "assistant"})
+                sent_role = True
+
+            # 发送 tool_calls chunks
+            for i, tc in enumerate(tool_calls):
+                yield make_chunk({
+                    "tool_calls": [{
+                        "index": i,
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"]
+                        }
+                    }]
+                })
+
+            yield make_chunk({}, finish_reason="tool_calls")
+            yield "data: [DONE]\n\n"
+        else:
+            # 标签检测到了但解析失败 — 当作普通文本输出
+            logger.warning("Tool tag detected but parsing failed — emitting as text")
+            yield emit_text(tool_buffer)
+            yield make_chunk({}, finish_reason="stop")
+            yield "data: [DONE]\n\n"
     else:
-        # 没有 tool_call，按正常文本流式发送
-        if complete_content:
-            text_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"role": "assistant", "content": complete_content},
-                    "finish_reason": None
-                }]
-            }
-            yield f"data: {json.dumps(text_chunk)}\n\n"
+        # 未检测到 tool call — 刷出缓冲区中残留的前缀文本
+        if buffer:
+            yield emit_text(buffer)
 
-        final_chunk = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop"
-            }]
-        }
-        yield f"data: {json.dumps(final_chunk)}\n\n"
+        if not sent_role:
+            yield make_chunk({"role": "assistant", "content": ""})
+
+        yield make_chunk({}, finish_reason="stop")
         yield "data: [DONE]\n\n"
 
 
