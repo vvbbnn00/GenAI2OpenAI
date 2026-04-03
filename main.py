@@ -73,6 +73,7 @@ GENAI_CAS_SERVICE_URL = (
     "https://ids.shanghaitech.edu.cn/authserver/login"
     "?service=" + quote(GENAI_LOGIN_URL, safe='')
 )
+GENAI_GET_TOKEN_URL = "https://genai.shanghaitech.edu.cn/htk/user/info/{token}?_t={timestamp}"
 
 
 class TokenManager:
@@ -159,26 +160,18 @@ class TokenManager:
             params = parse_qs(parsed.query)
 
             if 'token' in params:
-                self._token = params['token'][0]
+                real_token = client.session.get(GENAI_GET_TOKEN_URL.format(
+                    token=params['token'][0],
+                    timestamp=int(time.time() * 1000)
+                ), timeout=30).json().get('result', {}).get('token')
+                if not real_token:
+                    raise RuntimeError("Failed to retrieve real token from GenAI after CAS login")
+                self._token = real_token
                 self._update_expiry()
                 # 保存 keystore（sign_count 递增）
                 keystore.dump(self._keystore_path)
                 logger.info("GenAI token refreshed successfully")
             else:
-                # 可能 token 在响应体中或其他位置
-                logger.error("Failed to extract token from redirect URL: %s", final_url)
-                # 尝试从响应历史中查找
-                for resp in response.history:
-                    loc = resp.headers.get('Location', '')
-                    if 'token=' in loc:
-                        parsed_loc = urlparse(loc)
-                        params_loc = parse_qs(parsed_loc.query)
-                        if 'token' in params_loc:
-                            self._token = params_loc['token'][0]
-                            self._update_expiry()
-                            keystore.dump(self._keystore_path)
-                            logger.info("GenAI token extracted from redirect history")
-                            return
                 raise RuntimeError(f"Could not extract GenAI token from login flow. Final URL: {final_url}")
 
         except ImportError:
