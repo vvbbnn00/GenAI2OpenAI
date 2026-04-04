@@ -5,6 +5,12 @@ from datetime import datetime
 
 from flask import jsonify
 
+from genai_proxy.optimizations import (
+    extract_deepseek_tool_calls,
+    inject_deepseek_tool_prompt,
+    is_deepseek_model,
+)
+
 
 TOOL_SYSTEM_PROMPT = """\
 You have access to the following tools:
@@ -85,7 +91,10 @@ def format_tool_definitions(tools):
     return "\n".join(definitions)
 
 
-def inject_tool_prompt(messages, tools, tool_choice=None):
+def inject_tool_prompt(messages, tools, tool_choice=None, model=None):
+    if is_deepseek_model(model):
+        return inject_deepseek_tool_prompt(messages, tools, tool_choice)
+
     tool_defs = format_tool_definitions(tools)
     tool_prompt = TOOL_SYSTEM_PROMPT.format(tool_definitions=tool_defs)
 
@@ -173,7 +182,7 @@ def _parse_tool_call_body(raw):
     return None
 
 
-def extract_tool_calls(content, logger=None):
+def extract_tool_calls(content, logger=None, tools=None, model=None):
     cleaned = strip_think_blocks(content)
     cleaned = re.sub(
         r"```(?:xml|json|plaintext|text)?\s*\n?\s*(<tool_call>.*?</tool_call>)\s*\n?\s*```",
@@ -181,6 +190,15 @@ def extract_tool_calls(content, logger=None):
         cleaned,
         flags=re.DOTALL,
     )
+
+    if is_deepseek_model(model):
+        repaired_tool_calls, repaired_remaining = extract_deepseek_tool_calls(
+            cleaned,
+            tools=tools,
+            logger=logger,
+        )
+        if repaired_tool_calls:
+            return repaired_tool_calls, repaired_remaining
 
     pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
     matches = re.findall(pattern, cleaned, re.DOTALL)
@@ -236,4 +254,3 @@ def tag_prefix_len(text, tag):
         if text[-length:] == tag[:length]:
             return length
     return 0
-

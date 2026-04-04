@@ -12,6 +12,7 @@ from genai_proxy.compat.openai import (
     tag_prefix_len,
 )
 from genai_proxy.errors import ProxyError
+from genai_proxy.optimizations import should_buffer_deepseek_tool_stream
 
 
 GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"
@@ -41,6 +42,7 @@ class PreparedChatRequest:
     model: str
     max_tokens: int
     has_tools: bool
+    tools: list
 
 
 class GenAIService:
@@ -97,7 +99,12 @@ class GenAIService:
                 "tool_calls": collected_tool_calls,
             }
         elif prepared.has_tools:
-            tool_calls, remaining_text = extract_tool_calls(complete_content, self._logger)
+            tool_calls, remaining_text = extract_tool_calls(
+                complete_content,
+                self._logger,
+                tools=prepared.tools,
+                model=prepared.model,
+            )
             message_obj = {
                 "role": "assistant",
                 "content": remaining_text,
@@ -151,7 +158,7 @@ class GenAIService:
         has_tools = bool(tools)
 
         if has_tools:
-            messages = inject_tool_prompt(messages, tools, tool_choice)
+            messages = inject_tool_prompt(messages, tools, tool_choice, model=model)
 
         if not self._extract_last_user_message(messages):
             raise ProxyError("No user message found in 'messages'")
@@ -161,6 +168,7 @@ class GenAIService:
             model=model,
             max_tokens=max_tokens,
             has_tools=has_tools,
+            tools=tools,
         )
 
     def _get_genai_headers(self):
@@ -312,6 +320,10 @@ class GenAIService:
             yield make_error_chunk(str(exc), prepared.model)
 
     def _stream_genai_response_with_tools(self, prepared: PreparedChatRequest):
+        if should_buffer_deepseek_tool_stream(prepared.model):
+            yield from self._stream_deepseek_tool_response(prepared)
+            return
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(datetime.now().timestamp())
         open_tag = "<tool_call>"
@@ -393,7 +405,12 @@ class GenAIService:
                 buffer = ""
 
         if tool_detected:
-            tool_calls, remaining = extract_tool_calls(tool_buffer, self._logger)
+            tool_calls, remaining = extract_tool_calls(
+                tool_buffer,
+                self._logger,
+                tools=prepared.tools,
+                model=prepared.model,
+            )
             if tool_calls:
                 if remaining and remaining.strip():
                     yield emit_text(remaining.strip())
@@ -432,6 +449,92 @@ class GenAIService:
             yield emit_text(buffer)
         if not sent_role:
             yield make_chunk({"role": "assistant", "content": ""})
+        yield make_chunk({}, finish_reason="stop")
+        yield "data: [DONE]\n\n"
+
+    def _stream_deepseek_tool_response(self, prepared: PreparedChatRequest):
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(datetime.now().timestamp())
+        complete_content = ""
+
+        def make_chunk(delta, finish_reason=None):
+            chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": prepared.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": delta,
+                        "finish_reason": finish_reason,
+                    }
+                ],
+            }
+            return f"data: {json.dumps(chunk)}\n\n"
+
+        for line in self._stream_genai_response(prepared):
+            if not line.startswith("data: "):
+                continue
+
+            data_str = line[6:].strip()
+            if data_str == "[DONE]":
+                continue
+
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            choices = data.get("choices", [])
+            if not choices:
+                continue
+
+            delta = choices[0].get("delta", {})
+            content = delta.get("content", "")
+            if content:
+                complete_content += content
+
+        tool_calls, remaining = extract_tool_calls(
+            complete_content,
+            self._logger,
+            tools=prepared.tools,
+            model=prepared.model,
+        )
+
+        sent_role = False
+        if remaining:
+            yield make_chunk({"role": "assistant", "content": remaining})
+            sent_role = True
+
+        if tool_calls:
+            if not sent_role:
+                yield make_chunk({"role": "assistant"})
+                sent_role = True
+
+            for index, tool_call in enumerate(tool_calls):
+                yield make_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": index,
+                                "id": tool_call["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call["function"]["name"],
+                                    "arguments": tool_call["function"]["arguments"],
+                                },
+                            }
+                        ]
+                    }
+                )
+
+            yield make_chunk({}, finish_reason="tool_calls")
+            yield "data: [DONE]\n\n"
+            return
+
+        if not sent_role:
+            yield make_chunk({"role": "assistant", "content": complete_content})
         yield make_chunk({}, finish_reason="stop")
         yield "data: [DONE]\n\n"
 
