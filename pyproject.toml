@@ -10,3 +10,6 @@ dependencies = [
     "requests>=2.32.5",
     "shanghaitech-ids-passkey>=0.1.0",
 ]
+
+[tool.uv.sources]
+shanghaitech-ids-passkey = { git = "https://github.com/vvbbnn00/shanghaitech-ids-passkey.git", branch = "main" }

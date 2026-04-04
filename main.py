@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, stream_with_context, Response
 from flask_cors import CORS
+import atexit
 import requests
 import json
 import uuid
@@ -91,6 +92,10 @@ class TokenManager:
         self._keystore_path = keystore_path
         self._token_exp = None
         self._lock = threading.Lock()
+        self._ids_client = None
+        self._keystore = None
+        self._used_ids = False
+        self._shutdown_done = False
 
         if token:
             self._update_expiry()
@@ -140,9 +145,15 @@ class TokenManager:
             from shanghaitech_ids_passkey import IDSClient, PasskeyKeystore
 
             logger.info("Refreshing GenAI token via passkey login...")
-            keystore = PasskeyKeystore.load(self._keystore_path)
-            client = IDSClient(keystore)
+            if self._keystore is None:
+                self._keystore = PasskeyKeystore.load(self._keystore_path)
+            if self._ids_client is None:
+                self._ids_client = IDSClient(self._keystore)
+
+            client = self._ids_client
+            keystore = self._keystore
             client.login()
+            self._used_ids = True
             logger.info("IDS passkey login successful for user: %s", keystore.username)
 
             # 访问 GenAI 的 CAS service URL，让 IDS 签发 ticket 并跳转回 GenAI
@@ -194,9 +205,30 @@ class TokenManager:
                     logger.warning("Token expires in %.0f seconds but no keystore for auto-refresh!", remaining)
             return self._token
 
+    def shutdown(self):
+        """程序退出前清理 IDS 会话。"""
+        with self._lock:
+            if self._shutdown_done:
+                return
+            self._shutdown_done = True
+
+            if not self._ids_client:
+                return
+
+            try:
+                if self._used_ids:
+                    logger.info("Logging out from IDS before shutdown...")
+                    self._ids_client.logout()
+                    logger.info("IDS logout successful")
+            except Exception:
+                logger.exception("Failed to logout from IDS during shutdown")
+            finally:
+                self._ids_client.session.close()
+
 
 # 初始化 TokenManager
 token_manager = TokenManager(token=args.token, keystore_path=args.keystore)
+atexit.register(token_manager.shutdown)
 
 
 # ============================================================
@@ -625,7 +657,7 @@ def stream_genai_response(chat_info, messages, model, max_tokens):
                         genai_json = json.loads(line_str)
 
                         # 检查上游是否返回业务级错误（HTTP 200 但 success=false）
-                        if isinstance(genai_json, dict) and genai_json.get("success") is False:
+                        if isinstance(genai_json, dict) and genai_json.get("code", 200) >= 400:
                             err_msg = genai_json.get("message", "Unknown upstream error")
                             err_code = genai_json.get("code", 500)
                             logger.warning("GenAI business error (code=%s): %s", err_code, err_msg)
@@ -686,6 +718,11 @@ def stream_genai_response(chat_info, messages, model, max_tokens):
                     logger.debug("JSON decode error: %s, line: %s", e, line_str[:200])
 
         logger.debug("Total lines received: %d, finished: %s", line_count, finished)
+
+        if not finished:
+            logger.warning("Stream ended without finish_reason from GenAI")
+            yield make_error_chunk("Stream ended unexpectedly without completion", model)
+            return
 
         # 发送完成信号
         final_response = {
@@ -1031,4 +1068,7 @@ if __name__ == '__main__':
                 "passkey auto-refresh" if args.keystore else "static token (no auto-refresh)")
     if args.keystore:
         logger.info("Keystore: %s", args.keystore)
-    app.run(host='0.0.0.0', port=args.port, debug=False)
+    try:
+        app.run(host='0.0.0.0', port=args.port, debug=False)
+    finally:
+        token_manager.shutdown()
