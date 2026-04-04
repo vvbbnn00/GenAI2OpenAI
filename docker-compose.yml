@@ -29,7 +29,7 @@ services:
           exit 1
         fi
 
-        set -- uv run main.py --port "$${APP_PORT}"
+        set -- python main.py --port "$${APP_PORT}"
 
         if [ -n "$${GENAI_TOKEN:-}" ]; then
           set -- "$$@" --token "$${GENAI_TOKEN}"
