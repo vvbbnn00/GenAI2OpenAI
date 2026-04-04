@@ -1,0 +1,14 @@
+.git
+.gitignore
+.idea
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+*.keystore
+images
+test_*.py
+test_*.sh
