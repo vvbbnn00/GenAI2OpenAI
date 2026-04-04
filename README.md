@@ -179,7 +179,7 @@ response = client.chat.completions.create(
 
 ### Claude Messages API 兼容
 
-这个项目参考了 `claude-code-proxy` 的请求/响应转换思路，但没有把它整套服务端结构直接拷进来，而是以较低侵入的方式增加了一个 Claude 兼容层：
+除了 OpenAI 兼容接口外，本项目还提供了 Claude Messages API 兼容层：
 
 - Claude 请求会先转换成内部统一的 OpenAI Chat Completion 请求
 - 再复用原来的 GenAI 上游调用逻辑
@@ -241,19 +241,13 @@ print(resp)
 
 ### 支持的模型
 
-`/v1/models` 现在会实时读取 GenAI 上游模型列表，而不是使用仓库里的静态模型表。
-
-- 返回的是当前账号在 GenAI 可见的模型
-- 会自动带出上游的 `rootAiType`
-- 默认过滤 `gpt-image-1.5`
-
-因此，具体模型集合以 `/v1/models` 的实时返回为准。
+`/v1/models` 会实时读取 GenAI 上游模型列表，返回当前账号在 GenAI 可见的模型。它会自动带出上游的 `rootAiType`，并默认过滤 `gpt-image-1.5`。具体模型集合以 `/v1/models` 的实时返回为准。
 
 ## 项目结构
 
-重构后主要按职责拆分为下面几层：
+项目按职责分为以下几层：
 
-- `main.py`：只负责参数解析、日志初始化和服务启动
+- `main.py`：负责参数解析、日志初始化和服务启动
 - `genai_proxy/app.py`：应用装配
 - `genai_proxy/auth.py`：API Key 鉴权
 - `genai_proxy/services/token_manager.py`：JWT / passkey 刷新
