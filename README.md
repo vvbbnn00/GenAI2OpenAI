@@ -2,6 +2,8 @@
 
 OpenAI 兼容的代理服务，将上海科技大学 GenAI 平台的 API 转换为标准 OpenAI Chat Completion 接口，支持 tool calling。
 
+现在也提供 Claude Messages API 兼容入口，可以让 Anthropic / Claude SDK 通过同一个代理访问 GenAI。
+
 ## 安装与运行
 
 ### 环境要求
@@ -21,6 +23,7 @@ uv sync
 uv run main.py --token <token> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --keystore <path/to/ids-passkey.keystore> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --token <token> --keystore <path/to/ids-passkey.keystore> [--port 5000] [--api-key <key>] [--debug]
+uv run main.py --token <token> --claude-opus-model deepseek-v3:671b --claude-sonnet-model qwen-instruct --claude-haiku-model qwen-instruct
 ```
 
 认证参数说明：
@@ -37,6 +40,9 @@ uv run main.py --token <token> --keystore <path/to/ids-passkey.keystore> [--port
 | `--port` | 服务监听端口 | `5000` |
 | `--api-key` | 客户端认证密钥（也可通过 `API_KEY` 环境变量设置） | 无（不校验） |
 | `--debug` | 启用详细日志输出 | 关闭 |
+| `--claude-haiku-model` | 模型名包含 `haiku` 时映射到的 GenAI 模型，也可通过 `CLAUDE_HAIKU_MODEL` 环境变量设置 | `qwen-instruct` |
+| `--claude-sonnet-model` | 模型名包含 `sonnet` 时映射到的 GenAI 模型，也可通过 `CLAUDE_SONNET_MODEL` 环境变量设置 | `qwen-instruct` |
+| `--claude-opus-model` | 模型名包含 `opus` 时映射到的 GenAI 模型，也可通过 `CLAUDE_OPUS_MODEL` 环境变量设置 | `deepseek-v3:671b` |
 
 ### 启动示例
 
@@ -66,6 +72,8 @@ uv run main.py \
 
 - `POST /v1/chat/completions` — 聊天补全（流式/非流式）
 - `GET /v1/models` — 列出可用模型
+- `POST /v1/messages` — Claude Messages API 兼容接口（流式/非流式）
+- `POST /v1/messages/count_tokens` — Claude token 估算接口
 - `GET /health` — 健康检查
 
 ### Tool Calling
@@ -104,21 +112,97 @@ response = client.chat.completions.create(
 
 ### API Key 认证
 
-设置 `--api-key` 或环境变量 `API_KEY` 后，所有 `/v1/` 请求需要携带 `Authorization: Bearer <key>` 请求头。未设置时跳过认证（开发模式）。
+设置 `--api-key` 或环境变量 `API_KEY` 后：
+
+- OpenAI 兼容接口使用 `Authorization: Bearer <key>`
+- Claude 兼容接口支持 `x-api-key: <key>` 或 `Authorization: Bearer <key>`
+
+未设置时跳过认证（开发模式）。
+
+### Claude Messages API 兼容
+
+这个项目参考了 `claude-code-proxy` 的请求/响应转换思路，但没有把它整套服务端结构直接拷进来，而是以较低侵入的方式增加了一个 Claude 兼容层：
+
+- Claude 请求会先转换成内部统一的 OpenAI Chat Completion 请求
+- 再复用原来的 GenAI 上游调用逻辑
+- 返回时再转换回 Claude Messages API 的响应格式
+
+当前支持的 Claude 能力：
+
+- `messages`
+- `system`
+- `tools`
+- `tool_choice`
+- `tool_result`
+- 流式 `tool_use`
+- `count_tokens` 的简单估算
+
+目前 Claude 路由使用关键词匹配来做 alias 映射：
+
+- 模型名包含 `haiku` -> 默认映射到 `qwen-instruct`
+- 模型名包含 `sonnet` -> 默认映射到 `qwen-instruct`
+- 模型名包含 `opus` -> 默认映射到 `deepseek-v3:671b`
+
+这些默认值都可以通过启动参数覆盖，例如：
+
+```bash
+uv run main.py \
+  --keystore /path/to/ids-passkey.keystore \
+  --claude-haiku-model qwen-instruct \
+  --claude-sonnet-model GPT-4.1 \
+  --claude-opus-model GPT-5.4
+```
+
+例如下面这些模型名都可以工作，只要名称中带有 `haiku`、`sonnet` 或 `opus`：
+
+- `claude-3-5-haiku-latest`
+- `claude-3-7-sonnet-latest`
+- `claude-sonnet-4-0`
+- `claude-opus-4-1`
+
+Claude SDK 示例：
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://localhost:5000",
+    api_key="your-api-key",
+)
+
+resp = client.messages.create(
+    model="claude-3-7-sonnet-latest",
+    max_tokens=1024,
+    messages=[
+        {"role": "user", "content": "你好，帮我总结一下牛顿第一定律"}
+    ],
+)
+
+print(resp)
+```
 
 ### 支持的模型
 
-| 模型 | 后端类型 |
-|------|----------|
-| `GPT-5` | Azure |
-| `GPT-4.1` | Azure |
-| `GPT-4.1-mini` | Azure |
-| `o4-mini` | Azure |
-| `o3` | Azure |
-| `deepseek-v3:671b` | Xinference |
-| `deepseek-r1:671b` | Xinference |
-| `qwen-instruct` | Xinference |
-| `qwen-think` | Xinference |
+`/v1/models` 现在会实时读取 GenAI 上游模型列表，而不是使用仓库里的静态模型表。
+
+- 返回的是当前账号在 GenAI 可见的模型
+- 会自动带出上游的 `rootAiType`
+- 默认过滤 `gpt-image-1.5`
+
+因此，具体模型集合以 `/v1/models` 的实时返回为准。
+
+## 项目结构
+
+重构后主要按职责拆分为下面几层：
+
+- `main.py`：只负责参数解析、日志初始化和服务启动
+- `genai_proxy/app.py`：应用装配
+- `genai_proxy/auth.py`：API Key 鉴权
+- `genai_proxy/services/token_manager.py`：JWT / passkey 刷新
+- `genai_proxy/services/genai.py`：GenAI 上游调用与 OpenAI SSE 转换
+- `genai_proxy/compat/openai.py`：OpenAI tool calling 兼容逻辑
+- `genai_proxy/compat/claude.py`：Claude Messages API 转换逻辑
+- `genai_proxy/routes/`：OpenAI / Claude 路由
 
 ## Token 与 Passkey
 
