@@ -44,8 +44,6 @@ def is_deepseek_model(model: str | None) -> bool:
     return "deepseek" in (model or "").lower()
 
 
-def should_buffer_deepseek_tool_stream(model: str | None) -> bool:
-    return is_deepseek_model(model)
 def inject_deepseek_tool_prompt(messages, tools, tool_choice=None):
     tool_prompt = _render_deepseek_tools_prompt(tools, tool_choice)
     new_messages = []

@@ -12,7 +12,7 @@ from genai_proxy.compat.openai import (
     tag_prefix_len,
 )
 from genai_proxy.errors import ProxyError
-from genai_proxy.optimizations import should_buffer_deepseek_tool_stream
+from genai_proxy.optimizations import is_deepseek_model
 
 
 GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"
@@ -320,7 +320,7 @@ class GenAIService:
             yield make_error_chunk(str(exc), prepared.model)
 
     def _stream_genai_response_with_tools(self, prepared: PreparedChatRequest):
-        if should_buffer_deepseek_tool_stream(prepared.model):
+        if is_deepseek_model(prepared.model):
             yield from self._stream_deepseek_tool_response(prepared)
             return
 
