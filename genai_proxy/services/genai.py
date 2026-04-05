@@ -1,4 +1,5 @@
 import json
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,6 +14,8 @@ from genai_proxy.compat.openai import (
 )
 from genai_proxy.errors import ProxyError
 from genai_proxy.optimizations import is_deepseek_model
+from genai_proxy.services.token_manager import parse_jwt_payload
+from genai_proxy.token_usage import estimate_openai_request_tokens, estimate_token_by_model
 
 
 GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"
@@ -35,6 +38,9 @@ GENAI_BASE_HEADERS = {
     "sec-ch-ua-platform": '"Windows"',
 }
 
+GENAI_USER_INFO_URL = "https://genai.shanghaitech.edu.cn/htk/ai-user-info/list"
+GENAI_CURRENT_USER_URL = "https://genai.shanghaitech.edu.cn/htk/user/info/{token}"
+
 
 @dataclass(slots=True)
 class PreparedChatRequest:
@@ -43,6 +49,7 @@ class PreparedChatRequest:
     max_tokens: int
     has_tools: bool
     tools: list
+    prompt_tokens: int
 
 
 class GenAIService:
@@ -58,6 +65,35 @@ class GenAIService:
     def stream_openai_completion(self, req_data):
         prepared = self._prepare_chat_request(req_data)
         return self._stream_prepared_openai_completion(prepared)
+
+    def fetch_openai_billing_subscription(self):
+        token = self._token_manager.token
+        access_until = self._extract_access_until(token)
+        user_id = self._fetch_current_user_id(token)
+        record = self._fetch_user_info_record(token, user_id)
+        quota = self._coerce_amount(record.get("quota"))
+
+        return {
+            "object": "billing_subscription",
+            "has_payment_method": True,
+            "soft_limit_usd": quota,
+            "hard_limit_usd": quota,
+            "system_hard_limit_usd": quota,
+            "access_until": access_until,
+        }
+
+    def fetch_openai_billing_usage(self):
+        token = self._token_manager.token
+        self._extract_access_until(token)
+        user_id = self._fetch_current_user_id(token)
+        record = self._fetch_user_info_record(token, user_id)
+        month_usage_usd = self._coerce_amount(record.get("monthSurplus"))
+        total_usage = max(month_usage_usd, 0.0) * 100
+
+        return {
+            "object": "list",
+            "total_usage": round(total_usage, 2),
+        }
 
     def _build_openai_completion(self, prepared: PreparedChatRequest):
         complete_content = ""
@@ -119,6 +155,14 @@ class GenAIService:
             message_obj = {"role": "assistant", "content": complete_content}
             finish_reason = "stop"
 
+        completion_estimate_text = complete_content or ""
+        if message_obj.get("tool_calls"):
+            for tool_call in message_obj["tool_calls"]:
+                function = tool_call.get("function", {})
+                completion_estimate_text += function.get("name", "")
+                completion_estimate_text += function.get("arguments", "")
+        completion_tokens = estimate_token_by_model(prepared.model, completion_estimate_text)
+
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
             "object": "chat.completion",
@@ -132,9 +176,9 @@ class GenAIService:
                 }
             ],
             "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": len(complete_content),
-                "total_tokens": len(complete_content),
+                "prompt_tokens": prepared.prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prepared.prompt_tokens + completion_tokens,
             },
         }
 
@@ -169,12 +213,19 @@ class GenAIService:
             max_tokens=max_tokens,
             has_tools=has_tools,
             tools=tools,
+            prompt_tokens=estimate_openai_request_tokens(messages, model, None if has_tools else tools),
         )
 
     def _get_genai_headers(self):
         headers = dict(GENAI_BASE_HEADERS)
         headers["X-Access-Token"] = self._token_manager.token
         return headers
+
+    def _get_user_genai_headers(self, user_token: str):
+        return {
+            "Accept": "application/json",
+            "X-Access-Token": user_token,
+        }
 
     def _extract_last_user_message(self, messages):
         for msg in reversed(messages):
@@ -195,6 +246,121 @@ class GenAIService:
         except (KeyError, IndexError, TypeError):
             pass
         return None, None
+
+    def _fetch_user_info_record(self, user_token: str, user_id: str):
+        try:
+            response = requests.get(
+                GENAI_USER_INFO_URL,
+                params={
+                    "_t": int(time.time()),
+                    "pageNo": 1,
+                    "pageSize": 1,
+                    "userId": user_id,
+                },
+                headers=self._get_user_genai_headers(user_token),
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            self._logger.warning("Failed to fetch user billing info: %s", exc)
+            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502) from exc
+
+        if response.status_code == 401:
+            raise ProxyError("Upstream GenAI token is invalid or expired", error_type="authentication_error", status=502)
+        if response.status_code != 200:
+            self._logger.warning(
+                "GenAI billing API error %d: %s",
+                response.status_code,
+                response.text[:500],
+            )
+            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            self._logger.warning("Failed to decode billing response JSON: %s", exc)
+            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502) from exc
+
+        if payload.get("code", 200) >= 400 or payload.get("success") is False:
+            self._logger.warning("GenAI billing business error: %s", payload)
+            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
+
+        records = payload.get("result", {}).get("records") or []
+        if not records:
+            raise ProxyError(
+                "Quota information for the current GenAI account was not found",
+                error_type="invalid_request_error",
+                status=404,
+            )
+
+        record = records[0]
+        if str(record.get("id")) != str(user_id):
+            self._logger.warning(
+                "Billing record mismatch for user_id=%s, got id=%s",
+                user_id,
+                record.get("id"),
+            )
+            raise ProxyError(
+                "Quota information for the current GenAI account was not found",
+                error_type="invalid_request_error",
+                status=404,
+            )
+
+        return record
+
+    def _fetch_current_user_id(self, user_token: str) -> str:
+        try:
+            response = requests.get(
+                GENAI_CURRENT_USER_URL.format(token=user_token),
+                params={"_t": int(time.time() * 1000)},
+                headers=self._get_user_genai_headers(user_token),
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            self._logger.warning("Failed to fetch current user info: %s", exc)
+            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502) from exc
+
+        if response.status_code == 401:
+            raise ProxyError("Upstream GenAI token is invalid or expired", error_type="authentication_error", status=502)
+        if response.status_code != 200:
+            self._logger.warning(
+                "GenAI current user API error %d: %s",
+                response.status_code,
+                response.text[:500],
+            )
+            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            self._logger.warning("Failed to decode current user JSON: %s", exc)
+            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502) from exc
+
+        user_info = payload.get("result", {}).get("userInfo") or {}
+        user_id = user_info.get("id")
+        if not user_id:
+            self._logger.warning("Current user response missing id: %s", payload)
+            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
+        return str(user_id)
+
+    def _extract_access_until(self, user_token: str) -> int:
+        try:
+            access_until = int(parse_jwt_payload(user_token).get("exp") or 0)
+        except Exception as exc:
+            self._logger.warning("Failed to parse billing token expiry: %s", exc)
+            raise ProxyError("Upstream GenAI token is invalid or expired", error_type="authentication_error", status=502) from exc
+
+        if access_until <= int(time.time()):
+            raise ProxyError("Upstream GenAI token is invalid or expired", error_type="authentication_error", status=502)
+        return access_until
+
+    def _coerce_amount(self, value) -> float:
+        if value in (None, ""):
+            return 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            self._logger.warning("Invalid billing amount from upstream: %r", value)
+            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
 
     def _stream_genai_response(self, prepared: PreparedChatRequest):
         root_ai_type = self._model_manager.root_ai_type_for(prepared.model)

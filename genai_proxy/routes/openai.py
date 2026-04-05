@@ -10,6 +10,22 @@ from genai_proxy.errors import ProxyError
 bp = Blueprint("openai", __name__)
 
 
+def _billing_error_response(exc: ProxyError, fallback_message: str, fallback_error_type: str):
+    message = exc.message
+    error_type = exc.error_type
+
+    if exc.error_type == "upstream_error":
+        message = fallback_message
+        error_type = fallback_error_type
+
+    return openai_error(
+        message,
+        error_type=error_type,
+        code=exc.code,
+        status=exc.status,
+    )
+
+
 @bp.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
     request_id = f"req_{uuid.uuid4().hex[:16]}"
@@ -68,7 +84,34 @@ def list_models():
     return jsonify({"object": "list", "data": model_manager.list_openai_models()})
 
 
+@bp.route("/v1/dashboard/billing/subscription", methods=["GET"])
+def billing_subscription():
+    service = current_app.extensions["genai_service"]
+
+    try:
+        return jsonify(service.fetch_openai_billing_subscription())
+    except ProxyError as exc:
+        return _billing_error_response(
+            exc,
+            fallback_message="Failed to fetch subscription quota",
+            fallback_error_type="upstream_error",
+        )
+
+
+@bp.route("/v1/dashboard/billing/usage", methods=["GET"])
+def billing_usage():
+    service = current_app.extensions["genai_service"]
+
+    try:
+        return jsonify(service.fetch_openai_billing_usage())
+    except ProxyError as exc:
+        return _billing_error_response(
+            exc,
+            fallback_message="Failed to fetch usage",
+            fallback_error_type="new_api_error",
+        )
+
+
 @bp.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "ok"}), 200
-

@@ -44,4 +44,3 @@ def register_auth(app, config, logger):
                 code="invalid_api_key",
                 status=401,
             )
-

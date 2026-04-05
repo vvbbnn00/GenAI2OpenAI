@@ -1,4 +1,5 @@
 import time
+from datetime import datetime, timezone
 
 import requests
 
@@ -39,15 +40,17 @@ class ModelManager:
         return None
 
     def list_openai_models(self) -> list[dict]:
-        return [
-            {
-                "id": record["aiType"],
-                "object": "model",
-                "owned_by": "genai",
-                "permission": [],
-            }
-            for record in self.list_genai_models()
-        ]
+        models = []
+        for record in self.list_genai_models():
+            models.append(
+                {
+                    "id": record["aiType"],
+                    "object": "model",
+                    "created": _parse_created_timestamp(record.get("createTime")),
+                    "owned_by": _fallback_owner(record),
+                }
+            )
+        return models
 
     def list_genai_models(self, force_refresh: bool = False) -> list[dict]:
         if not force_refresh and self._models_cache is not None:
@@ -93,3 +96,21 @@ class ModelManager:
             [model.get("aiType") for model in models],
         )
         return models
+
+
+def _parse_created_timestamp(value) -> int:
+    if not value:
+        return 0
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return int(datetime.strptime(str(value), fmt).replace(tzinfo=timezone.utc).timestamp())
+        except ValueError:
+            continue
+    return 0
+
+
+def _fallback_owner(record: dict) -> str:
+    root_model_name = (record.get("rootModelName") or "").strip().lower()
+    root_ai_type = (record.get("rootAiType") or "").strip().lower()
+    return root_model_name or root_ai_type or "genai"

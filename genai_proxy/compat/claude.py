@@ -4,6 +4,7 @@ import uuid
 from flask import jsonify
 
 from genai_proxy.errors import ProxyError
+from genai_proxy.token_usage import estimate_claude_request_tokens, estimate_token_by_model
 
 
 ROLE_ASSISTANT = "assistant"
@@ -168,6 +169,22 @@ def convert_openai_to_claude_response(openai_response, original_request):
         "function_call": STOP_TOOL_USE,
     }.get(finish_reason, STOP_END_TURN)
 
+    estimator_model = original_request.get("_estimator_model") or original_request.get("model")
+    usage = openai_response.get("usage", {}) or {}
+    input_tokens = usage.get("prompt_tokens") or estimate_claude_request_tokens(
+        original_request.get("system"),
+        original_request.get("messages"),
+        estimator_model,
+        original_request.get("tools"),
+    )
+    output_tokens = usage.get("completion_tokens")
+    if output_tokens is None:
+        output_text = text_content or ""
+        for block in content_blocks:
+            if block.get("type") == CONTENT_TOOL_USE:
+                output_text += block.get("name", "")
+                output_text += json.dumps(block.get("input", {}), ensure_ascii=False, sort_keys=True)
+        output_tokens = estimate_token_by_model(estimator_model, output_text)
     return {
         "id": openai_response.get("id", f"msg_{uuid.uuid4()}"),
         "type": "message",
@@ -177,14 +194,22 @@ def convert_openai_to_claude_response(openai_response, original_request):
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
-            "input_tokens": openai_response.get("usage", {}).get("prompt_tokens", 0),
-            "output_tokens": openai_response.get("usage", {}).get("completion_tokens", 0),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
         },
     }
 
 
 def stream_openai_to_claude(openai_stream, original_request, logger):
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
+    estimator_model = original_request.get("_estimator_model") or original_request.get("model")
+    input_tokens = estimate_claude_request_tokens(
+        original_request.get("system"),
+        original_request.get("messages"),
+        estimator_model,
+        original_request.get("tools"),
+    )
+    output_text_parts = []
 
     yield _claude_event(
         EVENT_MESSAGE_START,
@@ -198,7 +223,7 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
             },
         },
     )
@@ -241,6 +266,7 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
             finish_reason = choice.get("finish_reason")
 
             if delta.get("content") is not None:
+                output_text_parts.append(delta["content"])
                 yield _claude_event(
                     EVENT_CONTENT_BLOCK_DELTA,
                     {
@@ -270,6 +296,7 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
                 function_data = tc_delta.get(TOOL_FUNCTION, {})
                 if function_data.get("name"):
                     tool_call["name"] = function_data["name"]
+                    output_text_parts.append(function_data["name"])
 
                 if tool_call["id"] and tool_call["name"] and not tool_call["started"]:
                     tool_block_counter += 1
@@ -295,6 +322,7 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
                     and function_data["arguments"] is not None
                 ):
                     tool_call["args_buffer"] += function_data["arguments"]
+                    output_text_parts.append(function_data["arguments"])
                     try:
                         json.loads(tool_call["args_buffer"])
                     except json.JSONDecodeError:
@@ -353,19 +381,25 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
         {
             "type": EVENT_MESSAGE_DELTA,
             "delta": {"stop_reason": final_stop_reason, "stop_sequence": None},
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": estimate_token_by_model(estimator_model, "".join(output_text_parts)),
+            },
         },
     )
     yield _claude_event(EVENT_MESSAGE_STOP, {"type": EVENT_MESSAGE_STOP})
 
 
 def estimate_claude_tokens(req_data):
-    total_chars = len(_extract_system_text(req_data.get("system")))
-
-    for message in req_data.get("messages", []):
-        total_chars += _count_content_chars(message.get("content"))
-
-    return {"input_tokens": max(1, total_chars // 4)}
+    estimator_model = req_data.get("_estimator_model") or req_data.get("model")
+    return {
+        "input_tokens": estimate_claude_request_tokens(
+            req_data.get("system"),
+            req_data.get("messages"),
+            estimator_model,
+            req_data.get("tools"),
+        )
+    }
 
 
 def _convert_claude_user_message(content):
@@ -477,22 +511,5 @@ def _normalize_tool_result(content):
             return content.get("text", "")
         return json.dumps(content, ensure_ascii=False)
     return str(content)
-
-
-def _count_content_chars(content):
-    if content is None:
-        return 0
-    if isinstance(content, str):
-        return len(content)
-    total = 0
-    for block in content:
-        if isinstance(block, dict) and block.get("text"):
-            total += len(block["text"])
-        elif isinstance(block, str):
-            total += len(block)
-    return total
-
-
 def _claude_event(event, payload):
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-

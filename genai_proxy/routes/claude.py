@@ -15,6 +15,7 @@ from genai_proxy.errors import ProxyError
 
 bp = Blueprint("claude", __name__)
 
+
 def map_claude_model_alias(model: str | None, config) -> str | None:
     if not model:
         return model
@@ -44,6 +45,10 @@ def create_message():
         original_model = original_req_data.get("model")
         message_count = len(original_req_data.get("messages", []))
         mapped_model = map_claude_model_alias(original_model, config)
+        original_req_with_estimator = {
+            **original_req_data,
+            "_estimator_model": mapped_model or original_model,
+        }
         if mapped_model != original_model:
             req_data = {**req_data, "model": mapped_model}
         openai_request = convert_claude_to_openai(req_data, model_manager)
@@ -60,7 +65,7 @@ def create_message():
         if openai_request.get("stream"):
             gen = stream_openai_to_claude(
                 service.stream_openai_completion(openai_request),
-                original_req_data,
+                original_req_with_estimator,
                 logger,
             )
             return Response(
@@ -74,7 +79,7 @@ def create_message():
             )
 
         response = service.build_openai_completion(openai_request)
-        return jsonify(convert_openai_to_claude_response(response, original_req_data))
+        return jsonify(convert_openai_to_claude_response(response, original_req_with_estimator))
     except ProxyError as exc:
         return claude_error(exc.message, exc.error_type, exc.status)
     except Exception as exc:
@@ -89,6 +94,11 @@ def create_message():
 def count_tokens():
     try:
         req_data = request.get_json() or {}
+        config = current_app.extensions["config"]
+        req_data = {
+            **req_data,
+            "_estimator_model": map_claude_model_alias(req_data.get("model"), config),
+        }
         return jsonify(estimate_claude_tokens(req_data))
     except Exception as exc:
         return claude_error(str(exc), "api_error", 500)

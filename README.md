@@ -130,6 +130,8 @@ uv run main.py \
 
 - `POST /v1/chat/completions` — 聊天补全（流式/非流式）
 - `GET /v1/models` — 列出可用模型
+- `GET /v1/dashboard/billing/subscription` — 当前代理账号的订阅额度信息
+- `GET /v1/dashboard/billing/usage` — 当前代理账号的使用量信息
 - `POST /v1/messages` — Claude Messages API 兼容接口（流式/非流式）
 - `POST /v1/messages/count_tokens` — Claude token 估算接口
 - `GET /health` — 健康检查
@@ -176,6 +178,10 @@ response = client.chat.completions.create(
 - Claude 兼容接口支持 `x-api-key: <key>` 或 `Authorization: Bearer <key>`
 
 未设置时跳过认证（开发模式）。
+
+计费接口 `/v1/dashboard/billing/*` 使用和其他 `/v1/*` 接口相同的代理鉴权方式。
+
+它返回的是当前代理绑定的 GenAI 账号额度，而不是调用方自带用户身份的额度。
 
 ### Claude Messages API 兼容
 
