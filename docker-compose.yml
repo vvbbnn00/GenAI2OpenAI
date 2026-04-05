@@ -3,10 +3,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: genai2openai
     restart: unless-stopped
+    init: true
+    stop_grace_period: 45s
     ports:
-      - "${APP_PORT:-5000}:${APP_PORT:-5000}"
+      - "${HOST_PORT:-5000}:${APP_PORT:-5000}"
     environment:
       APP_PORT: ${APP_PORT:-5000}
       GENAI_TOKEN: ${GENAI_TOKEN:-}
@@ -16,9 +17,18 @@ services:
       CLAUDE_HAIKU_MODEL: ${CLAUDE_HAIKU_MODEL:-qwen-instruct}
       CLAUDE_SONNET_MODEL: ${CLAUDE_SONNET_MODEL:-qwen-instruct}
       CLAUDE_OPUS_MODEL: ${CLAUDE_OPUS_MODEL:-deepseek-v3:671b}
-    # Uncomment this when using passkey auto-login / refresh.
-    # volumes:
-    #   - ./docker-deploy.keystore:/app/docker-deploy.keystore:ro
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
+      GUNICORN_THREADS: ${GUNICORN_THREADS:-8}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-180}
+      GUNICORN_GRACEFUL_TIMEOUT: ${GUNICORN_GRACEFUL_TIMEOUT:-30}
+      GUNICORN_KEEPALIVE: ${GUNICORN_KEEPALIVE:-10}
+      GUNICORN_MAX_REQUESTS: ${GUNICORN_MAX_REQUESTS:-0}
+      GUNICORN_MAX_REQUESTS_JITTER: ${GUNICORN_MAX_REQUESTS_JITTER:-0}
+    volumes:
+      - type: bind
+        source: ${KEYSTORE_HOST_PATH:-./docker-deploy.keystore}
+        target: /app/docker-deploy.keystore
+        read_only: false
     command:
       - /bin/sh
       - -lc
@@ -29,25 +39,27 @@ services:
           exit 1
         fi
 
-        set -- python main.py --port "$${APP_PORT}"
-
-        if [ -n "$${GENAI_TOKEN:-}" ]; then
-          set -- "$$@" --token "$${GENAI_TOKEN}"
-        fi
-
-        if [ -n "$${KEYSTORE_PATH:-}" ]; then
-          set -- "$$@" --keystore "$${KEYSTORE_PATH}"
-        fi
-
-        if [ -n "$${API_KEY:-}" ]; then
-          set -- "$$@" --api-key "$${API_KEY}"
-        fi
-
         if [ "$${APP_DEBUG:-0}" = "1" ]; then
-          set -- "$$@" --debug
+          log_level=debug
+        else
+          log_level=info
         fi
 
-        exec "$$@"
+        exec gunicorn \
+          --bind "0.0.0.0:$${APP_PORT}" \
+          --worker-class gthread \
+          --workers "$${GUNICORN_WORKERS:-2}" \
+          --threads "$${GUNICORN_THREADS:-8}" \
+          --timeout "$${GUNICORN_TIMEOUT:-180}" \
+          --graceful-timeout "$${GUNICORN_GRACEFUL_TIMEOUT:-30}" \
+          --keep-alive "$${GUNICORN_KEEPALIVE:-10}" \
+          --max-requests "$${GUNICORN_MAX_REQUESTS:-0}" \
+          --max-requests-jitter "$${GUNICORN_MAX_REQUESTS_JITTER:-0}" \
+          --log-level "$${log_level}" \
+          --access-logfile - \
+          --error-logfile - \
+          --capture-output \
+          main:app
     healthcheck:
       test:
         [

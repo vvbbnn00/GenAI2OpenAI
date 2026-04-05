@@ -21,6 +21,7 @@ RUN python -m pip install \
     cryptography==46.0.6 \
     flask==3.1.2 \
     flask-cors==6.0.1 \
+    gunicorn==23.0.0 \
     idna==3.11 \
     itsdangerous==2.2.0 \
     jinja2==3.1.6 \

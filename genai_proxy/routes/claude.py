@@ -30,6 +30,14 @@ def map_claude_model_alias(model: str | None, config) -> str | None:
     return model
 
 
+def _stream_with_completion_log(gen, logger, request_id: str, start_time: float):
+    try:
+        yield from gen
+    finally:
+        elapsed = time.monotonic() - start_time
+        logger.info("[%s] completed in %.2fs", request_id, elapsed)
+
+
 @bp.route("/v1/messages", methods=["POST"])
 def create_message():
     request_id = f"claude_{uuid.uuid4().hex[:16]}"
@@ -38,6 +46,7 @@ def create_message():
     model_manager = current_app.extensions["model_manager"]
     logger = current_app.extensions["logger"]
     config = current_app.extensions["config"]
+    stream = False
 
     try:
         original_req_data = request.get_json() or {}
@@ -62,14 +71,15 @@ def create_message():
             message_count,
         )
 
-        if openai_request.get("stream"):
+        stream = bool(openai_request.get("stream"))
+        if stream:
             gen = stream_openai_to_claude(
                 service.stream_openai_completion(openai_request),
                 original_req_with_estimator,
                 logger,
             )
             return Response(
-                stream_with_context(gen),
+                stream_with_context(_stream_with_completion_log(gen, logger, request_id, start_time)),
                 mimetype="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -86,8 +96,9 @@ def create_message():
         logger.exception("[%s] Unhandled Claude error", request_id)
         return claude_error(str(exc), "api_error", 500)
     finally:
-        elapsed = time.monotonic() - start_time
-        logger.info("[%s] completed in %.2fs", request_id, elapsed)
+        if not stream:
+            elapsed = time.monotonic() - start_time
+            logger.info("[%s] completed in %.2fs", request_id, elapsed)
 
 
 @bp.route("/v1/messages/count_tokens", methods=["POST"])

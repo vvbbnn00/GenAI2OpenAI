@@ -1,12 +1,24 @@
+import os
+
 from genai_proxy.app import create_app
-from genai_proxy.config import parse_args
+from genai_proxy.config import AppConfig, parse_args
 from genai_proxy.logging_utils import setup_logging
 
 
-def main():
-    config = parse_args()
-    logger = setup_logging(config.debug)
+def _config_from_env() -> AppConfig:
+    return AppConfig(
+        token=os.environ.get("GENAI_TOKEN") or None,
+        keystore=os.environ.get("KEYSTORE_PATH") or None,
+        port=int(os.environ.get("APP_PORT", 5000)),
+        debug=os.environ.get("APP_DEBUG", "0") == "1",
+        api_key=os.environ.get("API_KEY") or None,
+        claude_haiku_model=os.environ.get("CLAUDE_HAIKU_MODEL", "qwen-instruct"),
+        claude_sonnet_model=os.environ.get("CLAUDE_SONNET_MODEL", "qwen-instruct"),
+        claude_opus_model=os.environ.get("CLAUDE_OPUS_MODEL", "deepseek-v3:671b"),
+    )
 
+
+def _log_startup(config: AppConfig, logger) -> None:
     if config.api_key:
         logger.info("API key authentication enabled")
     else:
@@ -27,12 +39,27 @@ def main():
         config.claude_opus_model,
     )
 
+
+def create_app_from_env():
+    config = _config_from_env()
+    logger = setup_logging(config.debug)
+    _log_startup(config, logger)
+    return create_app(config, logger)
+
+
+def main():
+    config = parse_args()
+    logger = setup_logging(config.debug)
+    _log_startup(config, logger)
+
     app = create_app(config, logger)
     try:
-        app.run(host="0.0.0.0", port=config.port, debug=False)
+        app.run(host="0.0.0.0", port=config.port, debug=False, threaded=True)
     finally:
         app.extensions["token_manager"].shutdown()
 
 
 if __name__ == "__main__":
     main()
+else:
+    app = create_app_from_env()

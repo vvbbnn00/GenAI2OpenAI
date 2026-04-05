@@ -26,12 +26,21 @@ def _billing_error_response(exc: ProxyError, fallback_message: str, fallback_err
     )
 
 
+def _stream_with_completion_log(gen, logger, request_id: str, start_time: float):
+    try:
+        yield from gen
+    finally:
+        elapsed = time.monotonic() - start_time
+        logger.info("[%s] completed in %.2fs", request_id, elapsed)
+
+
 @bp.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
     request_id = f"req_{uuid.uuid4().hex[:16]}"
     start_time = time.monotonic()
     service = current_app.extensions["genai_service"]
     logger = current_app.extensions["logger"]
+    stream = False
 
     try:
         req_data = request.get_json()
@@ -48,7 +57,7 @@ def chat_completions():
         if stream:
             gen = service.stream_openai_completion(req_data)
             return Response(
-                stream_with_context(gen),
+                stream_with_context(_stream_with_completion_log(gen, logger, request_id, start_time)),
                 mimetype="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -74,8 +83,9 @@ def chat_completions():
             status=500,
         )
     finally:
-        elapsed = time.monotonic() - start_time
-        logger.info("[%s] completed in %.2fs", request_id, elapsed)
+        if not stream:
+            elapsed = time.monotonic() - start_time
+            logger.info("[%s] completed in %.2fs", request_id, elapsed)
 
 
 @bp.route("/v1/models", methods=["GET"])

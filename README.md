@@ -40,8 +40,7 @@ APP_DEBUG=0
 
 如果你要使用 keystore 自动登录/自动刷新：
 
-- 将 `docker-compose.yml` 里的 `volumes` 注释取消
-- 把本地 keystore 挂载到容器内，例如 `/app/docker-deploy.keystore`
+- 把本地 keystore 放到 `KEYSTORE_HOST_PATH` 指向的位置，默认是仓库根目录的 `./docker-deploy.keystore`
 - 在 `.env` 中设置 `KEYSTORE_PATH=/app/docker-deploy.keystore`
 
 3. 构建并启动服务：
@@ -68,12 +67,23 @@ docker compose down
 |------|------|--------|
 | `GENAI_TOKEN` | GenAI 平台 JWT；和 `KEYSTORE_PATH` 二选一或同时提供 | 空 |
 | `KEYSTORE_PATH` | 容器内的 keystore 路径，用于 passkey 自动登录/刷新 | 空 |
+| `KEYSTORE_HOST_PATH` | 宿主机上的 keystore 文件路径，会挂载到容器内 | `./docker-deploy.keystore` |
 | `APP_PORT` | 容器内和映射到宿主机的监听端口 | `5000` |
+| `HOST_PORT` | 宿主机暴露端口 | `5000` |
 | `PROXY_API_KEY` | 代理自身的客户端认证密钥，会传给应用的 `API_KEY` 环境变量 | 空 |
 | `APP_DEBUG` | 是否启用 `--debug`，`1` 为开启 | `0` |
 | `CLAUDE_HAIKU_MODEL` | Claude haiku 别名映射到的 GenAI 模型 | `qwen-instruct` |
 | `CLAUDE_SONNET_MODEL` | Claude sonnet 别名映射到的 GenAI 模型 | `qwen-instruct` |
 | `CLAUDE_OPUS_MODEL` | Claude opus 别名映射到的 GenAI 模型 | `deepseek-v3:671b` |
+| `GUNICORN_WORKERS` | gunicorn worker 进程数 | `2` |
+| `GUNICORN_THREADS` | 每个 worker 的线程数，决定长连接并发承载能力 | `8` |
+| `GUNICORN_TIMEOUT` | 单请求超时，适合 LLM 长响应 | `180` |
+| `GUNICORN_GRACEFUL_TIMEOUT` | 优雅退出超时 | `30` |
+| `GUNICORN_KEEPALIVE` | HTTP keep-alive 秒数 | `10` |
+| `GUNICORN_MAX_REQUESTS` | 单 worker 最多处理请求数，`0` 表示不轮换 | `0` |
+| `GUNICORN_MAX_REQUESTS_JITTER` | worker 轮换抖动 | `0` |
+
+`docker-compose.yml` 默认使用 `gunicorn + gthread`，比直接跑 Flask 开发服务器更适合本项目这种“请求会长时间阻塞在上游 LLM SSE 输出上”的代理场景。
 
 ### 启动服务
 

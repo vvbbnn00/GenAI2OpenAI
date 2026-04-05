@@ -1,10 +1,16 @@
 import atexit
 import base64
 import json
+import os
 import threading
 import time
 from datetime import datetime
 from urllib.parse import parse_qs, quote, urlparse
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 
 GENAI_LOGIN_URL = "https://genai.shanghaitech.edu.cn/htk/user/login"
@@ -35,6 +41,7 @@ class TokenManager:
         self._logger = logger
         self._token = token
         self._keystore_path = keystore_path
+        self._token_cache_path = f"{keystore_path}.token.json" if keystore_path else None
         self._token_exp = None
         self._lock = threading.Lock()
         self._ids_client = None
@@ -46,7 +53,6 @@ class TokenManager:
             self._update_expiry()
 
         if not token and keystore_path:
-            self._logger.info("No initial token provided, logging in via passkey...")
             self._refresh_token()
 
         atexit.register(self.shutdown)
@@ -83,6 +89,67 @@ class TokenManager:
             return False
         return time.time() >= (self._token_exp - self.REFRESH_MARGIN)
 
+    def _with_process_refresh_lock(self):
+        if not self._token_cache_path or fcntl is None:
+            return None
+
+        lock_path = f"{self._token_cache_path}.lock"
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return lock_fd
+
+    def _release_process_refresh_lock(self, lock_fd) -> None:
+        if lock_fd is None or fcntl is None:
+            return
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+    def _load_cached_token(self) -> bool:
+        if not self._token_cache_path:
+            return False
+
+        try:
+            with open(self._token_cache_path, encoding="utf-8") as cache_file:
+                payload = json.load(cache_file)
+        except FileNotFoundError:
+            return False
+        except Exception as exc:
+            self._logger.warning("Failed to read token cache %s: %s", self._token_cache_path, exc)
+            return False
+
+        cached_token = payload.get("token")
+        cached_exp = payload.get("exp")
+        if not cached_token or not cached_exp:
+            return False
+
+        if time.time() >= (float(cached_exp) - self.REFRESH_MARGIN):
+            return False
+
+        self._token = cached_token
+        self._update_expiry()
+        self._logger.info("Loaded GenAI token from cache: %s", self._token_cache_path)
+        return True
+
+    def _write_cached_token(self) -> None:
+        if not self._token_cache_path or not self._token:
+            return
+
+        payload = {
+            "token": self._token,
+            "exp": self._token_exp,
+            "updated_at": int(time.time()),
+        }
+        temp_path = f"{self._token_cache_path}.tmp"
+
+        try:
+            with open(temp_path, "w", encoding="utf-8") as cache_file:
+                json.dump(payload, cache_file)
+            os.replace(temp_path, self._token_cache_path)
+        except Exception as exc:
+            self._logger.warning("Failed to update token cache %s: %s", self._token_cache_path, exc)
+
     def _refresh_token(self) -> None:
         if not self._keystore_path:
             self._logger.warning(
@@ -90,7 +157,11 @@ class TokenManager:
             )
             return
 
+        lock_fd = self._with_process_refresh_lock()
         try:
+            if self._load_cached_token():
+                return
+
             from shanghaitech_ids_passkey import IDSClient, PasskeyKeystore
 
             self._logger.info("Refreshing GenAI token via passkey login...")
@@ -138,6 +209,7 @@ class TokenManager:
             self._token = real_token
             self._update_expiry()
             keystore.dump(self._keystore_path)
+            self._write_cached_token()
             self._logger.info("GenAI token refreshed successfully")
         except ImportError:
             self._logger.error(
@@ -148,6 +220,8 @@ class TokenManager:
         except Exception:
             self._logger.exception("Failed to refresh token via passkey")
             raise
+        finally:
+            self._release_process_refresh_lock(lock_fd)
 
     @property
     def token(self) -> str | None:
@@ -181,4 +255,3 @@ class TokenManager:
                 self._logger.exception("Failed to logout from IDS during shutdown")
             finally:
                 self._ids_client.session.close()
-
