@@ -22,8 +22,10 @@ Rules:
 2. The arguments field must be a JSON object matching the schema.
 3. The only valid closing tag is </tool_call>. Do not use </arg_value>.
 4. Do not wrap tool calls in markdown fences.
-5. After tool results are provided, answer the user normally unless another tool is truly needed.
-6. If no tool is needed, answer normally without <tool_call> tags."""
+5. For Claude Code tools such as Bash, Read, Edit, or Write, use the exact tool name from the schema and still use the JSON object format above.
+6. Do not print raw forms such as Bash<arg_key>command as final text.
+7. After tool results are provided, answer the user normally unless another tool is truly needed.
+8. If no tool is needed, answer normally without <tool_call> tags."""
 
 GLM_REQUIRED_TOOL_SUFFIX = (
     "\nFor this turn, you must call at least one tool using a <tool_call> block."

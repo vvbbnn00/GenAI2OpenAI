@@ -207,3 +207,5 @@ marimo/_lsp/
 __marimo__/
 .idea/
 *.keystore
+*.keystore.token.json
+*.keystore.token.json.lock

@@ -18,7 +18,9 @@ def select_tool_adapter(model: str | None, record: dict | None = None) -> str:
 
 def tool_start_tags(adapter: str) -> tuple[str, ...]:
     if adapter == DEEPSEEK_ADAPTER:
-        return ("<｜DSML｜function_calls>", "<tool_call>")
+        return ("<｜DSML｜function_calls>", "<tool_call>", "<arg_key>")
+    if adapter in {GLM_ADAPTER, MINIMAX_ADAPTER}:
+        return ("<tool_call>", "<arg_key>")
     return ("<tool_call>",)
 
 

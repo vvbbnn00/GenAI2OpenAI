@@ -534,7 +534,7 @@ class GenAIService:
     def _stream_genai_response_with_tools(self, prepared: PreparedChatRequest):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(datetime.now().timestamp())
-        open_tags = tool_start_tags(prepared.tool_adapter)
+        open_tags = _tool_start_tags_for_request(prepared.tool_adapter, prepared.tools)
         buffer = ""
         tool_buffer = ""
         sent_role = False
@@ -752,6 +752,28 @@ def _find_first_tag(text: str, tags: tuple[str, ...]) -> tuple[int, str | None]:
             first_pos = pos
             first_tag = tag
     return first_pos, first_tag
+
+
+def _tool_start_tags_for_request(adapter: str, tools: list | None) -> tuple[str, ...]:
+    tags = list(tool_start_tags(adapter))
+    for name in _request_tool_names(tools):
+        tags.append(f"{name}<arg_key>")
+        tags.append(f"{name} <arg_key>")
+    return tuple(dict.fromkeys(tags))
+
+
+def _request_tool_names(tools: list | None) -> list[str]:
+    names = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function_data = tool.get("function", {})
+        if not isinstance(function_data, dict):
+            function_data = {}
+        name = function_data.get("name") or tool.get("name")
+        if name:
+            names.append(name)
+    return names
 
 
 def _normalize_stream_tool_call(tool_call: dict) -> dict:

@@ -194,6 +194,8 @@ GenAI 的模型名并不总是直接等于上游模型名，代理会结合 `/v1
 
 这些模型在请求 GenAI 时仍会尽量传递 Xinference/OpenAI 兼容的 `messages`、`tools`、`tool_choice` 字段；当上游未稳定返回原生 `tool_calls` 时，代理会使用模型专用的文本工具格式兜底，并统一转换成 OpenAI 或 Claude Messages API 的工具调用响应。
 
+针对 Claude Code 常见的 `Bash`、`Read`、`Edit`、`Write` 等工具，代理会优先保留请求里的精确工具名，并兼容模型偶发输出的 `Bash<arg_key>`、`<arg_value>`、DSML 和 JSON-ish 工具块，避免把工具调用直接透传成普通文本。
+
 ### API Key 认证
 
 设置 `--api-key` 或环境变量 `API_KEY` 后：
@@ -288,7 +290,7 @@ uv run python test_tool_adapters.py
 uv run python test_allowed_models_integration.py --repeat 20 --models deepseek-chat MiniMax-M1 chatglm
 ```
 
-该集成测试只允许调用 `deepseek-chat`、`MiniMax-M1`、`chatglm`，覆盖 OpenAI 和 Claude Messages 两种调用风格下的非流式工具调用、流式工具调用、工具结果回合和无需工具的普通回答。
+该集成测试只允许调用 `deepseek-chat`、`MiniMax-M1`、`chatglm`，覆盖 OpenAI 和 Claude Messages 两种调用风格下的非流式工具调用、流式工具调用、Claude Code 风格 `Bash` 工具、工具结果回合和无需工具的普通回答。
 
 ## 项目结构
 

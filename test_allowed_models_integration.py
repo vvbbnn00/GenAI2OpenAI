@@ -21,6 +21,18 @@ CITIES = (
     "Wuhan",
 )
 CONDITIONS = ("sunny", "cloudy", "rainy", "windy", "clear")
+BASH_TASKS = (
+    "inspect package.json and list dependency names",
+    "run npm audit in JSON mode and show the first 200 lines",
+    "print the first 80 lines of package.json",
+    "list package lock files in the app directory",
+    "show the npm scripts from package.json",
+    "check installed Next.js dependency metadata",
+    "count direct dependencies in package.json",
+    "show overridden dependency versions",
+    "inspect TypeScript and ESLint versions",
+    "check whether sharp is pinned",
+)
 
 OPENAI_WEATHER_TOOL = {
     "type": "function",
@@ -48,6 +60,37 @@ CLAUDE_WEATHER_TOOL = {
             "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
         },
         "required": ["location"],
+    },
+}
+
+OPENAI_BASH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "Bash",
+        "description": "Run a shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Command to run"},
+                "description": {"type": "string", "description": "Short description"},
+                "timeout": {"type": "integer", "description": "Timeout in milliseconds"},
+            },
+            "required": ["command"],
+        },
+    },
+}
+
+CLAUDE_BASH_TOOL = {
+    "name": "Bash",
+    "description": "Run a shell command.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "Command to run"},
+            "description": {"type": "string", "description": "Short description"},
+            "timeout": {"type": "integer", "description": "Timeout in milliseconds"},
+        },
+        "required": ["command"],
     },
 }
 
@@ -85,10 +128,14 @@ def main():
                 for name, fn in (
                     ("openai_tool_call", test_openai_tool_call),
                     ("openai_stream_tool_call", test_openai_stream_tool_call),
+                    ("openai_bash_tool_call", test_openai_bash_tool_call),
+                    ("openai_stream_bash_tool_call", test_openai_stream_bash_tool_call),
                     ("openai_tool_result_turn", test_openai_tool_result_turn),
                     ("openai_no_tool_needed", test_openai_no_tool_needed),
                     ("claude_tool_use", test_claude_tool_use),
                     ("claude_stream_tool_use", test_claude_stream_tool_use),
+                    ("claude_bash_tool_use", test_claude_bash_tool_use),
+                    ("claude_stream_bash_tool_use", test_claude_stream_bash_tool_use),
                     ("claude_tool_result_turn", test_claude_tool_result_turn),
                 ):
                     for iteration in range(args.repeat):
@@ -150,6 +197,49 @@ def test_openai_stream_tool_call(client, model, iteration):
         for tc in choice.get("delta", {}).get("tool_calls", []) or []
     ]
     assert tool_chunks, "stream did not contain tool_calls"
+    assert any(
+        choice.get("finish_reason") == "tool_calls"
+        for event in events
+        for choice in event.get("choices", [])
+    )
+
+
+def test_openai_bash_tool_call(client, model, iteration):
+    data = post_json(
+        client,
+        "/v1/chat/completions",
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": bash_prompt(iteration)}],
+            "tools": [OPENAI_BASH_TOOL],
+            "tool_choice": {"type": "function", "function": {"name": "Bash"}},
+            "max_tokens": 1024,
+        },
+    )
+    tool_call = first_openai_tool_call(data)
+    assert_bash_tool_call(tool_call)
+
+
+def test_openai_stream_bash_tool_call(client, model, iteration):
+    events = post_stream(
+        client,
+        "/v1/chat/completions",
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": bash_prompt(iteration + 1)}],
+            "tools": [OPENAI_BASH_TOOL],
+            "tool_choice": {"type": "function", "function": {"name": "Bash"}},
+            "stream": True,
+            "max_tokens": 1024,
+        },
+    )
+    tool_chunks = [
+        tc
+        for event in events
+        for choice in event.get("choices", [])
+        for tc in choice.get("delta", {}).get("tool_calls", []) or []
+    ]
+    assert tool_chunks, "stream did not contain Bash tool_calls"
     assert any(
         choice.get("finish_reason") == "tool_calls"
         for event in events
@@ -256,6 +346,37 @@ def test_claude_stream_tool_use(client, model, iteration):
     )
 
 
+def test_claude_bash_tool_use(client, model, iteration):
+    data = post_json(client, "/v1/messages", claude_bash_tool_request(model, bash_prompt(iteration + 2)))
+    block = first_claude_tool_use(data)
+    assert_bash_tool_use(block)
+    assert data["stop_reason"] == "tool_use"
+
+
+def test_claude_stream_bash_tool_use(client, model, iteration):
+    events = post_claude_stream(
+        client,
+        "/v1/messages",
+        {
+            **claude_bash_tool_request(model, bash_prompt(iteration + 3)),
+            "stream": True,
+        },
+    )
+    tool_starts = [
+        event["data"]["content_block"]
+        for event in events
+        if event["event"] == "content_block_start"
+        and event["data"].get("content_block", {}).get("type") == "tool_use"
+    ]
+    assert tool_starts, "Claude stream did not start a Bash tool_use block"
+    assert any(block.get("name") == "Bash" for block in tool_starts)
+    assert any(
+        event["event"] == "message_delta"
+        and event["data"].get("delta", {}).get("stop_reason") == "tool_use"
+        for event in events
+    )
+
+
 def test_claude_tool_result_turn(client, model, iteration):
     city = city_for(iteration + 5)
     condition = CONDITIONS[(iteration + 2) % len(CONDITIONS)]
@@ -303,6 +424,25 @@ def claude_tool_request(model, text):
         "tools": [CLAUDE_WEATHER_TOOL],
         "tool_choice": {"type": "tool", "name": "get_weather"},
     }
+
+
+def claude_bash_tool_request(model, text):
+    return {
+        "model": model,
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": text}],
+        "tools": [CLAUDE_BASH_TOOL],
+        "tool_choice": {"type": "tool", "name": "Bash"},
+    }
+
+
+def bash_prompt(iteration):
+    task = BASH_TASKS[iteration % len(BASH_TASKS)]
+    return (
+        f"Run {iteration}: use the Bash tool for this Claude Code style request. "
+        f"Target project path is f:/onedrive-vercel/app. Task: {task}. "
+        "Return a tool call only."
+    )
 
 
 def city_for(iteration):
@@ -373,6 +513,18 @@ def first_claude_tool_use(data):
         if block.get("type") == "tool_use":
             return block
     raise AssertionError(f"no tool_use block: {json.dumps(data, ensure_ascii=False)[:500]}")
+
+
+def assert_bash_tool_call(tool_call):
+    assert tool_call["function"]["name"] == "Bash"
+    arguments = json.loads(tool_call["function"]["arguments"])
+    assert isinstance(arguments.get("command"), str) and arguments["command"].strip()
+
+
+def assert_bash_tool_use(block):
+    assert block["name"] == "Bash"
+    assert isinstance(block.get("input"), dict)
+    assert isinstance(block["input"].get("command"), str) and block["input"]["command"].strip()
 
 
 def assert_no_error_payload(data):
