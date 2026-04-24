@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+ARG DEBIAN_MIRROR=http://mirrors.ustc.edu.cn/debian
+ARG DEBIAN_SECURITY_MIRROR=http://mirrors.ustc.edu.cn/debian-security
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -8,7 +11,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN apt-get update \
+RUN set -eux; \
+    for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+        [ -f "$source_file" ] || continue; \
+        sed -i \
+            -e "s|http://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+            -e "s|https://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+            -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
+            -e "s|https://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
+            -e "s|http://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+            -e "s|https://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+            "$source_file"; \
+    done \
+    && apt-get update \
     && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
