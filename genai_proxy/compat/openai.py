@@ -6,8 +6,13 @@ from datetime import datetime
 from flask import jsonify
 
 from genai_proxy.optimizations import (
+    DEEPSEEK_ADAPTER,
+    GLM_ADAPTER,
+    MINIMAX_ADAPTER,
     extract_deepseek_tool_calls,
     inject_deepseek_tool_prompt,
+    inject_glm_tool_prompt,
+    inject_minimax_tool_prompt,
     is_deepseek_model,
 )
 
@@ -91,9 +96,31 @@ def format_tool_definitions(tools):
     return "\n".join(definitions)
 
 
-def inject_tool_prompt(messages, tools, tool_choice=None, model=None):
-    if is_deepseek_model(model):
-        return inject_deepseek_tool_prompt(messages, tools, tool_choice)
+def inject_tool_prompt(
+    messages,
+    tools,
+    tool_choice=None,
+    model=None,
+    adapter=None,
+):
+    if adapter == DEEPSEEK_ADAPTER or (adapter is None and is_deepseek_model(model)):
+        return inject_deepseek_tool_prompt(
+            messages,
+            tools,
+            tool_choice,
+        )
+    if adapter == MINIMAX_ADAPTER:
+        return inject_minimax_tool_prompt(
+            messages,
+            tools,
+            tool_choice,
+        )
+    if adapter == GLM_ADAPTER:
+        return inject_glm_tool_prompt(
+            messages,
+            tools,
+            tool_choice,
+        )
 
     tool_defs = format_tool_definitions(tools)
     tool_prompt = TOOL_SYSTEM_PROMPT.format(tool_definitions=tool_defs)
@@ -158,13 +185,25 @@ def strip_think_blocks(content):
 
 def _parse_tool_call_body(raw):
     raw = raw.strip()
+    raw = re.sub(r"</?arg_value>", "", raw).strip()
 
     try:
         call = json.loads(raw)
         if "name" in call:
+            call["arguments"] = _normalize_arguments(call.get("arguments", {}))
             return call
     except (json.JSONDecodeError, ValueError):
         pass
+
+    json_obj = _extract_first_json_object(raw)
+    if json_obj:
+        try:
+            call = json.loads(json_obj)
+            if "name" in call:
+                call["arguments"] = _normalize_arguments(call.get("arguments", {}))
+                return call
+        except (json.JSONDecodeError, ValueError):
+            pass
 
     name_m = re.search(r"<name>\s*(.*?)\s*</name>", raw, re.DOTALL)
     args_m = re.search(r"<arguments>\s*(.*?)\s*</arguments>", raw, re.DOTALL)
@@ -182,7 +221,7 @@ def _parse_tool_call_body(raw):
     return None
 
 
-def extract_tool_calls(content, logger=None, tools=None, model=None):
+def extract_tool_calls(content, logger=None, tools=None, model=None, adapter=None):
     cleaned = strip_think_blocks(content)
     cleaned = re.sub(
         r"```(?:xml|json|plaintext|text)?\s*\n?\s*(<tool_call>.*?</tool_call>)\s*\n?\s*```",
@@ -191,7 +230,7 @@ def extract_tool_calls(content, logger=None, tools=None, model=None):
         flags=re.DOTALL,
     )
 
-    if is_deepseek_model(model):
+    if adapter == DEEPSEEK_ADAPTER or (adapter is None and is_deepseek_model(model)):
         repaired_tool_calls, repaired_remaining = extract_deepseek_tool_calls(
             cleaned,
             tools=tools,
@@ -200,8 +239,7 @@ def extract_tool_calls(content, logger=None, tools=None, model=None):
         if repaired_tool_calls:
             return repaired_tool_calls, repaired_remaining
 
-    pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
-    matches = re.findall(pattern, cleaned, re.DOTALL)
+    matches, spans = _find_tool_call_blocks(cleaned)
 
     if not matches:
         if logger:
@@ -234,7 +272,7 @@ def extract_tool_calls(content, logger=None, tools=None, model=None):
                 "function": {
                     "name": call["name"],
                     "arguments": json.dumps(
-                        call.get("arguments", {}),
+                        _normalize_arguments(call.get("arguments", {})),
                         ensure_ascii=False,
                     ),
                 },
@@ -244,8 +282,108 @@ def extract_tool_calls(content, logger=None, tools=None, model=None):
     if not tool_calls:
         return None, content
 
-    remaining = re.sub(r"<tool_call>.*?</tool_call>", "", cleaned, flags=re.DOTALL).strip()
+    remaining = _remove_spans(cleaned, spans).strip()
     return tool_calls, remaining or None
+
+
+def _normalize_arguments(arguments):
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+            if isinstance(parsed, dict):
+                return parsed
+            return {"value": parsed}
+        except json.JSONDecodeError:
+            return {"raw": arguments}
+    if arguments is None:
+        return {}
+    return {"value": arguments}
+
+
+def _find_tool_call_blocks(content: str):
+    matches = []
+    spans = []
+    start_tag = "<tool_call>"
+    end_pattern = re.compile(r"</(?:tool_call|arg_value)>", re.DOTALL)
+    pos = 0
+
+    while True:
+        start = content.find(start_tag, pos)
+        if start < 0:
+            break
+
+        body_start = start + len(start_tag)
+        end_match = end_pattern.search(content, body_start)
+        if end_match:
+            body_end = end_match.start()
+            block_end = end_match.end()
+        else:
+            json_start = content.find("{", body_start)
+            json_end = _json_object_end(content, json_start) if json_start >= 0 else -1
+            if json_end > 0:
+                body_end = json_end
+                block_end = json_end
+            else:
+                next_start = content.find(start_tag, body_start)
+                body_end = next_start if next_start >= 0 else len(content)
+                block_end = body_end
+
+        matches.append(content[body_start:body_end])
+        spans.append((start, block_end))
+        pos = max(block_end, body_start + 1)
+
+    return matches, spans
+
+
+def _remove_spans(content: str, spans):
+    pieces = []
+    cursor = 0
+    for start, end in spans:
+        pieces.append(content[cursor:start])
+        cursor = end
+    pieces.append(content[cursor:])
+    return "".join(pieces)
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    end = _json_object_end(text, start)
+    if end < 0:
+        return None
+    return text[start:end]
+
+
+def _json_object_end(text: str, start: int) -> int:
+    if start < 0 or start >= len(text) or text[start] != "{":
+        return -1
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return -1
 
 
 def tag_prefix_len(text, tag):

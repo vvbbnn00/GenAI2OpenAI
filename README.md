@@ -91,7 +91,7 @@ docker compose down
 uv run main.py --token <token> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --keystore <path/to/ids-passkey.keystore> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --token <token> --keystore <path/to/ids-passkey.keystore> [--port 5000] [--api-key <key>] [--debug]
-uv run main.py --token <token> --claude-opus-model deepseek-v3:671b --claude-sonnet-model qwen-instruct --claude-haiku-model qwen-instruct
+uv run main.py --token <token> --claude-opus-model deepseek-chat --claude-sonnet-model MiniMax-M1 --claude-haiku-model chatglm
 ```
 
 认证参数说明：
@@ -159,7 +159,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="GPT-4.1",
+    model="deepseek-chat",
     messages=[{"role": "user", "content": "北京今天天气怎么样？"}],
     tools=[{
         "type": "function",
@@ -179,6 +179,20 @@ response = client.chat.completions.create(
 ```
 
 支持 `tool_choice` 参数：`"auto"`（默认）、`"required"`、指定函数名。
+
+### Xinference 模型工具适配
+
+GenAI 的模型名并不总是直接等于上游模型名，代理会结合 `/v1/models` 返回的 `aiType`、`aiName`、`simpleName`、`descInfo`、`rootAiType`、`rootModelName` 判断具体适配器。
+
+当前对以下 Xinference 上游模型有专用 tool calling 适配：
+
+| GenAI 模型名 | GenAI 描述线索 | 上游 | 适配重点 |
+|-------------|----------------|------|----------|
+| `deepseek-chat` | DeepSeek V4 Flash / DeepSeek V4 | Xinference | DSML 工具块解析、OpenAI `tool_calls` 转换、流式工具调用识别 |
+| `MiniMax-M1` | MiniMax 2.7 | Xinference | XML `<tool_call>` 兜底、`reasoning_split`、`<think>` 内容过滤、工具结果回合收敛 |
+| `chatglm` | GLM 5.1 | Xinference | XML `<tool_call>` 解析、`tool_stream`、非标准闭合标签修复、流式工具调用识别 |
+
+这些模型在请求 GenAI 时仍会尽量传递 Xinference/OpenAI 兼容的 `messages`、`tools`、`tool_choice` 字段；当上游未稳定返回原生 `tool_calls` 时，代理会使用模型专用的文本工具格式兜底，并统一转换成 OpenAI 或 Claude Messages API 的工具调用响应。
 
 ### API Key 认证
 
@@ -222,9 +236,9 @@ response = client.chat.completions.create(
 ```bash
 uv run main.py \
   --keystore /path/to/ids-passkey.keystore \
-  --claude-haiku-model qwen-instruct \
-  --claude-sonnet-model GPT-4.1 \
-  --claude-opus-model GPT-5.4
+  --claude-haiku-model chatglm \
+  --claude-sonnet-model MiniMax-M1 \
+  --claude-opus-model deepseek-chat
 ```
 
 例如下面这些模型名都可以工作，只要名称中带有 `haiku`、`sonnet` 或 `opus`：
@@ -259,6 +273,23 @@ print(resp)
 
 `/v1/models` 会实时读取 GenAI 上游模型列表，返回当前账号在 GenAI 可见的模型。它会自动带出上游的 `rootAiType`，并默认过滤 `gpt-image-1.5`。具体模型集合以 `/v1/models` 的实时返回为准。
 
+## 测试
+
+基础离线检查：
+
+```bash
+uv run python -m compileall genai_proxy test_tool_adapters.py test_allowed_models_integration.py
+uv run python test_tool_adapters.py
+```
+
+使用 `docker-deploy.keystore` 对 DeepSeek V4 Flash、MiniMax 2.7、GLM-5.1 做 20 轮变体集成测试：
+
+```bash
+uv run python test_allowed_models_integration.py --repeat 20 --models deepseek-chat MiniMax-M1 chatglm
+```
+
+该集成测试只允许调用 `deepseek-chat`、`MiniMax-M1`、`chatglm`，覆盖 OpenAI 和 Claude Messages 两种调用风格下的非流式工具调用、流式工具调用、工具结果回合和无需工具的普通回答。
+
 ## 项目结构
 
 项目按职责分为以下几层：
@@ -270,6 +301,7 @@ print(resp)
 - `genai_proxy/services/genai.py`：GenAI 上游调用与 OpenAI SSE 转换
 - `genai_proxy/compat/openai.py`：OpenAI tool calling 兼容逻辑
 - `genai_proxy/compat/claude.py`：Claude Messages API 转换逻辑
+- `genai_proxy/optimizations/`：模型专用 tool calling 适配与解析逻辑
 - `genai_proxy/routes/`：OpenAI / Claude 路由
 
 ## Token 与 Passkey

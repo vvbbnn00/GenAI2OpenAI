@@ -87,7 +87,10 @@ def inject_deepseek_tool_prompt(messages, tools, tool_choice=None):
             new_messages.append(
                 {
                     "role": "user",
-                    "content": _render_function_results(tool_messages),
+                    "content": _render_function_results(
+                        tool_messages,
+                        allow_additional_tool_calls=_allows_additional_tool_calls(tool_choice),
+                    ),
                 }
             )
             continue
@@ -200,13 +203,29 @@ def _render_dsml_parameter(key: str, value: Any) -> str:
     )
 
 
-def _render_function_results(tool_messages) -> str:
-    result_lines = ["<function_results>"]
+def _render_function_results(tool_messages, allow_additional_tool_calls=False) -> str:
+    result_lines = [
+        "<function_results>",
+    ]
+    if allow_additional_tool_calls:
+        result_lines.append(
+            "Use these function results to answer the user. Only call another function if the current result is genuinely insufficient."
+        )
+    else:
+        result_lines.append(
+            "The function results are sufficient and final for this turn. Answer the user normally using them. Do not emit DSML function_calls or <tool_call> tags."
+        )
     for msg in tool_messages:
         result_content = _normalize_tool_content(msg.get("content"))
         result_lines.append(f"<result>{result_content}</result>")
     result_lines.append("</function_results>")
     return "\n".join(result_lines)
+
+
+def _allows_additional_tool_calls(tool_choice) -> bool:
+    return tool_choice == "required" or (
+        isinstance(tool_choice, dict) and tool_choice.get("type") == "function"
+    )
 
 
 def _extract_dsml_tool_calls(content, logger=None):

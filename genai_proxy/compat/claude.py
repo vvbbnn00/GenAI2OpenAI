@@ -243,112 +243,113 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
     final_stop_reason = STOP_END_TURN
 
     try:
-        for line in openai_stream:
-            if not line.strip() or not line.startswith("data: "):
-                continue
+        for payload in openai_stream:
+            for line in _iter_openai_sse_lines(payload):
+                if not line.strip() or not line.startswith("data: "):
+                    continue
 
-            chunk_data = line[6:].strip()
-            if chunk_data == "[DONE]":
-                break
+                chunk_data = line[6:].strip()
+                if chunk_data == "[DONE]":
+                    break
 
-            try:
-                chunk = json.loads(chunk_data)
-            except json.JSONDecodeError as exc:
-                logger.warning("Failed to parse OpenAI chunk: %s", exc)
-                continue
+                try:
+                    chunk = json.loads(chunk_data)
+                except json.JSONDecodeError as exc:
+                    logger.warning("Failed to parse OpenAI chunk: %s", exc)
+                    continue
 
-            choices = chunk.get("choices", [])
-            if not choices:
-                continue
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
 
-            choice = choices[0]
-            delta = choice.get("delta", {})
-            finish_reason = choice.get("finish_reason")
+                choice = choices[0]
+                delta = choice.get("delta", {})
+                finish_reason = choice.get("finish_reason")
 
-            if delta.get("content") is not None:
-                output_text_parts.append(delta["content"])
-                yield _claude_event(
-                    EVENT_CONTENT_BLOCK_DELTA,
-                    {
-                        "type": EVENT_CONTENT_BLOCK_DELTA,
-                        "index": text_block_index,
-                        "delta": {"type": DELTA_TEXT, "text": delta["content"]},
-                    },
-                )
-
-            for tc_delta in delta.get("tool_calls", []) or []:
-                tc_index = tc_delta.get("index", 0)
-                tool_call = current_tool_calls.setdefault(
-                    tc_index,
-                    {
-                        "id": None,
-                        "name": None,
-                        "args_buffer": "",
-                        "json_sent": False,
-                        "claude_index": None,
-                        "started": False,
-                    },
-                )
-
-                if tc_delta.get("id"):
-                    tool_call["id"] = tc_delta["id"]
-
-                function_data = tc_delta.get(TOOL_FUNCTION, {})
-                if function_data.get("name"):
-                    tool_call["name"] = function_data["name"]
-                    output_text_parts.append(function_data["name"])
-
-                if tool_call["id"] and tool_call["name"] and not tool_call["started"]:
-                    tool_block_counter += 1
-                    tool_call["claude_index"] = text_block_index + tool_block_counter
-                    tool_call["started"] = True
+                if delta.get("content") is not None:
+                    output_text_parts.append(delta["content"])
                     yield _claude_event(
-                        EVENT_CONTENT_BLOCK_START,
+                        EVENT_CONTENT_BLOCK_DELTA,
                         {
-                            "type": EVENT_CONTENT_BLOCK_START,
-                            "index": tool_call["claude_index"],
-                            "content_block": {
-                                "type": CONTENT_TOOL_USE,
-                                "id": tool_call["id"],
-                                "name": tool_call["name"],
-                                "input": {},
-                            },
+                            "type": EVENT_CONTENT_BLOCK_DELTA,
+                            "index": text_block_index,
+                            "delta": {"type": DELTA_TEXT, "text": delta["content"]},
                         },
                     )
 
-                if (
-                    "arguments" in function_data
-                    and tool_call["started"]
-                    and function_data["arguments"] is not None
-                ):
-                    tool_call["args_buffer"] += function_data["arguments"]
-                    output_text_parts.append(function_data["arguments"])
-                    try:
-                        json.loads(tool_call["args_buffer"])
-                    except json.JSONDecodeError:
-                        pass
-                    else:
-                        if not tool_call["json_sent"]:
-                            yield _claude_event(
-                                EVENT_CONTENT_BLOCK_DELTA,
-                                {
-                                    "type": EVENT_CONTENT_BLOCK_DELTA,
-                                    "index": tool_call["claude_index"],
-                                    "delta": {
-                                        "type": DELTA_INPUT_JSON,
-                                        "partial_json": tool_call["args_buffer"],
-                                    },
-                                },
-                            )
-                            tool_call["json_sent"] = True
+                for tc_delta in delta.get("tool_calls", []) or []:
+                    tc_index = tc_delta.get("index", 0)
+                    tool_call = current_tool_calls.setdefault(
+                        tc_index,
+                        {
+                            "id": None,
+                            "name": None,
+                            "args_buffer": "",
+                            "json_sent": False,
+                            "claude_index": None,
+                            "started": False,
+                        },
+                    )
 
-            if finish_reason:
-                final_stop_reason = {
-                    "length": STOP_MAX_TOKENS,
-                    "tool_calls": STOP_TOOL_USE,
-                    "function_call": STOP_TOOL_USE,
-                    "stop": STOP_END_TURN,
-                }.get(finish_reason, STOP_END_TURN)
+                    if tc_delta.get("id"):
+                        tool_call["id"] = tc_delta["id"]
+
+                    function_data = tc_delta.get(TOOL_FUNCTION, {})
+                    if function_data.get("name"):
+                        tool_call["name"] = function_data["name"]
+                        output_text_parts.append(function_data["name"])
+
+                    if tool_call["id"] and tool_call["name"] and not tool_call["started"]:
+                        tool_block_counter += 1
+                        tool_call["claude_index"] = text_block_index + tool_block_counter
+                        tool_call["started"] = True
+                        yield _claude_event(
+                            EVENT_CONTENT_BLOCK_START,
+                            {
+                                "type": EVENT_CONTENT_BLOCK_START,
+                                "index": tool_call["claude_index"],
+                                "content_block": {
+                                    "type": CONTENT_TOOL_USE,
+                                    "id": tool_call["id"],
+                                    "name": tool_call["name"],
+                                    "input": {},
+                                },
+                            },
+                        )
+
+                    if (
+                        "arguments" in function_data
+                        and tool_call["started"]
+                        and function_data["arguments"] is not None
+                    ):
+                        tool_call["args_buffer"] += function_data["arguments"]
+                        output_text_parts.append(function_data["arguments"])
+                        try:
+                            json.loads(tool_call["args_buffer"])
+                        except json.JSONDecodeError:
+                            pass
+                        else:
+                            if not tool_call["json_sent"]:
+                                yield _claude_event(
+                                    EVENT_CONTENT_BLOCK_DELTA,
+                                    {
+                                        "type": EVENT_CONTENT_BLOCK_DELTA,
+                                        "index": tool_call["claude_index"],
+                                        "delta": {
+                                            "type": DELTA_INPUT_JSON,
+                                            "partial_json": tool_call["args_buffer"],
+                                        },
+                                    },
+                                )
+                                tool_call["json_sent"] = True
+
+                if finish_reason:
+                    final_stop_reason = {
+                        "length": STOP_MAX_TOKENS,
+                        "tool_calls": STOP_TOOL_USE,
+                        "function_call": STOP_TOOL_USE,
+                        "stop": STOP_END_TURN,
+                    }.get(finish_reason, STOP_END_TURN)
 
     except Exception as exc:
         logger.exception("Claude streaming conversion failed")
@@ -511,5 +512,13 @@ def _normalize_tool_result(content):
             return content.get("text", "")
         return json.dumps(content, ensure_ascii=False)
     return str(content)
+
+
 def _claude_event(event, payload):
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _iter_openai_sse_lines(payload):
+    for line in str(payload).splitlines():
+        if line.startswith("data: "):
+            yield line
