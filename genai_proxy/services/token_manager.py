@@ -14,12 +14,21 @@ except ImportError:  # pragma: no cover
 
 
 GENAI_LOGIN_URL = "https://genai.shanghaitech.edu.cn/htk/user/login"
-GENAI_CAS_SERVICE_URL = (
+GENAI_LEGACY_CAS_SERVICE_URL = (
     "https://ids.shanghaitech.edu.cn/authserver/login"
     f"?service={quote(GENAI_LOGIN_URL, safe='')}"
 )
 GENAI_GET_TOKEN_URL = (
     "https://genai.shanghaitech.edu.cn/htk/user/info/{token}?_t={timestamp}"
+)
+
+GENAI_AUTH_FAILURE_MESSAGES = (
+    "token失效",
+    "鉴权失败",
+    "重新登录",
+    "invalid token",
+    "token expired",
+    "authentication failed",
 )
 
 
@@ -32,6 +41,19 @@ def parse_jwt_payload(token: str) -> dict:
     payload_b64 += "=" * (-len(payload_b64) % 4)
     payload_bytes = base64.urlsafe_b64decode(payload_b64)
     return json.loads(payload_bytes)
+
+
+def is_genai_auth_failure(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+
+    code = payload.get("code")
+    message = str(payload.get("message") or "").lower()
+    if code in (401, 403):
+        return True
+    if payload.get("success") is False:
+        return any(marker in message for marker in GENAI_AUTH_FAILURE_MESSAGES)
+    return False
 
 
 class TokenManager:
@@ -150,7 +172,17 @@ class TokenManager:
         except Exception as exc:
             self._logger.warning("Failed to update token cache %s: %s", self._token_cache_path, exc)
 
-    def _refresh_token(self) -> None:
+    def _delete_cached_token(self) -> None:
+        if not self._token_cache_path:
+            return
+        try:
+            os.remove(self._token_cache_path)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            self._logger.warning("Failed to delete token cache %s: %s", self._token_cache_path, exc)
+
+    def _refresh_token(self, force: bool = False) -> None:
         if not self._keystore_path:
             self._logger.warning(
                 "Token expired or missing, but no keystore configured for refresh"
@@ -159,7 +191,7 @@ class TokenManager:
 
         lock_fd = self._with_process_refresh_lock()
         try:
-            if self._load_cached_token():
+            if not force and self._load_cached_token():
                 return
 
             from shanghaitech_ids_passkey import IDSClient, PasskeyKeystore
@@ -176,34 +208,24 @@ class TokenManager:
             self._used_ids = True
             self._logger.info("IDS passkey login successful for user: %s", keystore.username)
 
-            response = client.session.get(
-                GENAI_CAS_SERVICE_URL,
-                allow_redirects=True,
-                timeout=30,
-            )
+            login_response = self._get_genai_login_response(client)
+            params = parse_qs(urlparse(login_response.url).query)
 
-            final_url = response.url
-            self._logger.debug("Final redirect URL: %s", final_url)
-
-            parsed = urlparse(final_url)
-            params = parse_qs(parsed.query)
-
-            if "token" not in params:
-                raise RuntimeError(
-                    f"Could not extract GenAI token from login flow. Final URL: {final_url}"
-                )
-
-            real_token = client.session.get(
+            token_response = client.session.get(
                 GENAI_GET_TOKEN_URL.format(
                     token=params["token"][0],
                     timestamp=int(time.time() * 1000),
                 ),
                 timeout=30,
-            ).json().get("result", {}).get("token")
+            )
+            token_payload = token_response.json()
+            token_result = token_payload.get("result")
+            real_token = token_result.get("token") if isinstance(token_result, dict) else None
 
             if not real_token:
                 raise RuntimeError(
-                    "Failed to retrieve real token from GenAI after CAS login"
+                    "Failed to retrieve real token from GenAI login flow: "
+                    f"{token_payload.get('message', 'missing result.token')}"
                 )
 
             self._token = real_token
@@ -222,6 +244,52 @@ class TokenManager:
             raise
         finally:
             self._release_process_refresh_lock(lock_fd)
+
+    def _get_genai_login_response(self, client):
+        for login_url in (GENAI_LOGIN_URL, GENAI_LEGACY_CAS_SERVICE_URL):
+            response = client.session.get(
+                login_url,
+                allow_redirects=True,
+                timeout=30,
+            )
+            parsed = urlparse(response.url)
+            params = parse_qs(parsed.query)
+            self._logger.debug(
+                "GenAI login flow ended at %s://%s%s with query keys: %s",
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                sorted(params),
+            )
+            if params.get("token"):
+                return response
+
+        parsed = urlparse(response.url)
+        raise RuntimeError(
+            "Could not extract GenAI token from login flow. "
+            f"Final URL path: {parsed.scheme}://{parsed.netloc}{parsed.path}, "
+            f"query keys: {sorted(parse_qs(parsed.query))}"
+        )
+
+    def refresh_after_auth_failure(self, reason: str = "upstream authentication failure") -> bool:
+        if not self._keystore_path:
+            self._logger.warning(
+                "GenAI token was rejected by upstream (%s), but no keystore is configured",
+                reason,
+            )
+            return False
+
+        with self._lock:
+            self._logger.warning("GenAI token was rejected by upstream (%s); refreshing", reason)
+            self._token = None
+            self._token_exp = None
+            self._delete_cached_token()
+            try:
+                self._refresh_token(force=True)
+            except Exception:
+                self._logger.exception("Failed to refresh GenAI token after upstream rejection")
+                return False
+            return bool(self._token)
 
     @property
     def token(self) -> str | None:

@@ -3,6 +3,9 @@ from datetime import datetime, timezone
 
 import requests
 
+from genai_proxy.errors import ProxyError
+from genai_proxy.services.token_manager import is_genai_auth_failure
+
 
 GENAI_MODEL_LIST_URL = (
     "https://genai.shanghaitech.edu.cn/htk/ai/aiModel/list"
@@ -63,19 +66,70 @@ class ModelManager:
         return models
 
     def _fetch_models(self) -> list[dict]:
-        url = GENAI_MODEL_LIST_URL.format(timestamp=int(time.time()))
-        response = requests.get(
-            url,
-            headers={
-                "Accept": "application/json",
-                "X-Access-Token": self._token_manager.token,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
+        return self._fetch_models_with_retry()
 
-        payload = response.json()
-        records = payload.get("result", {}).get("records", [])
+    def _fetch_models_with_retry(self) -> list[dict]:
+        refreshed = False
+        while True:
+            try:
+                return self._fetch_models_once()
+            except ProxyError as exc:
+                if exc.code != "upstream_auth_failed" or refreshed:
+                    raise
+                refreshed = True
+                if not self._token_manager.refresh_after_auth_failure("model list rejected token"):
+                    raise
+
+    def _fetch_models_once(self) -> list[dict]:
+        url = GENAI_MODEL_LIST_URL.format(timestamp=int(time.time()))
+        try:
+            response = requests.get(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "X-Access-Token": self._token_manager.token,
+                },
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            self._logger.warning("Failed to fetch GenAI model list: %s", exc)
+            raise ProxyError("Failed to fetch GenAI models", error_type="upstream_error", status=502) from exc
+
+        if response.status_code in (401, 403):
+            raise ProxyError(
+                "Upstream GenAI token is invalid or expired",
+                error_type="authentication_error",
+                code="upstream_auth_failed",
+                status=502,
+            )
+        if response.status_code != 200:
+            self._logger.warning("GenAI model list HTTP error %d: %s", response.status_code, response.text[:500])
+            raise ProxyError("Failed to fetch GenAI models", error_type="upstream_error", status=502)
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            self._logger.warning("Failed to decode GenAI model list JSON: %s", exc)
+            raise ProxyError("Failed to fetch GenAI models", error_type="upstream_error", status=502) from exc
+
+        if is_genai_auth_failure(payload):
+            raise ProxyError(
+                "Upstream GenAI token is invalid or expired",
+                error_type="authentication_error",
+                code="upstream_auth_failed",
+                status=502,
+            )
+
+        if payload.get("success") is False or payload.get("code", 200) >= 400:
+            self._logger.warning("GenAI model list business error: %s", payload)
+            raise ProxyError("Failed to fetch GenAI models", error_type="upstream_error", status=502)
+
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            self._logger.warning("GenAI model list response missing result object: %s", payload)
+            raise ProxyError("Failed to fetch GenAI models", error_type="upstream_error", status=502)
+
+        records = result.get("records") or []
         models = []
         seen = set()
 

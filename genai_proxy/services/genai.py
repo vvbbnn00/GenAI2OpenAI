@@ -14,7 +14,7 @@ from genai_proxy.compat.openai import (
 )
 from genai_proxy.errors import ProxyError
 from genai_proxy.optimizations import select_tool_adapter, tool_start_tags
-from genai_proxy.services.token_manager import parse_jwt_payload
+from genai_proxy.services.token_manager import is_genai_auth_failure, parse_jwt_payload
 from genai_proxy.token_usage import estimate_openai_request_tokens, estimate_token_by_model
 
 
@@ -70,33 +70,37 @@ class GenAIService:
         return self._stream_prepared_openai_completion(prepared)
 
     def fetch_openai_billing_subscription(self):
-        token = self._token_manager.token
-        access_until = self._extract_access_until(token)
-        user_id = self._fetch_current_user_id(token)
-        record = self._fetch_user_info_record(token, user_id)
-        quota = self._coerce_amount(record.get("quota"))
+        def fetch(token):
+            access_until = self._extract_access_until(token)
+            user_id = self._fetch_current_user_id(token)
+            record = self._fetch_user_info_record(token, user_id)
+            quota = self._coerce_amount(record.get("quota"))
 
-        return {
-            "object": "billing_subscription",
-            "has_payment_method": True,
-            "soft_limit_usd": quota,
-            "hard_limit_usd": quota,
-            "system_hard_limit_usd": quota,
-            "access_until": access_until,
-        }
+            return {
+                "object": "billing_subscription",
+                "has_payment_method": True,
+                "soft_limit_usd": quota,
+                "hard_limit_usd": quota,
+                "system_hard_limit_usd": quota,
+                "access_until": access_until,
+            }
+
+        return self._with_token_auth_retry("billing subscription", fetch)
 
     def fetch_openai_billing_usage(self):
-        token = self._token_manager.token
-        self._extract_access_until(token)
-        user_id = self._fetch_current_user_id(token)
-        record = self._fetch_user_info_record(token, user_id)
-        month_usage_usd = self._coerce_amount(record.get("monthSurplus"))
-        total_usage = max(month_usage_usd, 0.0) * 100
+        def fetch(token):
+            self._extract_access_until(token)
+            user_id = self._fetch_current_user_id(token)
+            record = self._fetch_user_info_record(token, user_id)
+            month_usage_usd = self._coerce_amount(record.get("monthSurplus"))
+            total_usage = max(month_usage_usd, 0.0) * 100
 
-        return {
-            "object": "list",
-            "total_usage": round(total_usage, 2),
-        }
+            return {
+                "object": "list",
+                "total_usage": round(total_usage, 2),
+            }
+
+        return self._with_token_auth_retry("billing usage", fetch)
 
     def _build_openai_completion(self, prepared: PreparedChatRequest):
         complete_content = ""
@@ -249,6 +253,16 @@ class GenAIService:
             "X-Access-Token": user_token,
         }
 
+    def _with_token_auth_retry(self, reason: str, fetch):
+        try:
+            return fetch(self._token_manager.token)
+        except ProxyError as exc:
+            if exc.code != "upstream_auth_failed":
+                raise
+            if not self._token_manager.refresh_after_auth_failure(reason):
+                raise
+            return fetch(self._token_manager.token)
+
     def _extract_last_user_message(self, messages):
         for msg in reversed(messages):
             if msg.get("role") == "user":
@@ -288,7 +302,12 @@ class GenAIService:
             raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502) from exc
 
         if response.status_code == 401:
-            raise ProxyError("Upstream GenAI token is invalid or expired", error_type="authentication_error", status=502)
+            raise ProxyError(
+                "Upstream GenAI token is invalid or expired",
+                error_type="authentication_error",
+                code="upstream_auth_failed",
+                status=502,
+            )
         if response.status_code != 200:
             self._logger.warning(
                 "GenAI billing API error %d: %s",
@@ -303,11 +322,20 @@ class GenAIService:
             self._logger.warning("Failed to decode billing response JSON: %s", exc)
             raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502) from exc
 
+        if is_genai_auth_failure(payload):
+            raise ProxyError(
+                "Upstream GenAI token is invalid or expired",
+                error_type="authentication_error",
+                code="upstream_auth_failed",
+                status=502,
+            )
+
         if payload.get("code", 200) >= 400 or payload.get("success") is False:
             self._logger.warning("GenAI billing business error: %s", payload)
             raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
 
-        records = payload.get("result", {}).get("records") or []
+        result = payload.get("result")
+        records = result.get("records") if isinstance(result, dict) else []
         if not records:
             raise ProxyError(
                 "Quota information for the current GenAI account was not found",
@@ -343,7 +371,12 @@ class GenAIService:
             raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502) from exc
 
         if response.status_code == 401:
-            raise ProxyError("Upstream GenAI token is invalid or expired", error_type="authentication_error", status=502)
+            raise ProxyError(
+                "Upstream GenAI token is invalid or expired",
+                error_type="authentication_error",
+                code="upstream_auth_failed",
+                status=502,
+            )
         if response.status_code != 200:
             self._logger.warning(
                 "GenAI current user API error %d: %s",
@@ -358,7 +391,20 @@ class GenAIService:
             self._logger.warning("Failed to decode current user JSON: %s", exc)
             raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502) from exc
 
-        user_info = payload.get("result", {}).get("userInfo") or {}
+        if is_genai_auth_failure(payload):
+            raise ProxyError(
+                "Upstream GenAI token is invalid or expired",
+                error_type="authentication_error",
+                code="upstream_auth_failed",
+                status=502,
+            )
+
+        if payload.get("code", 200) >= 400 or payload.get("success") is False:
+            self._logger.warning("GenAI current user business error: %s", payload)
+            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
+
+        result = payload.get("result")
+        user_info = result.get("userInfo") if isinstance(result, dict) else {}
         user_id = user_info.get("id")
         if not user_id:
             self._logger.warning("Current user response missing id: %s", payload)
@@ -370,10 +416,20 @@ class GenAIService:
             access_until = int(parse_jwt_payload(user_token).get("exp") or 0)
         except Exception as exc:
             self._logger.warning("Failed to parse billing token expiry: %s", exc)
-            raise ProxyError("Upstream GenAI token is invalid or expired", error_type="authentication_error", status=502) from exc
+            raise ProxyError(
+                "Upstream GenAI token is invalid or expired",
+                error_type="authentication_error",
+                code="upstream_auth_failed",
+                status=502,
+            ) from exc
 
         if access_until <= int(time.time()):
-            raise ProxyError("Upstream GenAI token is invalid or expired", error_type="authentication_error", status=502)
+            raise ProxyError(
+                "Upstream GenAI token is invalid or expired",
+                error_type="authentication_error",
+                code="upstream_auth_failed",
+                status=502,
+            )
         return access_until
 
     def _coerce_amount(self, value) -> float:
@@ -425,112 +481,135 @@ class GenAIService:
             )
             self._logger.debug("  [%d] role=%s, content=%s", index, role, preview)
 
-        response = None
-        try:
-            response = requests.post(
-                GENAI_URL,
-                headers=self._get_genai_headers(),
-                json=genai_data,
-                stream=True,
-                timeout=(10, 75),
-            )
-            self._logger.debug("GenAI Response Status: %d", response.status_code)
-
-            if response.status_code != 200:
-                self._logger.warning(
-                    "GenAI API error %d: %s",
-                    response.status_code,
-                    response.text[:500],
+        auth_retry_used = False
+        while True:
+            response = None
+            retry_after_refresh = False
+            try:
+                response = requests.post(
+                    GENAI_URL,
+                    headers=self._get_genai_headers(),
+                    json=genai_data,
+                    stream=True,
+                    timeout=(10, 75),
                 )
-                if response.status_code == 401:
-                    yield make_error_chunk("Upstream authentication failed", prepared.model)
-                elif response.status_code == 429:
-                    yield make_error_chunk("Upstream rate limit exceeded", prepared.model)
-                else:
+                self._logger.debug("GenAI Response Status: %d", response.status_code)
+
+                if response.status_code != 200:
+                    self._logger.warning(
+                        "GenAI API error %d: %s",
+                        response.status_code,
+                        response.text[:500],
+                    )
+                    if response.status_code in (401, 403):
+                        if not auth_retry_used and self._token_manager.refresh_after_auth_failure("chat request"):
+                            auth_retry_used = True
+                            retry_after_refresh = True
+                            continue
+                        yield make_error_chunk("Upstream authentication failed", prepared.model)
+                    elif response.status_code == 429:
+                        yield make_error_chunk("Upstream rate limit exceeded", prepared.model)
+                    else:
+                        yield make_error_chunk(
+                            f"Upstream API error: {response.status_code}",
+                            prepared.model,
+                        )
+                    return
+
+                finished = False
+                line_count = 0
+                for line in response.iter_lines():
+                    if finished:
+                        break
+
+                    if not line:
+                        continue
+
+                    line_str = line.decode("utf-8") if isinstance(line, bytes) else line
+                    if line_count < 5:
+                        self._logger.debug("Raw line [%d]: %s", line_count, line_str[:300])
+                    line_count += 1
+
+                    if line_str.startswith("data:"):
+                        line_str = line_str[5:].strip()
+
+                    if not line_str:
+                        continue
+
+                    try:
+                        genai_json = json.loads(line_str)
+                    except json.JSONDecodeError as exc:
+                        self._logger.debug("JSON decode error: %s, line: %s", exc, line_str[:200])
+                        continue
+
+                    if is_genai_auth_failure(genai_json):
+                        err_msg = genai_json.get("message", "Unknown upstream error")
+                        self._logger.warning("GenAI authentication business error: %s", err_msg)
+                        if not auth_retry_used and self._token_manager.refresh_after_auth_failure("chat stream"):
+                            auth_retry_used = True
+                            retry_after_refresh = True
+                            break
+                        yield make_error_chunk("Upstream authentication failed", prepared.model)
+                        return
+
+                    if isinstance(genai_json, dict) and genai_json.get("code", 200) >= 400:
+                        err_msg = genai_json.get("message", "Unknown upstream error")
+                        err_code = genai_json.get("code", 500)
+                        self._logger.warning(
+                            "GenAI business error (code=%s): %s",
+                            err_code,
+                            err_msg,
+                        )
+                        yield make_error_chunk(f"Upstream error: {err_msg}", prepared.model)
+                        return
+
+                    choice = None
+                    finish_reason = None
+                    if "choices" in genai_json and genai_json["choices"]:
+                        choice = genai_json["choices"][0]
+                        finish_reason = choice.get("finish_reason")
+
+                    content, reasoning, tool_calls = self._extract_delta_from_genai(genai_json)
+                    delta = {}
+                    if content:
+                        delta["content"] = content
+                    if reasoning:
+                        delta["reasoning_content"] = reasoning
+                    if tool_calls:
+                        delta["tool_calls"] = tool_calls
+
+                    if delta:
+                        yield self._make_chunk(prepared.model, delta)
+
+                    if finish_reason is not None:
+                        finished = True
+                        yield self._make_chunk(prepared.model, {}, finish_reason=finish_reason)
+                        yield "data: [DONE]\n\n"
+                        break
+
+                if retry_after_refresh:
+                    continue
+
+                self._logger.debug("Total lines received: %d, finished: %s", line_count, finished)
+
+                if not finished:
+                    self._logger.warning("Stream ended without finish_reason from GenAI")
                     yield make_error_chunk(
-                        f"Upstream API error: {response.status_code}",
+                        "Stream ended unexpectedly without completion",
                         prepared.model,
                     )
                 return
-
-            finished = False
-            line_count = 0
-            for line in response.iter_lines():
-                if finished:
-                    break
-
-                if not line:
-                    continue
-
-                line_str = line.decode("utf-8") if isinstance(line, bytes) else line
-                if line_count < 5:
-                    self._logger.debug("Raw line [%d]: %s", line_count, line_str[:300])
-                line_count += 1
-
-                if line_str.startswith("data:"):
-                    line_str = line_str[5:].strip()
-
-                if not line_str:
-                    continue
-
-                try:
-                    genai_json = json.loads(line_str)
-                except json.JSONDecodeError as exc:
-                    self._logger.debug("JSON decode error: %s, line: %s", exc, line_str[:200])
-                    continue
-
-                if isinstance(genai_json, dict) and genai_json.get("code", 200) >= 400:
-                    err_msg = genai_json.get("message", "Unknown upstream error")
-                    err_code = genai_json.get("code", 500)
-                    self._logger.warning(
-                        "GenAI business error (code=%s): %s",
-                        err_code,
-                        err_msg,
-                    )
-                    yield make_error_chunk(f"Upstream error: {err_msg}", prepared.model)
-                    return
-
-                choice = None
-                finish_reason = None
-                if "choices" in genai_json and genai_json["choices"]:
-                    choice = genai_json["choices"][0]
-                    finish_reason = choice.get("finish_reason")
-
-                content, reasoning, tool_calls = self._extract_delta_from_genai(genai_json)
-                delta = {}
-                if content:
-                    delta["content"] = content
-                if reasoning:
-                    delta["reasoning_content"] = reasoning
-                if tool_calls:
-                    delta["tool_calls"] = tool_calls
-
-                if delta:
-                    yield self._make_chunk(prepared.model, delta)
-
-                if finish_reason is not None:
-                    finished = True
-                    yield self._make_chunk(prepared.model, {}, finish_reason=finish_reason)
-                    yield "data: [DONE]\n\n"
-                    break
-
-            self._logger.debug("Total lines received: %d, finished: %s", line_count, finished)
-
-            if not finished:
-                self._logger.warning("Stream ended without finish_reason from GenAI")
-                yield make_error_chunk(
-                    "Stream ended unexpectedly without completion",
-                    prepared.model,
-                )
-        except requests.Timeout as exc:
-            self._logger.warning("GenAI stream timed out or stalled: %s", exc)
-            yield make_error_chunk("Upstream stream timed out or stalled", prepared.model)
-        except Exception as exc:
-            self._logger.exception("Error in _stream_genai_response")
-            yield make_error_chunk(str(exc), prepared.model)
-        finally:
-            if response is not None:
-                response.close()
+            except requests.Timeout as exc:
+                self._logger.warning("GenAI stream timed out or stalled: %s", exc)
+                yield make_error_chunk("Upstream stream timed out or stalled", prepared.model)
+                return
+            except Exception as exc:
+                self._logger.exception("Error in _stream_genai_response")
+                yield make_error_chunk(str(exc), prepared.model)
+                return
+            finally:
+                if response is not None:
+                    response.close()
 
     def _stream_genai_response_with_tools(self, prepared: PreparedChatRequest):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"

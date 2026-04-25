@@ -91,7 +91,15 @@ def chat_completions():
 @bp.route("/v1/models", methods=["GET"])
 def list_models():
     model_manager = current_app.extensions["model_manager"]
-    return jsonify({"object": "list", "data": model_manager.list_openai_models()})
+    try:
+        return jsonify({"object": "list", "data": model_manager.list_openai_models()})
+    except ProxyError as exc:
+        return openai_error(
+            exc.message,
+            error_type=exc.error_type,
+            code=exc.code,
+            status=exc.status,
+        )
 
 
 @bp.route("/v1/dashboard/billing/subscription", methods=["GET"])
