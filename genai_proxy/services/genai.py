@@ -1,4 +1,5 @@
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -10,10 +11,9 @@ from genai_proxy.compat.openai import (
     extract_tool_calls,
     inject_tool_prompt,
     make_error_chunk,
-    tag_prefix_len,
 )
 from genai_proxy.errors import ProxyError
-from genai_proxy.optimizations import native_tool_fields, select_tool_adapter, tool_start_tags
+from genai_proxy.optimizations import select_tool_adapter, tool_start_tags
 from genai_proxy.services.token_manager import parse_jwt_payload
 from genai_proxy.token_usage import estimate_openai_request_tokens, estimate_token_by_model
 
@@ -42,24 +42,11 @@ GENAI_USER_INFO_URL = "https://genai.shanghaitech.edu.cn/htk/ai-user-info/list"
 GENAI_CURRENT_USER_URL = "https://genai.shanghaitech.edu.cn/htk/user/info/{token}"
 
 
-def _is_tool_result_continuation(messages) -> bool:
-    for message in reversed(messages or []):
-        if message.get("role") == "system":
-            continue
-        return message.get("role") == "tool"
-    return False
-
-
-def _requires_tool_choice(tool_choice) -> bool:
-    return tool_choice == "required" or (
-        isinstance(tool_choice, dict) and tool_choice.get("type") == "function"
-    )
-
-
 @dataclass(slots=True)
 class PreparedChatRequest:
     messages: list
     model: str
+    root_model_name: str | None
     max_tokens: int
     has_tools: bool
     tools: list
@@ -159,9 +146,14 @@ class GenAIService:
                 model=prepared.model,
                 adapter=prepared.tool_adapter,
             )
+            if tool_calls:
+                remaining_text = _strip_visible_tool_syntax(
+                    remaining_text or "",
+                    _tool_start_tags_for_request(prepared.tool_adapter, prepared.tools),
+                )
             message_obj = {
                 "role": "assistant",
-                "content": remaining_text,
+                "content": remaining_text or None,
                 "tool_calls": tool_calls,
             }
             if tool_calls:
@@ -217,13 +209,11 @@ class GenAIService:
         max_tokens = req_data.get("max_tokens", 30000)
         tools = req_data.get("tools") or []
         tool_choice = req_data.get("tool_choice")
-        requested_tools = bool(tools)
-        tool_result_continuation = _is_tool_result_continuation(
-            messages,
-        ) and not _requires_tool_choice(tool_choice)
         model_record = self._model_manager.get_model_record(model)
         tool_adapter = select_tool_adapter(model, model_record)
 
+        requested_tools = bool(tools)
+        has_tools = requested_tools and not _tool_choice_is_none(tool_choice)
         if requested_tools:
             messages = inject_tool_prompt(
                 messages,
@@ -233,19 +223,19 @@ class GenAIService:
                 adapter=tool_adapter,
             )
 
-        has_tools = requested_tools and not tool_result_continuation
         if not self._extract_last_user_message(messages):
             raise ProxyError("No user message found in 'messages'")
 
         return PreparedChatRequest(
             messages=messages,
             model=model,
+            root_model_name=(model_record or {}).get("rootModelName"),
             max_tokens=max_tokens,
             has_tools=has_tools,
             tools=tools if has_tools else [],
             tool_choice=tool_choice if has_tools else None,
             tool_adapter=tool_adapter,
-            prompt_tokens=estimate_openai_request_tokens(messages, model, None),
+            prompt_tokens=estimate_openai_request_tokens(messages, model, tools if has_tools else None),
         )
 
     def _get_genai_headers(self):
@@ -395,11 +385,16 @@ class GenAIService:
             self._logger.warning("Invalid billing amount from upstream: %r", value)
             raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
 
-    def _stream_genai_response(self, prepared: PreparedChatRequest):
+    def _stream_genai_response(
+        self,
+        prepared: PreparedChatRequest,
+        messages: list | None = None,
+    ):
         root_ai_type = self._model_manager.root_ai_type_for(prepared.model)
+        messages = messages if messages is not None else prepared.messages
         genai_data = {
             "chatInfo": "",
-            "messages": prepared.messages,
+            "messages": messages,
             "type": "3",
             "stream": True,
             "aiType": prepared.model,
@@ -408,17 +403,19 @@ class GenAIService:
             "rootAiType": root_ai_type,
             "maxToken": prepared.max_tokens or 30000,
         }
-        if prepared.has_tools:
-            genai_data["tools"] = prepared.tools
-            if prepared.tool_choice:
-                genai_data["tool_choice"] = prepared.tool_choice
-            genai_data.update(native_tool_fields(prepared.tool_adapter))
-            genai_data.pop("native_tools", None)
+        if prepared.root_model_name:
+            genai_data["rootModelName"] = prepared.root_model_name
 
         self._logger.debug("=== GenAI Request ===")
-        self._logger.debug("Model: %s, rootAiType: %s", prepared.model, root_ai_type)
-        self._logger.debug("Messages count: %d", len(prepared.messages))
-        for index, message in enumerate(prepared.messages):
+        self._logger.debug(
+            "Model: %s, rootAiType: %s, rootModelName: %s, tool_prompt: %s",
+            prepared.model,
+            root_ai_type,
+            prepared.root_model_name,
+            prepared.has_tools,
+        )
+        self._logger.debug("Messages count: %d", len(messages))
+        for index, message in enumerate(messages):
             role = message.get("role", "?")
             content = message.get("content", "")
             preview = (
@@ -428,6 +425,7 @@ class GenAIService:
             )
             self._logger.debug("  [%d] role=%s, content=%s", index, role, preview)
 
+        response = None
         try:
             response = requests.post(
                 GENAI_URL,
@@ -530,18 +528,14 @@ class GenAIService:
         except Exception as exc:
             self._logger.exception("Error in _stream_genai_response")
             yield make_error_chunk(str(exc), prepared.model)
+        finally:
+            if response is not None:
+                response.close()
 
     def _stream_genai_response_with_tools(self, prepared: PreparedChatRequest):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(datetime.now().timestamp())
         open_tags = _tool_start_tags_for_request(prepared.tool_adapter, prepared.tools)
-        buffer = ""
-        tool_buffer = ""
-        sent_role = False
-        tool_detected = False
-        native_tool_detected = False
-        think_buffer = ""
-        in_think_block = False
 
         def make_chunk(delta, finish_reason=None):
             chunk = {
@@ -559,167 +553,134 @@ class GenAIService:
             }
             return f"data: {json.dumps(chunk)}\n\n"
 
-        def emit_text(text):
-            nonlocal sent_role
+        def emit_response_text(text, sent_role):
+            if not text:
+                return sent_role
             delta = {"content": text}
             if not sent_role:
                 delta["role"] = "assistant"
                 sent_role = True
-            return make_chunk(delta)
+            yield make_chunk(delta)
+            return sent_role
 
-        def strip_stream_think(text):
-            nonlocal think_buffer, in_think_block
-            current = think_buffer + text
-            think_buffer = ""
-            output = []
+        def emit_tool_calls(tool_calls, sent_role):
+            if not sent_role:
+                yield make_chunk({"role": "assistant"})
+                sent_role = True
+            for index, tool_call in enumerate(tool_calls):
+                yield make_chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": index,
+                                "id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                                "type": tool_call.get("type", "function"),
+                                "function": {
+                                    "name": tool_call.get("function", {}).get("name"),
+                                    "arguments": tool_call.get("function", {}).get("arguments", ""),
+                                },
+                            }
+                        ]
+                    }
+                )
 
-            while current:
-                if in_think_block:
-                    end_pos = current.find("</think>")
-                    if end_pos < 0:
-                        return "".join(output)
-                    current = current[end_pos + len("</think>") :]
-                    in_think_block = False
-                    continue
+        attempt = self._collect_tool_attempt(
+            prepared,
+            prepared.messages,
+        )
+        if attempt.get("error"):
+            yield attempt["error"]
+            return
 
-                start_pos = current.find("<think>")
-                if start_pos < 0:
-                    prefix_len = tag_prefix_len(current, "<think>")
-                    if prefix_len > 0:
-                        think_buffer = current[-prefix_len:]
-                        output.append(current[:-prefix_len])
-                    else:
-                        output.append(current)
-                    return "".join(output)
-
-                output.append(current[:start_pos])
-                current = current[start_pos + len("<think>") :]
-                in_think_block = True
-
-            return "".join(output)
-
-        for payload in self._stream_genai_response(prepared):
-            for line in _iter_sse_lines(payload):
-                if not line.startswith("data: "):
-                    continue
-
-                data_str = line[6:].strip()
-                if data_str == "[DONE]":
-                    continue
-
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-
-                if "choices" not in data or not data["choices"]:
-                    continue
-
-                choice = data["choices"][0]
-                if choice.get("finish_reason") == "error":
-                    yield f"{line}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-
-                chunk_delta = choice.get("delta", {})
-                native_tool_calls = chunk_delta.get("tool_calls") or []
-                if native_tool_calls:
-                    native_tool_detected = True
-                    if buffer:
-                        yield emit_text(buffer)
-                        buffer = ""
-                    if not sent_role:
-                        yield make_chunk({"role": "assistant"})
-                        sent_role = True
-                    for tool_call in native_tool_calls:
-                        yield make_chunk({"tool_calls": [_normalize_stream_tool_call(tool_call)]})
-                    continue
-
-                content = chunk_delta.get("content", "")
-                if not content:
-                    finish_reason = choice.get("finish_reason")
-                    if native_tool_detected and finish_reason is not None:
-                        yield make_chunk({}, finish_reason="tool_calls")
-                        yield "data: [DONE]\n\n"
-                        return
-                    continue
-
-                if tool_detected:
-                    tool_buffer += content
-                    continue
-
-                content = strip_stream_think(content)
-                if not content:
-                    continue
-
-                buffer += content
-
-                tag_pos, _ = _find_first_tag(buffer, open_tags)
-                if tag_pos >= 0:
-                    tool_detected = True
-                    tool_buffer = buffer
-                    buffer = ""
-                    continue
-
-                prefix_len = max(tag_prefix_len(buffer, tag) for tag in open_tags)
-                if prefix_len > 0:
-                    safe = buffer[:-prefix_len]
-                    if safe.strip():
-                        yield emit_text(safe)
-                    buffer = buffer[-prefix_len:]
-                else:
-                    if buffer.strip():
-                        yield emit_text(buffer)
-                    buffer = ""
-
-        if tool_detected:
+        tool_calls = attempt.get("tool_calls") or []
+        content = attempt.get("content") or ""
+        remaining = content
+        if not tool_calls:
             tool_calls, remaining = extract_tool_calls(
-                tool_buffer,
+                content,
                 self._logger,
                 tools=prepared.tools,
                 model=prepared.model,
                 adapter=prepared.tool_adapter,
             )
-            if tool_calls:
-                if remaining and remaining.strip():
-                    yield emit_text(remaining.strip())
-                if not sent_role:
-                    yield make_chunk({"role": "assistant"})
-                    sent_role = True
+            tool_calls = tool_calls or []
 
-                for index, tool_call in enumerate(tool_calls):
-                    yield make_chunk(
-                        {
-                            "tool_calls": [
-                                {
-                                    "index": index,
-                                    "id": tool_call["id"],
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool_call["function"]["name"],
-                                        "arguments": tool_call["function"]["arguments"],
-                                    },
-                                }
-                            ]
-                        }
-                    )
-
-                yield make_chunk({}, finish_reason="tool_calls")
-                yield "data: [DONE]\n\n"
-                return
-
-            self._logger.warning("Tool tag detected but parsing failed — emitting as text")
-            yield emit_text(tool_buffer)
-            yield make_chunk({}, finish_reason="stop")
+        sent_role = False
+        if tool_calls:
+            clean_remaining = _strip_visible_tool_syntax(remaining or "", open_tags).strip()
+            if clean_remaining:
+                for chunk in emit_response_text(clean_remaining, sent_role):
+                    if isinstance(chunk, bool):
+                        sent_role = chunk
+                    else:
+                        yield chunk
+                sent_role = True
+            for chunk in emit_tool_calls(tool_calls, sent_role):
+                yield chunk
+            yield make_chunk({}, finish_reason="tool_calls")
             yield "data: [DONE]\n\n"
             return
 
-        if buffer.strip():
-            yield emit_text(buffer)
+        clean_content = _strip_visible_tool_syntax(content, open_tags)
+        if clean_content.strip():
+            for chunk in emit_response_text(clean_content, sent_role):
+                if isinstance(chunk, bool):
+                    sent_role = chunk
+                else:
+                    yield chunk
+            sent_role = True
         if not sent_role:
             yield make_chunk({"role": "assistant", "content": ""})
         yield make_chunk({}, finish_reason="stop")
         yield "data: [DONE]\n\n"
+
+    def _collect_tool_attempt(
+        self,
+        prepared: PreparedChatRequest,
+        messages: list,
+    ) -> dict:
+        complete_content = ""
+        collected_tool_calls = []
+        stream = self._stream_genai_response(prepared, messages=messages)
+        try:
+            for payload in stream:
+                for line in _iter_sse_lines(payload):
+                    if not line.startswith("data: "):
+                        continue
+
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        continue
+
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if "choices" not in data or not data["choices"]:
+                        continue
+
+                    choice = data["choices"][0]
+                    if choice.get("finish_reason") == "error":
+                        return {"error": f"{line}\n\ndata: [DONE]\n\n"}
+
+                    delta = choice.get("delta", {})
+                    content = delta.get("content") or ""
+                    if content:
+                        complete_content += content
+
+                    for tool_call in delta.get("tool_calls", []) or []:
+                        collected_tool_calls.append(_normalize_stream_tool_call(tool_call))
+
+        finally:
+            close = getattr(stream, "close", None)
+            if close:
+                close()
+
+        return {
+            "content": complete_content,
+            "tool_calls": _merge_tool_call_deltas(collected_tool_calls) if collected_tool_calls else [],
+        }
 
     def _make_chunk(self, model, delta, finish_reason=None):
         response = {
@@ -743,27 +704,19 @@ def _iter_sse_lines(payload: str):
             yield line
 
 
-def _find_first_tag(text: str, tags: tuple[str, ...]) -> tuple[int, str | None]:
-    first_pos = -1
-    first_tag = None
-    for tag in tags:
-        pos = text.find(tag)
-        if pos >= 0 and (first_pos < 0 or pos < first_pos):
-            first_pos = pos
-            first_tag = tag
-    return first_pos, first_tag
-
-
 def _tool_start_tags_for_request(adapter: str, tools: list | None) -> tuple[str, ...]:
     tags = list(tool_start_tags(adapter))
-    for name in _request_tool_names(tools):
+    for name, argument_names in _request_tool_specs(tools).items():
         tags.append(f"{name}<arg_key>")
         tags.append(f"{name} <arg_key>")
+        for argument_name in argument_names:
+            tags.append(f"{name}{argument_name}:")
+            tags.append(f"{name} {argument_name}:")
     return tuple(dict.fromkeys(tags))
 
 
-def _request_tool_names(tools: list | None) -> list[str]:
-    names = []
+def _request_tool_specs(tools: list | None) -> dict[str, list[str]]:
+    specs = {}
     for tool in tools or []:
         if not isinstance(tool, dict):
             continue
@@ -772,8 +725,44 @@ def _request_tool_names(tools: list | None) -> list[str]:
             function_data = {}
         name = function_data.get("name") or tool.get("name")
         if name:
-            names.append(name)
-    return names
+            parameters = function_data.get("parameters", {}) or tool.get("input_schema", {})
+            properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+            specs[name] = list(properties.keys()) if isinstance(properties, dict) else []
+    return specs
+
+
+def _tool_choice_is_none(tool_choice) -> bool:
+    return tool_choice == "none" or (
+        isinstance(tool_choice, dict) and tool_choice.get("type") == "none"
+    )
+
+
+def _strip_visible_tool_syntax(text: str, tags: tuple[str, ...]) -> str:
+    if not text:
+        return ""
+    positions = [text.find(tag) for tag in tags if text.find(tag) >= 0]
+    transcript_pos = _find_claude_code_transcript_pos(text, tags)
+    if transcript_pos >= 0:
+        positions.append(transcript_pos)
+    if not positions:
+        return text
+    return text[: min(positions)].strip()
+
+
+def _find_claude_code_transcript_pos(text: str, tags: tuple[str, ...]) -> int:
+    names = []
+    for tag in tags:
+        if "<" in tag:
+            name = tag.split("<", 1)[0].strip()
+            if name:
+                names.append(re.escape(name))
+    if not names:
+        return -1
+    pattern = re.compile(
+        rf"(?m)(?<![\w./@-])(?:{'|'.join(dict.fromkeys(names))})(?:[^\n<]*)?\nIN\n"
+    )
+    match = pattern.search(text)
+    return match.start() if match else -1
 
 
 def _normalize_stream_tool_call(tool_call: dict) -> dict:

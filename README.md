@@ -182,19 +182,22 @@ response = client.chat.completions.create(
 
 ### Xinference 模型工具适配
 
-GenAI 的模型名并不总是直接等于上游模型名，代理会结合 `/v1/models` 返回的 `aiType`、`aiName`、`simpleName`、`descInfo`、`rootAiType`、`rootModelName` 判断具体适配器。
+GenAI 的模型名并不总是直接等于上游模型名，代理会结合 `/v1/models` 返回的 `aiType`、`aiName`、`simpleName`、`descInfo`、`rootAiType`、`rootModelName` 判断具体适配器。`rootModelName` 明确不是 `Xinference` 时不会套用这些 Xinference 专用适配。
 
 当前对以下 Xinference 上游模型有专用 tool calling 适配：
 
 | GenAI 模型名 | GenAI 描述线索 | 上游 | 适配重点 |
 |-------------|----------------|------|----------|
-| `deepseek-chat` | DeepSeek V4 Flash / DeepSeek V4 | Xinference | DSML 工具块解析、OpenAI `tool_calls` 转换、流式工具调用识别 |
-| `MiniMax-M1` | MiniMax 2.7 | Xinference | XML `<tool_call>` 兜底、`reasoning_split`、`<think>` 内容过滤、工具结果回合收敛 |
-| `chatglm` | GLM 5.1 | Xinference | XML `<tool_call>` 解析、`tool_stream`、非标准闭合标签修复、流式工具调用识别 |
+| `deepseek-chat` | DeepSeek V4 Flash / DeepSeek V4 | Xinference | DeepSeek V4 官方 DSML `<｜DSML｜tool_calls>` 注入与解析，兼容旧 `<｜DSML｜function_calls>` |
+| `deepseek-pro` | DeepSeek V4 Pro / DeepSeek V4 | Xinference | DeepSeek V4 官方 DSML `<｜DSML｜tool_calls>` 注入与解析，兼容旧 `<｜DSML｜function_calls>` |
+| `MiniMax-M1` | MiniMax 2.7 | Xinference | MiniMax-M2.7 官方 `<minimax:tool_call>` 注入与解析，兼容 XML/JSON-ish 变体和 `<think>` 过滤 |
+| `chatglm` | GLM 5.1 | Xinference | GLM-5.1 官方 `<tool_call>name<arg_key>...<arg_value>...` 注入与解析，兼容非标准闭合标签 |
 
-这些模型在请求 GenAI 时仍会尽量传递 Xinference/OpenAI 兼容的 `messages`、`tools`、`tool_choice` 字段；当上游未稳定返回原生 `tool_calls` 时，代理会使用模型专用的文本工具格式兜底，并统一转换成 OpenAI 或 Claude Messages API 的工具调用响应。
+DeepSeek 同厂不同版本不会共用同一个 adapter：`deepseek-chat` 使用 `deepseek_v4_flash`，`deepseek-pro` 使用 `deepseek_v4_pro`，旧 DeepSeek 名称使用 `deepseek_legacy`。V4 初始工具提示词按 DeepSeek V4 Pro `encoding_dsv4.py` / `encoding/tests` 的 `## Tools`、`<｜DSML｜tool_calls>`、`### Available Tool Schemas` 结构生成；MiniMax 和 GLM 分别按官方 `chat_template.jinja` 的 `<minimax:tool_call>` 与 `<tool_call>...<arg_key>...` 结构生成。
 
-针对 Claude Code 常见的 `Bash`、`Read`、`Edit`、`Write` 等工具，代理会优先保留请求里的精确工具名，并兼容模型偶发输出的 `Bash<arg_key>`、`<arg_value>`、DSML 和 JSON-ish 工具块，避免把工具调用直接透传成普通文本。
+GenAI 网页通道 `/htk/chat/start/chat` 目前不暴露可靠的原生 `tools/tool_choice` 通道，因此代理不会向上游请求体拼接 `tools` 或 `tool_choice` 字段，而是把工具定义写入模型专用的隐藏提示词。返回时统一解析成 OpenAI 或 Claude Messages API 的结构化工具调用响应，不把模型生成的 `<tool_call>`、`<minimax:tool_call>`、DSML 或 Claude Code transcript 片段直接透传给客户端。
+
+针对 Claude Code 常见的 `Bash`、`Glob`、`Read`、`Edit`、`Write` 等工具，代理会优先保留请求里的精确工具名，并兼容模型偶发输出的 `Bash<arg_key>`、`<arg_value>`、`Bash\nIN\n...`、`Globpattern: ...`、DSML、MiniMax XML 和 JSON-ish 工具块。工具结果后的多轮会话会继续保留工具定义，允许模型按需继续调用工具；显式 `tool_choice: "none"` 时才禁止工具调用。
 
 ### API Key 认证
 
@@ -284,13 +287,13 @@ uv run python -m compileall genai_proxy test_tool_adapters.py test_allowed_model
 uv run python test_tool_adapters.py
 ```
 
-使用 `docker-deploy.keystore` 对 DeepSeek V4 Flash、MiniMax 2.7、GLM-5.1 做 20 轮变体集成测试：
+使用 `docker-deploy.keystore` 对 DeepSeek V4 Flash、DeepSeek V4 Pro、MiniMax 2.7、GLM-5.1 做 20 轮变体集成测试：
 
 ```bash
-uv run python test_allowed_models_integration.py --repeat 20 --models deepseek-chat MiniMax-M1 chatglm
+uv run python test_allowed_models_integration.py --repeat 20 --models deepseek-chat deepseek-pro MiniMax-M1 chatglm
 ```
 
-该集成测试只允许调用 `deepseek-chat`、`MiniMax-M1`、`chatglm`，覆盖 OpenAI 和 Claude Messages 两种调用风格下的非流式工具调用、流式工具调用、Claude Code 风格 `Bash` 工具、工具结果回合和无需工具的普通回答。
+该集成测试只允许调用 `deepseek-chat`、`deepseek-pro`、`MiniMax-M1`、`chatglm`，覆盖 OpenAI 和 Claude Messages 两种调用风格下的非流式工具调用、流式工具调用、Claude Code 风格 `Bash` 工具、工具结果回合和无需工具的普通回答。
 
 ## 项目结构
 

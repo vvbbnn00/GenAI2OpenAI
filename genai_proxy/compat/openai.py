@@ -6,14 +6,15 @@ from datetime import datetime
 from flask import jsonify
 
 from genai_proxy.optimizations import (
-    DEEPSEEK_ADAPTER,
     GLM_ADAPTER,
     MINIMAX_ADAPTER,
     extract_deepseek_tool_calls,
     inject_deepseek_tool_prompt,
     inject_glm_tool_prompt,
     inject_minimax_tool_prompt,
+    is_deepseek_adapter,
     is_deepseek_model,
+    select_tool_adapter,
 )
 
 
@@ -32,10 +33,11 @@ When you need to call a tool, you MUST use the following XML format. Do NOT use 
 
 Rules:
 1. You can call multiple tools by using multiple <tool_call> blocks.
-2. If you don't need any tool, just respond normally in plain text without any <tool_call> tags.
-3. After receiving tool results, analyze them and either call more tools or give a final answer in plain text.
-4. The "arguments" field MUST be a valid JSON object matching the tool's parameter schema.
-5. NEVER wrap <tool_call> in markdown code blocks like ```xml or ```json."""
+2. Call a tool only when it is needed to answer the user's current request and the tool's purpose matches the request.
+3. If you can answer directly or no provided tool is relevant, respond normally in plain text without any <tool_call> tags.
+4. After receiving tool results, analyze them and either call more tools or give a final answer in plain text.
+5. The "arguments" field MUST be a valid JSON object matching the tool's parameter schema.
+6. NEVER wrap <tool_call> in markdown code blocks like ```xml or ```json."""
 
 TOOL_CHOICE_REQUIRED_PROMPT = (
     "\nYou MUST call at least one tool in your response. Do NOT respond with plain text only."
@@ -43,6 +45,7 @@ TOOL_CHOICE_REQUIRED_PROMPT = (
 TOOL_CHOICE_SPECIFIC_PROMPT = (
     '\nYou MUST call the tool named "{name}" in your response.'
 )
+TOOL_CHOICE_NONE_PROMPT = "\nFor this turn, do not call any tool."
 
 
 def openai_error(message, error_type="invalid_request_error", code=None, status=400):
@@ -103,19 +106,21 @@ def inject_tool_prompt(
     model=None,
     adapter=None,
 ):
-    if adapter == DEEPSEEK_ADAPTER or (adapter is None and is_deepseek_model(model)):
+    resolved_adapter = adapter or (select_tool_adapter(model) if model else None)
+    if is_deepseek_adapter(resolved_adapter) or (resolved_adapter is None and is_deepseek_model(model)):
         return inject_deepseek_tool_prompt(
             messages,
             tools,
             tool_choice,
+            adapter=resolved_adapter,
         )
-    if adapter == MINIMAX_ADAPTER:
+    if resolved_adapter == MINIMAX_ADAPTER:
         return inject_minimax_tool_prompt(
             messages,
             tools,
             tool_choice,
         )
-    if adapter == GLM_ADAPTER:
+    if resolved_adapter == GLM_ADAPTER:
         return inject_glm_tool_prompt(
             messages,
             tools,
@@ -130,6 +135,8 @@ def inject_tool_prompt(
     elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
         name = tool_choice["function"]["name"]
         tool_prompt += TOOL_CHOICE_SPECIFIC_PROMPT.format(name=name)
+    elif _tool_choice_is_none(tool_choice):
+        tool_prompt += TOOL_CHOICE_NONE_PROMPT
 
     new_messages = []
     has_system = False
@@ -181,6 +188,12 @@ def inject_tool_prompt(
 
 def strip_think_blocks(content):
     return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+
+def _tool_choice_is_none(tool_choice) -> bool:
+    return tool_choice == "none" or (
+        isinstance(tool_choice, dict) and tool_choice.get("type") == "none"
+    )
 
 
 def _parse_tool_call_body(raw, tools=None):
@@ -276,11 +289,13 @@ def extract_tool_calls(content, logger=None, tools=None, model=None, adapter=Non
         flags=re.DOTALL,
     )
 
-    if adapter == DEEPSEEK_ADAPTER or (adapter is None and is_deepseek_model(model)):
+    resolved_adapter = adapter or (select_tool_adapter(model) if model else None)
+    if is_deepseek_adapter(resolved_adapter) or (resolved_adapter is None and is_deepseek_model(model)):
         repaired_tool_calls, repaired_remaining = extract_deepseek_tool_calls(
             cleaned,
             tools=tools,
             logger=logger,
+            adapter=resolved_adapter,
         )
         if repaired_tool_calls:
             return repaired_tool_calls, repaired_remaining
@@ -490,6 +505,10 @@ def _parse_jsonish_scalar(raw: str):
             return json.loads(candidate)
         except json.JSONDecodeError:
             return value[1:-1]
+    if value.startswith('"') and not value.endswith('"'):
+        return value[1:]
+    if value.endswith('"') and not value.startswith('"'):
+        return value[:-1]
 
     lowered = value.lower()
     if lowered == "true":
@@ -544,6 +563,10 @@ def _tool_name_set(tools) -> set[str]:
 
 
 def _tool_argument_names(name: str, tools=None) -> list[str]:
+    return list(_tool_argument_types(name, tools))
+
+
+def _tool_argument_types(name: str, tools=None) -> dict[str, str | None]:
     for tool in tools or []:
         if not isinstance(tool, dict):
             continue
@@ -556,8 +579,38 @@ def _tool_argument_names(name: str, tools=None) -> list[str]:
         parameters = function_data.get("parameters", {}) or tool.get("input_schema", {})
         properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
         if isinstance(properties, dict):
-            return list(properties.keys())
-    return []
+            return {
+                key: value.get("type") if isinstance(value, dict) else None
+                for key, value in properties.items()
+            }
+    return {}
+
+
+def _parse_typed_value(value: str, expected_type: str | None):
+    if expected_type in {"object", "array"}:
+        try:
+            return json.loads(_escape_invalid_json_backslashes(value))
+        except json.JSONDecodeError:
+            return value
+    if expected_type == "integer":
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    if expected_type == "number":
+        try:
+            parsed = float(value)
+            return int(parsed) if parsed == int(parsed) else parsed
+        except ValueError:
+            return value
+    if expected_type == "boolean":
+        lowered = value.lower()
+        if lowered in {"true", "1"}:
+            return True
+        if lowered in {"false", "0"}:
+            return False
+        return value
+    return _parse_jsonish_scalar(value)
 
 
 def _find_tool_call_blocks(content: str, tools=None):
@@ -574,7 +627,15 @@ def _find_tool_call_blocks(content: str, tools=None):
         body_start = start + len(start_tag)
         tool_end = content.find("</tool_call>", body_start)
         arg_value_end = content.find("</arg_value>", body_start)
-        if tool_end >= 0 and (
+        next_start = content.find(start_tag, body_start)
+        if (
+            next_start >= 0
+            and (tool_end < 0 or next_start < tool_end)
+            and not _tool_call_prefix_looks_parseable(content[body_start:next_start], tools)
+        ):
+            body_end = next_start
+            block_end = next_start
+        elif tool_end >= 0 and (
             arg_value_end < 0 or "<arg_key>" in content[body_start:tool_end]
         ):
             body_end = tool_end
@@ -596,7 +657,6 @@ def _find_tool_call_blocks(content: str, tools=None):
                 body_end = json_end
                 block_end = json_end
             else:
-                next_start = content.find(start_tag, body_start)
                 body_end = next_start if next_start >= 0 else len(content)
                 block_end = body_end
 
@@ -605,16 +665,49 @@ def _find_tool_call_blocks(content: str, tools=None):
         pos = max(block_end, body_start + 1)
 
     raw_matches, raw_spans = _find_arg_key_tool_blocks(content, tools, spans)
-    if raw_matches:
-        combined = sorted(
-            list(zip(spans, matches, strict=False))
-            + list(zip(raw_spans, raw_matches, strict=False)),
-            key=lambda item: item[0][0],
-        )
-        spans = [span for span, _ in combined]
-        matches = [match for _, match in combined]
+    minimax_matches, minimax_spans = _find_minimax_tool_call_blocks(
+        content,
+        tools,
+        spans + raw_spans,
+    )
+    transcript_matches, transcript_spans = _find_claude_code_transcript_tool_blocks(
+        content,
+        tools,
+        spans + raw_spans + minimax_spans,
+    )
+    inline_matches, inline_spans = _find_inline_tool_argument_blocks(
+        content,
+        tools,
+        spans + raw_spans + minimax_spans + transcript_spans,
+    )
+    combined = sorted(
+        list(zip(spans, matches, strict=False))
+        + list(zip(raw_spans, raw_matches, strict=False))
+        + list(zip(minimax_spans, minimax_matches, strict=False))
+        + list(zip(transcript_spans, transcript_matches, strict=False)),
+        key=lambda item: item[0][0],
+    )
+    combined = sorted(
+        combined
+        + list(zip(inline_spans, inline_matches, strict=False)),
+        key=lambda item: item[0][0],
+    )
+    spans = [span for span, _ in combined]
+    matches = [match for _, match in combined]
 
     return matches, spans
+
+
+def _tool_call_prefix_looks_parseable(prefix: str, tools=None) -> bool:
+    text = prefix.strip()
+    if not text:
+        return False
+    if text.startswith(("{", "<name>", "<arg_key>")) or '"name"' in text[:80]:
+        return True
+    for name in _tool_name_set(tools):
+        if re.match(rf"{re.escape(name)}(?:\s*<arg_key>|\s*$)", text, re.IGNORECASE):
+            return True
+    return False
 
 
 def _find_arg_key_tool_blocks(content: str, tools=None, occupied_spans=None):
@@ -645,10 +738,258 @@ def _find_arg_key_tool_blocks(content: str, tools=None, occupied_spans=None):
     return blocks, spans
 
 
+def _find_minimax_tool_call_blocks(content: str, tools=None, occupied_spans=None):
+    occupied_spans = occupied_spans or []
+    pattern = re.compile(r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL)
+    blocks = []
+    spans = []
+
+    for match in pattern.finditer(content):
+        if any(span_start <= match.start() < span_end for span_start, span_end in occupied_spans):
+            continue
+        inner = match.group(1)
+        invocations = list(
+            re.finditer(
+                r"<invoke\s+name=(?P<quote>[\"']?)(?P<name>[^\"'>\s]+)(?P=quote)>(?P<body>.*?)</invoke>",
+                inner,
+                re.DOTALL,
+            )
+        )
+        for invoke in invocations:
+            name = _canonical_tool_name(invoke.group("name"), tools)
+            if name is None:
+                continue
+            arguments = _parse_minimax_parameters(name, invoke.group("body"), tools)
+            blocks.append(json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False))
+            spans.append((match.start(), match.end()))
+
+    return blocks, spans
+
+
+def _parse_minimax_parameters(name: str, body: str, tools=None):
+    argument_types = _tool_argument_types(name, tools)
+    arguments = {}
+    parameter_pattern = re.compile(
+        r"<parameter\s+name=(?P<quote>[\"']?)(?P<key>[^\"'>\s]+)(?P=quote)>(?P<value>.*?)</parameter>",
+        re.DOTALL,
+    )
+    for parameter in parameter_pattern.finditer(body):
+        key = parameter.group("key")
+        value = parameter.group("value").strip()
+        arguments[key] = _parse_typed_value(value, argument_types.get(key))
+    return arguments
+
+
+def _find_inline_tool_argument_blocks(content: str, tools=None, occupied_spans=None):
+    occupied_spans = occupied_spans or []
+    tool_names = sorted(_tool_name_set(tools), key=len, reverse=True)
+    if not tool_names:
+        return [], []
+
+    blocks = []
+    spans = []
+    lines = content.splitlines(keepends=True)
+    offsets = []
+    cursor = 0
+    for line in lines:
+        offsets.append(cursor)
+        cursor += len(line)
+
+    for line_index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        line_start = offsets[line_index]
+        if any(span_start <= line_start < span_end for span_start, span_end in occupied_spans):
+            continue
+
+        parsed = _parse_inline_tool_line(stripped, tools)
+        if not parsed:
+            continue
+
+        name, arguments = parsed
+        end_index = line_index + 1
+        while end_index < len(lines):
+            next_stripped = lines[end_index].strip()
+            if not next_stripped:
+                end_index += 1
+                continue
+            continuation = _parse_inline_continuation_line(next_stripped, name, tools)
+            if continuation is None:
+                break
+            _, key, value = continuation
+            arguments[key] = value
+            end_index += 1
+
+        block_end = offsets[end_index] if end_index < len(offsets) else len(content)
+        blocks.append(json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False))
+        spans.append((line_start, block_end))
+
+    return blocks, spans
+
+
+def _parse_inline_tool_line(line: str, tools=None):
+    for name in sorted(_tool_name_set(tools), key=len, reverse=True):
+        if not line.lower().startswith(name.lower()):
+            continue
+        rest = line[len(name) :].strip()
+        if not rest:
+            continue
+        parsed = _parse_inline_argument_text(name, rest, tools)
+        if parsed is not None:
+            return name, parsed
+    return None
+
+
+def _parse_inline_continuation_line(line: str, name: str, tools=None):
+    parsed = _parse_inline_argument_text(name, line, tools)
+    if not parsed or len(parsed) != 1:
+        return None
+    key, value = next(iter(parsed.items()))
+    return name, key, value
+
+
+def _parse_inline_argument_text(name: str, text: str, tools=None):
+    argument_names = _tool_argument_names(name, tools)
+    if not argument_names:
+        return None
+
+    key_pattern = "|".join(re.escape(key) for key in sorted(argument_names, key=len, reverse=True))
+    matches = list(
+        re.finditer(
+            rf"(?<![\w./@-])(?P<key>{key_pattern})\s*:\s*",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    if not matches:
+        return None
+
+    arguments = {}
+    canonical_keys = {key.lower(): key for key in argument_names}
+    for index, match in enumerate(matches):
+        key = canonical_keys.get(match.group("key").lower(), match.group("key"))
+        value_start = match.end()
+        value_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        raw_value = text[value_start:value_end].strip()
+        if not raw_value:
+            return None
+        arguments[key] = _parse_jsonish_scalar(raw_value)
+    return arguments
+
+
+def _find_claude_code_transcript_tool_blocks(content: str, tools=None, occupied_spans=None):
+    occupied_spans = occupied_spans or []
+    tool_names = sorted(_tool_name_set(tools), key=len, reverse=True)
+    if not tool_names:
+        return [], []
+
+    name_pattern = "|".join(re.escape(name) for name in tool_names)
+    pattern = re.compile(
+        rf"(?m)(?<![\w./@-])(?P<name>{name_pattern})(?P<label>[^\n<]*)?\nIN\n",
+        re.DOTALL,
+    )
+    matches = list(pattern.finditer(content))
+    blocks = []
+    spans = []
+
+    for index, match in enumerate(matches):
+        start = match.start("name")
+        if any(span_start <= start < span_end for span_start, span_end in occupied_spans):
+            continue
+
+        body_start = match.end()
+        candidates = []
+        if index + 1 < len(matches):
+            candidates.append(matches[index + 1].start("name"))
+        for marker in ("<tool_call>", "<minimax:tool_call>", "<｜DSML｜tool_calls>", "<｜DSML｜function_calls>"):
+            marker_pos = content.find(marker, body_start)
+            if marker_pos >= 0:
+                candidates.append(marker_pos)
+        next_tool_pos = min(candidates) if candidates else len(content)
+        out_marker = _find_transcript_out_marker(content, body_start, next_tool_pos)
+        body_end = out_marker[0] if out_marker else next_tool_pos
+        span_end = next_tool_pos
+        if out_marker:
+            after_out = out_marker[1]
+            next_after_out = [
+                pos
+                for pos in (
+                    content.find("<tool_call>", after_out),
+                    content.find("<minimax:tool_call>", after_out),
+                    content.find("<｜DSML｜tool_calls>", after_out),
+                    content.find("<｜DSML｜function_calls>", after_out),
+                    matches[index + 1].start("name") if index + 1 < len(matches) else -1,
+                )
+                if pos >= 0
+            ]
+            span_end = min(next_after_out) if next_after_out else len(content)
+
+        raw_input = content[body_start:body_end].strip()
+        if not raw_input:
+            continue
+
+        name = _canonical_tool_name(match.group("name"), tools)
+        if name is None:
+            continue
+        arguments = _transcript_tool_arguments(
+            name,
+            raw_input,
+            tools,
+            label=(match.group("label") or "").strip(),
+        )
+        if arguments is None:
+            continue
+
+        blocks.append(json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False))
+        spans.append((start, span_end))
+
+    return blocks, spans
+
+
+def _find_transcript_out_marker(content: str, start: int, end: int) -> tuple[int, int] | None:
+    search_area = content[start:end]
+    match = re.search(r"(?:\r?\n)OUT(?:\r?\n)", search_area)
+    if not match:
+        return None
+    return start + match.start(), start + match.end()
+
+
+def _transcript_tool_arguments(name: str, raw_input: str, tools=None, label: str = ""):
+    raw_input = raw_input.strip()
+    if not raw_input:
+        return {}
+    if raw_input.startswith("{"):
+        try:
+            parsed = json.loads(_escape_invalid_json_backslashes(raw_input))
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    argument_names = _tool_argument_names(name, tools)
+    if name.lower() == "bash" and "command" in argument_names:
+        arguments = {"command": raw_input}
+        if label and "description" in argument_names:
+            arguments["description"] = label
+        return arguments
+    if len(argument_names) == 1:
+        return {argument_names[0]: raw_input}
+    return None
+
+
 def _remove_spans(content: str, spans):
+    merged_spans = []
+    for start, end in sorted(spans):
+        if not merged_spans or start > merged_spans[-1][1]:
+            merged_spans.append([start, end])
+        else:
+            merged_spans[-1][1] = max(merged_spans[-1][1], end)
+
     pieces = []
     cursor = 0
-    for start, end in spans:
+    for start, end in merged_spans:
         pieces.append(content[cursor:start])
         cursor = end
     pieces.append(content[cursor:])

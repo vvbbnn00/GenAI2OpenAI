@@ -4,7 +4,34 @@ import uuid
 from typing import Any
 
 
-DEEPSEEK_TOOL_SYSTEM_TEMPLATE = """## Tools
+DEEPSEEK_V4_TOOL_SYSTEM_TEMPLATE = """## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<｜DSML｜tool_calls>" block like the following:
+
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="$TOOL_NAME">
+<｜DSML｜parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜parameter>
+...
+</｜DSML｜invoke>
+<｜DSML｜invoke name="$TOOL_NAME2">
+...
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>
+
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.
+
+Otherwise, output directly after </think> with tool calls or final response.
+
+### Available Tool Schemas
+
+{tool_schemas}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+"""
+
+DEEPSEEK_LEGACY_TOOL_SYSTEM_TEMPLATE = """## Tools
 
 You have access to a set of tools you can use to answer the user's question.
 
@@ -20,11 +47,6 @@ String and scalar parameters should be specified as-is without any escaping or q
 Lists and objects should use JSON format.
 The "string" attribute must be "true" for string parameters and "false" for numbers, booleans, arrays, and objects.
 
-For this proxy:
-- If you need a tool, prefer replying with the function_calls block immediately instead of a long preamble.
-- Emit well-formed DSML only. Do not use markdown fences.
-- For shell commands, prefer single quotes inside command strings, for example '*.py' instead of "*.py".
-
 Here are the functions available in JSONSchema format:
 <functions>
 {tool_schemas}
@@ -32,10 +54,18 @@ Here are the functions available in JSONSchema format:
 """
 
 DEEPSEEK_REQUIRED_TOOL_SUFFIX = (
+    "\nFor this turn, a plain-text-only answer is invalid. You must emit a <｜DSML｜tool_calls> block."
+)
+DEEPSEEK_LEGACY_REQUIRED_TOOL_SUFFIX = (
     "\nFor this turn, a plain-text-only answer is invalid. You must emit a <｜DSML｜function_calls> block."
+)
+DEEPSEEK_NO_TOOL_SUFFIX = (
+    "\nFor this turn, do not emit DSML tool_calls/function_calls or <tool_call> tags."
 )
 
 DSML_TOKEN = "｜DSML｜"
+DSML_TOOL_CALLS_START = "<｜DSML｜tool_calls>"
+DSML_TOOL_CALLS_END = "</｜DSML｜tool_calls>"
 DSML_FUNCTION_CALLS_START = "<｜DSML｜function_calls>"
 DSML_FUNCTION_CALLS_END = "</｜DSML｜function_calls>"
 
@@ -44,8 +74,8 @@ def is_deepseek_model(model: str | None) -> bool:
     return "deepseek" in (model or "").lower()
 
 
-def inject_deepseek_tool_prompt(messages, tools, tool_choice=None):
-    tool_prompt = _render_deepseek_tools_prompt(tools, tool_choice)
+def inject_deepseek_tool_prompt(messages, tools, tool_choice=None, adapter=None):
+    tool_prompt = _render_deepseek_tools_prompt(tools, tool_choice, adapter=adapter)
     new_messages = []
     has_system = False
     index = 0
@@ -69,7 +99,7 @@ def inject_deepseek_tool_prompt(messages, tools, tool_choice=None):
             assistant_parts = []
             if msg.get("content"):
                 assistant_parts.append(msg["content"])
-            assistant_parts.append(_render_deepseek_tool_calls(msg["tool_calls"]))
+            assistant_parts.append(_render_deepseek_tool_calls(msg["tool_calls"], adapter=adapter))
             new_messages.append(
                 {
                     "role": "assistant",
@@ -89,6 +119,7 @@ def inject_deepseek_tool_prompt(messages, tools, tool_choice=None):
                     "role": "user",
                     "content": _render_function_results(
                         tool_messages,
+                        adapter=adapter,
                         allow_additional_tool_calls=_allows_additional_tool_calls(tool_choice),
                     ),
                 }
@@ -104,8 +135,12 @@ def inject_deepseek_tool_prompt(messages, tools, tool_choice=None):
     return new_messages
 
 
-def extract_deepseek_tool_calls(content, tools=None, logger=None):
-    dsml_tool_calls, dsml_remaining = _extract_dsml_tool_calls(content, logger=logger)
+def extract_deepseek_tool_calls(content, tools=None, logger=None, adapter=None):
+    dsml_tool_calls, dsml_remaining = _extract_dsml_tool_calls(
+        content,
+        logger=logger,
+        include_legacy=True,
+    )
     if dsml_tool_calls:
         return dsml_tool_calls, dsml_remaining
 
@@ -144,28 +179,38 @@ def extract_deepseek_tool_calls(content, tools=None, logger=None):
     return repaired_tool_calls, remaining or None
 
 
-def _render_deepseek_tools_prompt(tools, tool_choice=None):
+def _render_deepseek_tools_prompt(tools, tool_choice=None, adapter=None):
     tool_schemas = []
     for tool in tools:
         function_data = tool.get("function", {})
         if function_data:
             tool_schemas.append(json.dumps(function_data, ensure_ascii=False))
 
-    prompt = DEEPSEEK_TOOL_SYSTEM_TEMPLATE.format(
+    is_legacy = adapter == "deepseek_legacy"
+    template = DEEPSEEK_LEGACY_TOOL_SYSTEM_TEMPLATE if is_legacy else DEEPSEEK_V4_TOOL_SYSTEM_TEMPLATE
+    prompt = template.format(
         tool_schemas="\n".join(tool_schemas),
     )
 
     if tool_choice == "required":
-        prompt += DEEPSEEK_REQUIRED_TOOL_SUFFIX
+        prompt += DEEPSEEK_LEGACY_REQUIRED_TOOL_SUFFIX if is_legacy else DEEPSEEK_REQUIRED_TOOL_SUFFIX
     elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
-        prompt += (
-            f'\nFor this turn, you must emit a <｜DSML｜function_calls> block using the tool "{tool_choice["function"]["name"]}".'
-        )
+        if is_legacy:
+            prompt += (
+                f'\nFor this turn, you must emit a <｜DSML｜function_calls> block using the tool "{tool_choice["function"]["name"]}".'
+            )
+        else:
+            prompt += (
+                f'\nFor this turn, you must emit a <｜DSML｜tool_calls> block using the tool "{tool_choice["function"]["name"]}".'
+            )
+    elif _tool_choice_is_none(tool_choice):
+        prompt += DEEPSEEK_NO_TOOL_SUFFIX
 
     return prompt
 
 
-def _render_deepseek_tool_calls(tool_calls):
+def _render_deepseek_tool_calls(tool_calls, adapter=None):
+    block_name = "function_calls" if adapter == "deepseek_legacy" else "tool_calls"
     invocations = []
     for tool_call in tool_calls:
         function_data = tool_call.get("function", {})
@@ -187,9 +232,9 @@ def _render_deepseek_tool_calls(tool_calls):
 
     return "\n".join(
         [
-            f"<{DSML_TOKEN}function_calls>",
+            f"<{DSML_TOKEN}{block_name}>",
             *invocations,
-            f"</{DSML_TOKEN}function_calls>",
+            f"</{DSML_TOKEN}{block_name}>",
         ]
     )
 
@@ -203,37 +248,35 @@ def _render_dsml_parameter(key: str, value: Any) -> str:
     )
 
 
-def _render_function_results(tool_messages, allow_additional_tool_calls=False) -> str:
-    result_lines = [
-        "<function_results>",
-    ]
-    if allow_additional_tool_calls:
-        result_lines.append(
-            "Use these function results to answer the user. Only call another function if the current result is genuinely insufficient."
+def _render_function_results(tool_messages, adapter=None, allow_additional_tool_calls=False) -> str:
+    if adapter != "deepseek_legacy":
+        return "\n".join(
+            f"<tool_result>{_normalize_tool_content(msg.get('content'))}</tool_result>"
+            for msg in tool_messages
         )
-    else:
-        result_lines.append(
-            "The function results are sufficient and final for this turn. Answer the user normally using them. Do not emit DSML function_calls or <tool_call> tags."
-        )
+
+    result_lines = ["<function_results>"]
+    if not allow_additional_tool_calls:
+        result_lines.append("Answer the user normally using these function results.")
     for msg in tool_messages:
         result_content = _normalize_tool_content(msg.get("content"))
-        result_lines.append(f"<result>{result_content}</result>")
+        result_lines.append(f"<tool_result>{result_content}</tool_result>")
     result_lines.append("</function_results>")
     return "\n".join(result_lines)
 
 
 def _allows_additional_tool_calls(tool_choice) -> bool:
-    return tool_choice == "required" or (
-        isinstance(tool_choice, dict) and tool_choice.get("type") == "function"
+    return not _tool_choice_is_none(tool_choice)
+
+
+def _tool_choice_is_none(tool_choice) -> bool:
+    return tool_choice == "none" or (
+        isinstance(tool_choice, dict) and tool_choice.get("type") == "none"
     )
 
 
-def _extract_dsml_tool_calls(content, logger=None):
-    match = re.search(
-        rf"{re.escape(DSML_FUNCTION_CALLS_START)}(.*?){re.escape(DSML_FUNCTION_CALLS_END)}",
-        content,
-        re.DOTALL,
-    )
+def _extract_dsml_tool_calls(content, logger=None, include_legacy=True):
+    match = _find_dsml_tool_call_block(content, include_legacy=include_legacy)
     if not match:
         return None, content
 
@@ -274,6 +317,21 @@ def _extract_dsml_tool_calls(content, logger=None):
         content[: match.start()] + content[match.end() :]
     ).strip()
     return tool_calls, remaining or None
+
+
+def _find_dsml_tool_call_block(content: str, include_legacy=True):
+    pairs = [(DSML_TOOL_CALLS_START, DSML_TOOL_CALLS_END)]
+    if include_legacy:
+        pairs.append((DSML_FUNCTION_CALLS_START, DSML_FUNCTION_CALLS_END))
+    for start_tag, end_tag in pairs:
+        match = re.search(
+            rf"{re.escape(start_tag)}(.*?){re.escape(end_tag)}",
+            content,
+            re.DOTALL,
+        )
+        if match:
+            return match
+    return None
 
 
 def _normalize_tool_content(content):

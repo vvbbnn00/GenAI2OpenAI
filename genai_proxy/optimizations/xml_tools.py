@@ -1,7 +1,13 @@
 import json
 
 
-def inject_xml_tool_prompt(messages, tool_prompt, allow_additional_tool_calls=False):
+def inject_xml_tool_prompt(
+    messages,
+    tool_prompt,
+    allow_additional_tool_calls=False,
+    render_tool_call_message=None,
+    render_tool_results=None,
+):
     new_messages = []
     has_system = False
     index = 0
@@ -25,7 +31,11 @@ def inject_xml_tool_prompt(messages, tool_prompt, allow_additional_tool_calls=Fa
             new_messages.append(
                 {
                     "role": "assistant",
-                    "content": _render_tool_call_message(msg),
+                    "content": (
+                        render_tool_call_message(msg)
+                        if render_tool_call_message
+                        else _render_tool_call_message(msg)
+                    ),
                 }
             )
             index += 1
@@ -39,9 +49,16 @@ def inject_xml_tool_prompt(messages, tool_prompt, allow_additional_tool_calls=Fa
             new_messages.append(
                 {
                     "role": "user",
-                    "content": _render_tool_results(
-                        tool_messages,
-                        allow_additional_tool_calls=allow_additional_tool_calls,
+                    "content": (
+                        render_tool_results(
+                            tool_messages,
+                            allow_additional_tool_calls=allow_additional_tool_calls,
+                        )
+                        if render_tool_results
+                        else _render_tool_results(
+                            tool_messages,
+                            allow_additional_tool_calls=allow_additional_tool_calls,
+                        )
                     ),
                 }
             )

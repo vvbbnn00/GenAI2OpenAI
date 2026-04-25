@@ -7,7 +7,7 @@ from genai_proxy.config import AppConfig
 from genai_proxy.logging_utils import setup_logging
 
 
-ALLOWED_MODELS = ("deepseek-chat", "MiniMax-M1", "chatglm")
+ALLOWED_MODELS = ("deepseek-chat", "deepseek-pro", "MiniMax-M1", "chatglm")
 CITIES = (
     "Shanghai",
     "Beijing",
