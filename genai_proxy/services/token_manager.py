@@ -7,8 +7,6 @@ import time
 from datetime import datetime
 from urllib.parse import parse_qs, quote, urlparse
 
-import requests
-
 try:
     import fcntl
 except ImportError:  # pragma: no cover
@@ -23,7 +21,6 @@ GENAI_LEGACY_CAS_SERVICE_URL = (
 GENAI_GET_TOKEN_URL = (
     "https://genai.shanghaitech.edu.cn/htk/user/info/{token}?_t={timestamp}"
 )
-GENAI_CONFIRM_TOKEN_URL = "https://genai.shanghaitech.edu.cn/htk/user/info/{token}"
 
 GENAI_AUTH_FAILURE_MESSAGES = (
     "token失效",
@@ -63,7 +60,6 @@ class TokenManager:
     REFRESH_MARGIN = 300
     DEFAULT_TOKEN_CHECK_INTERVAL = 60
     REFRESH_FAILURE_RETRY_INTERVAL = 60
-    TOKEN_CONFIRM_TIMEOUT = 10
 
     def __init__(
         self,
@@ -82,6 +78,7 @@ class TokenManager:
         )
         self._token_cache_path = f"{keystore_path}.token.json" if keystore_path else None
         self._token_exp = None
+        self._user_id = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._token_check_thread = None
@@ -166,6 +163,7 @@ class TokenManager:
 
         cached_token = payload.get("token")
         cached_exp = payload.get("exp")
+        cached_user_id = payload.get("user_id")
         if not cached_token or not cached_exp:
             return False
         if rejected_token is not None and cached_token == rejected_token:
@@ -173,6 +171,12 @@ class TokenManager:
 
         if time.time() >= (float(cached_exp) - self.REFRESH_MARGIN):
             return False
+
+        if cached_user_id:
+            self._user_id = str(cached_user_id)
+
+        if cached_token == self._token:
+            return True
 
         self._token = cached_token
         self._update_expiry()
@@ -188,6 +192,8 @@ class TokenManager:
             "exp": self._token_exp,
             "updated_at": int(time.time()),
         }
+        if self._user_id:
+            payload["user_id"] = self._user_id
         temp_path = f"{self._token_cache_path}.tmp"
 
         try:
@@ -196,6 +202,40 @@ class TokenManager:
             os.replace(temp_path, self._token_cache_path)
         except Exception as exc:
             self._logger.warning("Failed to update token cache %s: %s", self._token_cache_path, exc)
+
+    def update_token_from_upstream(self, token: str | None, reason: str) -> bool:
+        if not token:
+            return False
+
+        with self._lock:
+            if self._shutdown_done or self._token == token:
+                return False
+
+            self._logger.info("Updating GenAI token from %s", reason)
+            self._token = token
+            self._update_expiry()
+            self._write_cached_token()
+            self._last_refresh_failure_at = 0.0
+            return True
+
+    def update_billing_user_id(self, user_id: str | int | None) -> bool:
+        if user_id in (None, ""):
+            return False
+
+        user_id = str(user_id)
+        with self._lock:
+            if self._shutdown_done or self._user_id == user_id:
+                return False
+
+            self._user_id = user_id
+            self._write_cached_token()
+            return True
+
+    @property
+    def billing_user_id(self) -> str | None:
+        with self._lock:
+            self._load_cached_token()
+            return self._user_id
 
     def _delete_cached_token(self) -> None:
         if not self._token_cache_path:
@@ -313,14 +353,14 @@ class TokenManager:
 
     def _run_token_check_loop(self) -> None:
         self._logger.info(
-            "Periodic GenAI token confirmation enabled: every %d seconds",
+            "Periodic GenAI token maintenance enabled: every %d seconds",
             self._token_check_interval,
         )
         while not self._stop_event.is_set():
             try:
                 self._confirm_token_for_background()
             except Exception:
-                self._logger.exception("Periodic GenAI token confirmation failed")
+                self._logger.exception("Periodic GenAI token maintenance failed")
 
             if self._stop_event.wait(self._token_check_interval):
                 break
@@ -329,71 +369,9 @@ class TokenManager:
         with self._lock:
             if self._shutdown_done:
                 return
+            self._load_cached_token()
             if self._needs_refresh():
-                self._refresh_token_for_access("periodic token confirmation")
-            token = self._token
-
-        if not token:
-            return
-
-        if self._stop_event.is_set():
-            return
-
-        if self._token_was_rejected_by_upstream(token):
-            if self._stop_event.is_set():
-                return
-            self.refresh_after_auth_failure(
-                "periodic token confirmation",
-                rejected_token=token,
-            )
-
-    def _token_was_rejected_by_upstream(self, token: str) -> bool:
-        try:
-            response = requests.get(
-                GENAI_CONFIRM_TOKEN_URL.format(token=token),
-                params={"_t": int(time.time() * 1000)},
-                headers={
-                    "Accept": "application/json",
-                    "X-Access-Token": token,
-                },
-                timeout=self.TOKEN_CONFIRM_TIMEOUT,
-            )
-        except requests.RequestException as exc:
-            self._logger.warning(
-                "Periodic token confirmation request failed: %s",
-                exc.__class__.__name__,
-            )
-            return False
-
-        if response.status_code in (401, 403):
-            return True
-        if response.status_code != 200:
-            self._logger.warning(
-                "Periodic token confirmation HTTP error %d",
-                response.status_code,
-            )
-            return False
-
-        try:
-            payload = response.json()
-        except ValueError:
-            self._logger.warning("Periodic token confirmation returned invalid JSON")
-            return False
-
-        if is_genai_auth_failure(payload):
-            return True
-        code = payload.get("code", 200)
-        try:
-            failed_code = int(code) >= 400
-        except (TypeError, ValueError):
-            failed_code = False
-        if payload.get("success") is False or failed_code:
-            self._logger.warning(
-                "Periodic token confirmation business error: code=%s message=%s",
-                code,
-                payload.get("message"),
-            )
-        return False
+                self._refresh_token_for_access("periodic token maintenance")
 
     def refresh_after_auth_failure(
         self,
@@ -419,8 +397,6 @@ class TokenManager:
                 return True
 
             self._logger.warning("GenAI token was rejected by upstream (%s); refreshing", reason)
-            self._token = None
-            self._token_exp = None
             try:
                 self._refresh_token(force=True, rejected_token=rejected_token)
             except Exception:

@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--token-check-interval",
         type=int,
         default=os.environ.get("TOKEN_CHECK_INTERVAL") or "60",
-        help="Seconds between background GenAI token confirmation checks; set 0 to disable",
+        help="Seconds between background GenAI token expiry/cache checks; set 0 to disable",
     )
     parser.add_argument(
         "--claude-haiku-model",

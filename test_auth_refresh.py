@@ -8,8 +8,6 @@ import time
 import unittest
 from unittest.mock import patch
 
-import requests
-
 from genai_proxy.errors import ProxyError
 from genai_proxy.services.genai import GenAIService
 from genai_proxy.services.models import ModelManager
@@ -48,16 +46,13 @@ class FakeResponse:
         return self._payload
 
 
-class InvalidJsonResponse(FakeResponse):
-    def json(self):
-        raise ValueError("invalid json")
-
-
 class FakeTokenManager:
     def __init__(self):
         self._token = "stale-token"
         self.refresh_count = 0
         self.rejected_token = None
+        self.upstream_token_updates = []
+        self._billing_user_id = None
 
     @property
     def token(self):
@@ -68,6 +63,19 @@ class FakeTokenManager:
         self.rejected_token = rejected_token
         self._token = "fresh-token"
         return True
+
+    def update_token_from_upstream(self, token, reason):
+        self.upstream_token_updates.append((token, reason))
+        self._token = token
+        return True
+
+    def update_billing_user_id(self, user_id):
+        self._billing_user_id = str(user_id)
+        return True
+
+    @property
+    def billing_user_id(self):
+        return self._billing_user_id
 
 
 class FakeSession:
@@ -151,6 +159,118 @@ class AuthRefreshTests(unittest.TestCase):
         self.assertEqual(service._with_token_auth_retry("unit test", fetch), "ok")
         self.assertEqual(seen_tokens, ["stale-token", "fresh-token"])
         self.assertEqual(token_manager.rejected_token, "stale-token")
+
+    def test_billing_stores_token_returned_by_current_user_response(self):
+        old_token = make_jwt(exp=int(time.time()) + 3600)
+        new_exp = int(time.time()) + 7200
+        new_token = make_jwt(exp=new_exp)
+        token_manager = FakeTokenManager()
+        token_manager._token = old_token
+        service = GenAIService(self.logger, token_manager, None)
+
+        responses = [
+            FakeResponse(
+                {
+                    "success": True,
+                    "code": 200,
+                    "result": {
+                        "token": new_token,
+                        "userInfo": {"id": "42"},
+                    },
+                }
+            ),
+            FakeResponse(
+                {
+                    "success": True,
+                    "code": 200,
+                    "result": {
+                        "records": [
+                            {
+                                "id": "42",
+                                "quota": "12.5",
+                            }
+                        ]
+                    },
+                }
+            ),
+        ]
+
+        with patch("genai_proxy.services.genai.requests.get", side_effect=responses) as mocked_get:
+            result = service.fetch_openai_billing_subscription()
+
+        self.assertEqual(result["access_until"], new_exp)
+        self.assertEqual(token_manager.token, new_token)
+        self.assertEqual(token_manager.billing_user_id, "42")
+        self.assertEqual(token_manager.upstream_token_updates, [(new_token, "current user response")])
+        self.assertEqual(mocked_get.call_args_list[1].kwargs["headers"]["X-Access-Token"], old_token)
+
+    def test_billing_reuses_cached_user_id_after_first_lookup(self):
+        old_token = make_jwt(exp=int(time.time()) + 3600)
+        new_token = make_jwt(exp=int(time.time()) + 7200)
+        token_manager = FakeTokenManager()
+        token_manager._token = old_token
+        service = GenAIService(self.logger, token_manager, None)
+
+        responses = [
+            FakeResponse(
+                {
+                    "success": True,
+                    "code": 200,
+                    "result": {
+                        "token": new_token,
+                        "userInfo": {"id": "42"},
+                    },
+                }
+            ),
+            FakeResponse(
+                {
+                    "success": True,
+                    "code": 200,
+                    "result": {"records": [{"id": "42", "quota": "12.5"}]},
+                }
+            ),
+            FakeResponse(
+                {
+                    "success": True,
+                    "code": 200,
+                    "result": {"records": [{"id": "42", "monthSurplus": "0.5"}]},
+                }
+            ),
+        ]
+
+        with patch("genai_proxy.services.genai.requests.get", side_effect=responses) as mocked_get:
+            service.fetch_openai_billing_subscription()
+            usage = service.fetch_openai_billing_usage()
+
+        self.assertEqual(usage["total_usage"], 50.0)
+        self.assertEqual(mocked_get.call_count, 3)
+        self.assertIn("/htk/user/info/", mocked_get.call_args_list[0].args[0])
+        self.assertIn("/htk/ai-user-info/list", mocked_get.call_args_list[1].args[0])
+        self.assertIn("/htk/ai-user-info/list", mocked_get.call_args_list[2].args[0])
+        self.assertEqual(mocked_get.call_args_list[2].kwargs["headers"]["X-Access-Token"], new_token)
+
+    def test_billing_uses_cached_user_id_without_current_user_lookup(self):
+        token = make_jwt()
+        token_manager = FakeTokenManager()
+        token_manager._token = token
+        token_manager._billing_user_id = "42"
+        service = GenAIService(self.logger, token_manager, None)
+
+        with patch(
+            "genai_proxy.services.genai.requests.get",
+            return_value=FakeResponse(
+                {
+                    "success": True,
+                    "code": 200,
+                    "result": {"records": [{"id": "42", "monthSurplus": "0.5"}]},
+                }
+            ),
+        ) as mocked_get:
+            usage = service.fetch_openai_billing_usage()
+
+        self.assertEqual(usage["total_usage"], 50.0)
+        self.assertEqual(mocked_get.call_count, 1)
+        self.assertIn("/htk/ai-user-info/list", mocked_get.call_args.args[0])
 
     def test_model_list_result_null_raises_proxy_error_instead_of_attribute_error(self):
         token_manager = FakeTokenManager()
@@ -258,6 +378,28 @@ class AuthRefreshTests(unittest.TestCase):
             self.assertEqual(refresh.call_count, 1)
             self.assertGreater(manager._last_refresh_failure_at, 0)
 
+    def test_rejected_token_refresh_failure_keeps_existing_token(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            keystore_path = os.path.join(temp_dir, "docker-deploy.keystore")
+            current_token = make_jwt()
+            manager = TokenManager(
+                self.logger,
+                token=current_token,
+                keystore_path=keystore_path,
+                token_check_interval=0,
+            )
+
+            with patch.object(manager, "_refresh_token", side_effect=RuntimeError("ids failed")):
+                self.assertFalse(
+                    manager.refresh_after_auth_failure(
+                        "unit test",
+                        rejected_token=current_token,
+                    )
+                )
+
+            self.assertEqual(manager.token, current_token)
+            self.assertGreater(manager._last_refresh_failure_at, 0)
+
     def test_background_confirmation_refreshes_before_expiry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             keystore_path = os.path.join(temp_dir, "docker-deploy.keystore")
@@ -273,41 +415,56 @@ class AuthRefreshTests(unittest.TestCase):
                 manager._token = make_jwt()
                 manager._token_exp = int(time.time()) + 3600
 
-            with (
-                patch.object(manager, "_refresh_token", side_effect=fake_refresh) as refresh,
-                patch.object(manager, "_token_was_rejected_by_upstream", return_value=False) as confirm,
-            ):
+            with patch.object(manager, "_refresh_token", side_effect=fake_refresh) as refresh:
                 manager._confirm_token_for_background()
 
             self.assertEqual(refresh.call_count, 1)
-            self.assertEqual(confirm.call_count, 1)
 
-    def test_background_confirmation_refreshes_when_upstream_rejects_token(self):
+    def test_background_confirmation_loads_newer_cached_token(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             keystore_path = os.path.join(temp_dir, "docker-deploy.keystore")
+            cache_path = f"{keystore_path}.token.json"
+            old_token = make_jwt(exp=int(time.time()) + 3600)
+            cached_token = make_jwt(exp=int(time.time()) + 7200)
+            with open(cache_path, "w", encoding="utf-8") as cache_file:
+                json.dump({"token": cached_token, "exp": int(time.time()) + 7200}, cache_file)
+
             manager = TokenManager(
                 self.logger,
-                token=make_jwt(),
+                token=old_token,
                 keystore_path=keystore_path,
                 token_check_interval=0,
             )
 
-            old_token = manager._token
-
-            def fake_refresh(force=False, rejected_token=None):
-                self.assertTrue(force)
-                self.assertEqual(rejected_token, old_token)
-                manager._token = make_jwt()
-                manager._token_exp = int(time.time()) + 3600
-
-            with (
-                patch.object(manager, "_token_was_rejected_by_upstream", return_value=True) as confirm,
-                patch.object(manager, "_refresh_token", side_effect=fake_refresh) as refresh,
-            ):
+            with patch.object(manager, "_refresh_token") as refresh:
                 manager._confirm_token_for_background()
 
-            self.assertEqual(confirm.call_count, 1)
-            self.assertEqual(refresh.call_count, 1)
+            self.assertEqual(refresh.call_count, 0)
+            self.assertEqual(manager.token, cached_token)
+
+    def test_background_confirmation_loads_cached_billing_user_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            keystore_path = os.path.join(temp_dir, "docker-deploy.keystore")
+            cache_path = f"{keystore_path}.token.json"
+            cached_token = make_jwt(exp=int(time.time()) + 7200)
+            with open(cache_path, "w", encoding="utf-8") as cache_file:
+                json.dump(
+                    {
+                        "token": cached_token,
+                        "exp": int(time.time()) + 7200,
+                        "user_id": "42",
+                    },
+                    cache_file,
+                )
+
+            manager = TokenManager(
+                self.logger,
+                token=cached_token,
+                keystore_path=keystore_path,
+                token_check_interval=0,
+            )
+
+            self.assertEqual(manager.billing_user_id, "42")
 
     def test_background_confirmation_does_not_refresh_during_shutdown(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -318,18 +475,11 @@ class AuthRefreshTests(unittest.TestCase):
                 keystore_path=keystore_path,
                 token_check_interval=0,
             )
+            manager._shutdown_done = True
 
-            def reject_and_stop(token):
-                manager._stop_event.set()
-                return True
-
-            with (
-                patch.object(manager, "_token_was_rejected_by_upstream", side_effect=reject_and_stop) as confirm,
-                patch.object(manager, "_refresh_token") as refresh,
-            ):
+            with patch.object(manager, "_refresh_token") as refresh:
                 manager._confirm_token_for_background()
 
-            self.assertEqual(confirm.call_count, 1)
             self.assertEqual(refresh.call_count, 0)
 
     def test_background_confirmation_thread_starts_and_shutdown_stops_it(self):
@@ -351,45 +501,6 @@ class AuthRefreshTests(unittest.TestCase):
                 self.assertTrue(manager._token_check_thread.is_alive())
                 manager.shutdown()
                 self.assertFalse(manager._token_check_thread.is_alive())
-
-    def test_periodic_confirmation_classifies_auth_failures_only(self):
-        manager = TokenManager(self.logger, token=make_jwt(), token_check_interval=0)
-
-        with patch(
-            "genai_proxy.services.token_manager.requests.get",
-            return_value=FakeResponse(status_code=401),
-        ):
-            self.assertTrue(manager._token_was_rejected_by_upstream("token"))
-
-        with patch(
-            "genai_proxy.services.token_manager.requests.get",
-            return_value=FakeResponse({"success": False, "message": "Token失效，请重新登录", "code": 500}),
-        ):
-            self.assertTrue(manager._token_was_rejected_by_upstream("token"))
-
-        with patch(
-            "genai_proxy.services.token_manager.requests.get",
-            return_value=FakeResponse({"success": True, "code": 200}),
-        ):
-            self.assertFalse(manager._token_was_rejected_by_upstream("token"))
-
-        with patch(
-            "genai_proxy.services.token_manager.requests.get",
-            return_value=FakeResponse(status_code=500),
-        ):
-            self.assertFalse(manager._token_was_rejected_by_upstream("token"))
-
-        with patch(
-            "genai_proxy.services.token_manager.requests.get",
-            return_value=InvalidJsonResponse(status_code=200),
-        ):
-            self.assertFalse(manager._token_was_rejected_by_upstream("token"))
-
-        with patch(
-            "genai_proxy.services.token_manager.requests.get",
-            side_effect=requests.Timeout(),
-        ):
-            self.assertFalse(manager._token_was_rejected_by_upstream("token"))
 
     def test_genai_login_flow_prefers_current_oauth_entry_and_falls_back_to_legacy_cas(self):
         manager = TokenManager(

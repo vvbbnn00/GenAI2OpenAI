@@ -1,5 +1,6 @@
 import json
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -60,6 +61,8 @@ class GenAIService:
         self._logger = logger
         self._token_manager = token_manager
         self._model_manager = model_manager
+        self._billing_user_id = getattr(token_manager, "billing_user_id", None)
+        self._billing_user_id_lock = threading.Lock()
 
     def build_openai_completion(self, req_data):
         prepared = self._prepare_chat_request(req_data)
@@ -72,7 +75,10 @@ class GenAIService:
     def fetch_openai_billing_subscription(self):
         def fetch(token):
             access_until = self._extract_access_until(token)
-            user_id = self._fetch_current_user_id(token)
+            user_id = self._get_billing_user_id(token)
+            current_token = self._token_manager.token
+            if current_token:
+                access_until = self._extract_access_until(current_token)
             record = self._fetch_user_info_record(token, user_id)
             quota = self._coerce_amount(record.get("quota"))
 
@@ -90,7 +96,7 @@ class GenAIService:
     def fetch_openai_billing_usage(self):
         def fetch(token):
             self._extract_access_until(token)
-            user_id = self._fetch_current_user_id(token)
+            user_id = self._get_billing_user_id(token)
             record = self._fetch_user_info_record(token, user_id)
             month_usage_usd = self._coerce_amount(record.get("monthSurplus"))
             total_usage = max(month_usage_usd, 0.0) * 100
@@ -253,6 +259,21 @@ class GenAIService:
             "X-Access-Token": user_token,
         }
 
+    def _get_billing_user_id(self, token: str) -> str:
+        if self._billing_user_id:
+            return self._billing_user_id
+
+        cached_user_id = getattr(self._token_manager, "billing_user_id", None)
+        if cached_user_id:
+            self._billing_user_id = cached_user_id
+            return cached_user_id
+
+        with self._billing_user_id_lock:
+            if not self._billing_user_id:
+                cached_user_id = getattr(self._token_manager, "billing_user_id", None)
+                self._billing_user_id = cached_user_id or self._fetch_current_user_id(token)
+            return self._billing_user_id
+
     def _with_token_auth_retry(self, reason: str, fetch):
         token = self._token_manager.token
         try:
@@ -410,6 +431,14 @@ class GenAIService:
         if not user_id:
             self._logger.warning("Current user response missing id: %s", payload)
             raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
+
+        self._token_manager.update_billing_user_id(user_id)
+        refreshed_token = result.get("token") if isinstance(result, dict) else None
+        if refreshed_token:
+            self._token_manager.update_token_from_upstream(
+                refreshed_token,
+                "current user response",
+            )
         return str(user_id)
 
     def _extract_access_until(self, user_token: str) -> int:

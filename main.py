@@ -41,9 +41,9 @@ def _log_startup(config: AppConfig, logger) -> None:
     if config.keystore:
         logger.info("Keystore: %s", config.keystore)
         if config.token_check_interval:
-            logger.info("Token confirmation interval: %d seconds", config.token_check_interval)
+            logger.info("Token maintenance interval: %d seconds", config.token_check_interval)
         else:
-            logger.info("Token confirmation interval: disabled")
+            logger.info("Token maintenance interval: disabled")
     logger.info(
         "Claude alias mapping: haiku=%s sonnet=%s opus=%s",
         config.claude_haiku_model,
