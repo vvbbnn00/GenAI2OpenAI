@@ -240,6 +240,24 @@ class AuthRefreshTests(unittest.TestCase):
             self.assertEqual(manager.token, cached_token)
             self.assertTrue(os.path.exists(cache_path))
 
+    def test_token_access_keeps_existing_token_when_proactive_refresh_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            keystore_path = os.path.join(temp_dir, "docker-deploy.keystore")
+            current_token = make_jwt(exp=int(time.time()) + 60)
+            manager = TokenManager(
+                self.logger,
+                token=current_token,
+                keystore_path=keystore_path,
+                token_check_interval=0,
+            )
+
+            with patch.object(manager, "_refresh_token", side_effect=RuntimeError("ids failed")) as refresh:
+                self.assertEqual(manager.token, current_token)
+                self.assertEqual(manager.token, current_token)
+
+            self.assertEqual(refresh.call_count, 1)
+            self.assertGreater(manager._last_refresh_failure_at, 0)
+
     def test_background_confirmation_refreshes_before_expiry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             keystore_path = os.path.join(temp_dir, "docker-deploy.keystore")

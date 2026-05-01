@@ -62,6 +62,7 @@ def is_genai_auth_failure(payload: dict | None) -> bool:
 class TokenManager:
     REFRESH_MARGIN = 300
     DEFAULT_TOKEN_CHECK_INTERVAL = 60
+    REFRESH_FAILURE_RETRY_INTERVAL = 60
     TOKEN_CONFIRM_TIMEOUT = 10
 
     def __init__(
@@ -84,6 +85,7 @@ class TokenManager:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._token_check_thread = None
+        self._last_refresh_failure_at = 0.0
         self._ids_client = None
         self._keystore = None
         self._used_ids = False
@@ -216,9 +218,11 @@ class TokenManager:
         try:
             if force:
                 if rejected_token is not None and self._load_cached_token(rejected_token=rejected_token):
+                    self._last_refresh_failure_at = 0.0
                     return
                 self._delete_cached_token()
             elif self._load_cached_token():
+                self._last_refresh_failure_at = 0.0
                 return
 
             from shanghaitech_ids_passkey import IDSClient, PasskeyKeystore
@@ -259,6 +263,7 @@ class TokenManager:
             self._update_expiry()
             keystore.dump(self._keystore_path)
             self._write_cached_token()
+            self._last_refresh_failure_at = 0.0
             self._logger.info("GenAI token refreshed successfully")
         except ImportError:
             self._logger.error(
@@ -325,7 +330,7 @@ class TokenManager:
             if self._shutdown_done:
                 return
             if self._needs_refresh():
-                self._refresh_token()
+                self._refresh_token_for_access("periodic token confirmation")
             token = self._token
 
         if not token:
@@ -419,15 +424,38 @@ class TokenManager:
             try:
                 self._refresh_token(force=True, rejected_token=rejected_token)
             except Exception:
+                self._last_refresh_failure_at = time.time()
                 self._logger.exception("Failed to refresh GenAI token after upstream rejection")
                 return False
             return bool(self._token)
+
+    def _refresh_token_for_access(self, reason: str) -> None:
+        if self._token and self._recent_refresh_failure():
+            return
+
+        try:
+            self._refresh_token()
+        except Exception:
+            self._last_refresh_failure_at = time.time()
+            if self._token:
+                self._logger.warning(
+                    "Continuing with existing GenAI token after refresh failure during %s",
+                    reason,
+                )
+                return
+            raise
+
+    def _recent_refresh_failure(self) -> bool:
+        return (
+            self._last_refresh_failure_at > 0
+            and time.time() - self._last_refresh_failure_at < self.REFRESH_FAILURE_RETRY_INTERVAL
+        )
 
     @property
     def token(self) -> str | None:
         with self._lock:
             if self._needs_refresh():
-                self._refresh_token()
+                self._refresh_token_for_access("token access")
             elif self._token and self._token_exp and not self._keystore_path:
                 remaining = self._token_exp - time.time()
                 if remaining < self.REFRESH_MARGIN:
