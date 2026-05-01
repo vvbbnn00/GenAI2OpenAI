@@ -68,6 +68,7 @@ docker compose down
 | `GENAI_TOKEN` | GenAI 平台 JWT；和 `KEYSTORE_PATH` 二选一或同时提供 | 空 |
 | `KEYSTORE_PATH` | 容器内的 keystore 路径，用于 passkey 自动登录/刷新 | 空 |
 | `KEYSTORE_HOST_PATH` | 宿主机上的 keystore 文件路径，会挂载到容器内 | `./docker-deploy.keystore` |
+| `TOKEN_CHECK_INTERVAL` | 后台确认 GenAI token 是否仍有效的间隔秒数；`0` 表示关闭 | `60` |
 | `APP_PORT` | 容器内和映射到宿主机的监听端口 | `5000` |
 | `HOST_PORT` | 宿主机暴露端口 | `5000` |
 | `PROXY_API_KEY` | 代理自身的客户端认证密钥，会传给应用的 `API_KEY` 环境变量 | 空 |
@@ -91,6 +92,7 @@ docker compose down
 uv run main.py --token <token> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --keystore <path/to/ids-passkey.keystore> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --token <token> --keystore <path/to/ids-passkey.keystore> [--port 5000] [--api-key <key>] [--debug]
+uv run main.py --keystore <path/to/ids-passkey.keystore> --token-check-interval 60
 uv run main.py --token <token> --claude-opus-model deepseek-chat --claude-sonnet-model MiniMax-M1 --claude-haiku-model chatglm
 ```
 
@@ -105,6 +107,7 @@ uv run main.py --token <token> --claude-opus-model deepseek-chat --claude-sonnet
 |------|------|--------|
 | `--token` | GenAI 平台的访问令牌（JWT）；和 `--keystore` 二选一或同时提供 | — |
 | `--keystore` | `shanghaitech-ids-passkey` 生成的 keystore 文件路径，用于自动登录/刷新 token | — |
+| `--token-check-interval` | 后台确认 GenAI token 是否仍有效的间隔秒数；`0` 表示关闭 | `60` |
 | `--port` | 服务监听端口 | `5000` |
 | `--api-key` | 客户端认证密钥（也可通过 `API_KEY` 环境变量设置） | 无（不校验） |
 | `--debug` | 启用详细日志输出 | 关闭 |
@@ -338,12 +341,14 @@ uv run main.py --keystore /path/to/ids-passkey.keystore
 1. 启动时通过 passkey 登录 IDS
 2. 自动访问 GenAI 登录入口 `https://genai.shanghaitech.edu.cn/htk/user/login`
 3. 从最终跳转 URL 中提取 `?token=...`
-4. 在 token 即将过期前自动刷新
+4. 每隔 `TOKEN_CHECK_INTERVAL` 秒后台确认 token 是否仍有效
+5. 在 token 即将过期前自动刷新，或在后台确认发现 token 被上游拒绝时立即重取
 
 ### 关于自动刷新
 
 - 自动刷新基于 JWT 的 `exp` 字段判断过期时间
 - 当前实现会在 **距离过期约 5 分钟** 时提前刷新
+- 提供 `--keystore` 时默认每 60 秒后台确认一次 token 是否仍被 GenAI 接受；可用 `--token-check-interval` 或 `TOKEN_CHECK_INTERVAL` 调整，设置为 `0` 可关闭
 - 仅提供 `--token` 时，服务不会自动刷新，只会在日志中提示 token 即将过期
 - 提供 `--keystore` 时，会保存更新后的 keystore（例如递增的 `sign_count`）
 

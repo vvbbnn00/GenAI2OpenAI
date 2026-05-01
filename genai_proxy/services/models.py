@@ -71,23 +71,27 @@ class ModelManager:
     def _fetch_models_with_retry(self) -> list[dict]:
         refreshed = False
         while True:
+            token = self._token_manager.token
             try:
-                return self._fetch_models_once()
+                return self._fetch_models_once(token)
             except ProxyError as exc:
                 if exc.code != "upstream_auth_failed" or refreshed:
                     raise
                 refreshed = True
-                if not self._token_manager.refresh_after_auth_failure("model list rejected token"):
+                if not self._token_manager.refresh_after_auth_failure(
+                    "model list rejected token",
+                    rejected_token=token,
+                ):
                     raise
 
-    def _fetch_models_once(self) -> list[dict]:
+    def _fetch_models_once(self, token: str | None) -> list[dict]:
         url = GENAI_MODEL_LIST_URL.format(timestamp=int(time.time()))
         try:
             response = requests.get(
                 url,
                 headers={
                     "Accept": "application/json",
-                    "X-Access-Token": self._token_manager.token,
+                    "X-Access-Token": token,
                 },
                 timeout=30,
             )

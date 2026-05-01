@@ -5,6 +5,13 @@ from genai_proxy.config import AppConfig, parse_args
 from genai_proxy.logging_utils import setup_logging
 
 
+def _int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return default
+    return int(value)
+
+
 def _config_from_env() -> AppConfig:
     return AppConfig(
         token=os.environ.get("GENAI_TOKEN") or None,
@@ -12,6 +19,7 @@ def _config_from_env() -> AppConfig:
         port=int(os.environ.get("APP_PORT", 5000)),
         debug=os.environ.get("APP_DEBUG", "0") == "1",
         api_key=os.environ.get("API_KEY") or None,
+        token_check_interval=max(0, _int_env("TOKEN_CHECK_INTERVAL", 60)),
         claude_haiku_model=os.environ.get("CLAUDE_HAIKU_MODEL", "qwen-instruct"),
         claude_sonnet_model=os.environ.get("CLAUDE_SONNET_MODEL", "qwen-instruct"),
         claude_opus_model=os.environ.get("CLAUDE_OPUS_MODEL", "deepseek-v3:671b"),
@@ -32,6 +40,10 @@ def _log_startup(config: AppConfig, logger) -> None:
     )
     if config.keystore:
         logger.info("Keystore: %s", config.keystore)
+        if config.token_check_interval:
+            logger.info("Token confirmation interval: %d seconds", config.token_check_interval)
+        else:
+            logger.info("Token confirmation interval: disabled")
     logger.info(
         "Claude alias mapping: haiku=%s sonnet=%s opus=%s",
         config.claude_haiku_model,

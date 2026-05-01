@@ -114,6 +114,7 @@ def main():
             port=0,
             debug=False,
             api_key=None,
+            token_check_interval=60,
             claude_haiku_model="chatglm",
             claude_sonnet_model="MiniMax-M1",
             claude_opus_model="deepseek-chat",

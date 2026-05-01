@@ -10,6 +10,7 @@ class AppConfig:
     port: int
     debug: bool
     api_key: str | None
+    token_check_interval: int
     claude_haiku_model: str
     claude_sonnet_model: str
     claude_opus_model: str
@@ -47,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="API key for client authentication (or set API_KEY env var)",
     )
     parser.add_argument(
+        "--token-check-interval",
+        type=int,
+        default=os.environ.get("TOKEN_CHECK_INTERVAL") or "60",
+        help="Seconds between background GenAI token confirmation checks; set 0 to disable",
+    )
+    parser.add_argument(
         "--claude-haiku-model",
         type=str,
         default=os.environ.get("CLAUDE_HAIKU_MODEL", "qwen-instruct"),
@@ -73,6 +80,8 @@ def parse_args(argv: list[str] | None = None) -> AppConfig:
 
     if not args.token and not args.keystore:
         parser.error("At least one of --token or --keystore must be provided")
+    if args.token_check_interval < 0:
+        parser.error("--token-check-interval must be 0 or greater")
 
     return AppConfig(
         token=args.token,
@@ -80,6 +89,7 @@ def parse_args(argv: list[str] | None = None) -> AppConfig:
         port=args.port,
         debug=args.debug,
         api_key=args.api_key or os.environ.get("API_KEY"),
+        token_check_interval=args.token_check_interval,
         claude_haiku_model=args.claude_haiku_model,
         claude_sonnet_model=args.claude_sonnet_model,
         claude_opus_model=args.claude_opus_model,

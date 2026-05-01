@@ -242,9 +242,9 @@ class GenAIService:
             prompt_tokens=estimate_openai_request_tokens(messages, model, tools if has_tools else None),
         )
 
-    def _get_genai_headers(self):
+    def _get_genai_headers(self, token: str | None = None):
         headers = dict(GENAI_BASE_HEADERS)
-        headers["X-Access-Token"] = self._token_manager.token
+        headers["X-Access-Token"] = token if token is not None else self._token_manager.token
         return headers
 
     def _get_user_genai_headers(self, user_token: str):
@@ -254,12 +254,13 @@ class GenAIService:
         }
 
     def _with_token_auth_retry(self, reason: str, fetch):
+        token = self._token_manager.token
         try:
-            return fetch(self._token_manager.token)
+            return fetch(token)
         except ProxyError as exc:
             if exc.code != "upstream_auth_failed":
                 raise
-            if not self._token_manager.refresh_after_auth_failure(reason):
+            if not self._token_manager.refresh_after_auth_failure(reason, rejected_token=token):
                 raise
             return fetch(self._token_manager.token)
 
@@ -485,10 +486,11 @@ class GenAIService:
         while True:
             response = None
             retry_after_refresh = False
+            request_token = self._token_manager.token
             try:
                 response = requests.post(
                     GENAI_URL,
-                    headers=self._get_genai_headers(),
+                    headers=self._get_genai_headers(request_token),
                     json=genai_data,
                     stream=True,
                     timeout=(10, 75),
@@ -502,7 +504,13 @@ class GenAIService:
                         response.text[:500],
                     )
                     if response.status_code in (401, 403):
-                        if not auth_retry_used and self._token_manager.refresh_after_auth_failure("chat request"):
+                        if (
+                            not auth_retry_used
+                            and self._token_manager.refresh_after_auth_failure(
+                                "chat request",
+                                rejected_token=request_token,
+                            )
+                        ):
                             auth_retry_used = True
                             retry_after_refresh = True
                             continue
@@ -545,7 +553,13 @@ class GenAIService:
                     if is_genai_auth_failure(genai_json):
                         err_msg = genai_json.get("message", "Unknown upstream error")
                         self._logger.warning("GenAI authentication business error: %s", err_msg)
-                        if not auth_retry_used and self._token_manager.refresh_after_auth_failure("chat stream"):
+                        if (
+                            not auth_retry_used
+                            and self._token_manager.refresh_after_auth_failure(
+                                "chat stream",
+                                rejected_token=request_token,
+                            )
+                        ):
                             auth_retry_used = True
                             retry_after_refresh = True
                             break

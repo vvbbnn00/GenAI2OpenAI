@@ -7,6 +7,8 @@ import time
 from datetime import datetime
 from urllib.parse import parse_qs, quote, urlparse
 
+import requests
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover
@@ -21,6 +23,7 @@ GENAI_LEGACY_CAS_SERVICE_URL = (
 GENAI_GET_TOKEN_URL = (
     "https://genai.shanghaitech.edu.cn/htk/user/info/{token}?_t={timestamp}"
 )
+GENAI_CONFIRM_TOKEN_URL = "https://genai.shanghaitech.edu.cn/htk/user/info/{token}"
 
 GENAI_AUTH_FAILURE_MESSAGES = (
     "token失效",
@@ -58,14 +61,29 @@ def is_genai_auth_failure(payload: dict | None) -> bool:
 
 class TokenManager:
     REFRESH_MARGIN = 300
+    DEFAULT_TOKEN_CHECK_INTERVAL = 60
+    TOKEN_CONFIRM_TIMEOUT = 10
 
-    def __init__(self, logger, token: str | None = None, keystore_path: str | None = None):
+    def __init__(
+        self,
+        logger,
+        token: str | None = None,
+        keystore_path: str | None = None,
+        token_check_interval: int | None = None,
+    ):
         self._logger = logger
         self._token = token
         self._keystore_path = keystore_path
+        self._token_check_interval = (
+            self.DEFAULT_TOKEN_CHECK_INTERVAL
+            if token_check_interval is None
+            else max(0, token_check_interval)
+        )
         self._token_cache_path = f"{keystore_path}.token.json" if keystore_path else None
         self._token_exp = None
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._token_check_thread = None
         self._ids_client = None
         self._keystore = None
         self._used_ids = False
@@ -76,6 +94,9 @@ class TokenManager:
 
         if not token and keystore_path:
             self._refresh_token()
+
+        if keystore_path and self._token_check_interval:
+            self._start_token_check_thread()
 
         atexit.register(self.shutdown)
 
@@ -128,7 +149,7 @@ class TokenManager:
         finally:
             os.close(lock_fd)
 
-    def _load_cached_token(self) -> bool:
+    def _load_cached_token(self, rejected_token: str | None = None) -> bool:
         if not self._token_cache_path:
             return False
 
@@ -144,6 +165,8 @@ class TokenManager:
         cached_token = payload.get("token")
         cached_exp = payload.get("exp")
         if not cached_token or not cached_exp:
+            return False
+        if rejected_token is not None and cached_token == rejected_token:
             return False
 
         if time.time() >= (float(cached_exp) - self.REFRESH_MARGIN):
@@ -182,7 +205,7 @@ class TokenManager:
         except Exception as exc:
             self._logger.warning("Failed to delete token cache %s: %s", self._token_cache_path, exc)
 
-    def _refresh_token(self, force: bool = False) -> None:
+    def _refresh_token(self, force: bool = False, rejected_token: str | None = None) -> None:
         if not self._keystore_path:
             self._logger.warning(
                 "Token expired or missing, but no keystore configured for refresh"
@@ -191,7 +214,11 @@ class TokenManager:
 
         lock_fd = self._with_process_refresh_lock()
         try:
-            if not force and self._load_cached_token():
+            if force:
+                if rejected_token is not None and self._load_cached_token(rejected_token=rejected_token):
+                    return
+                self._delete_cached_token()
+            elif self._load_cached_token():
                 return
 
             from shanghaitech_ids_passkey import IDSClient, PasskeyKeystore
@@ -271,7 +298,103 @@ class TokenManager:
             f"query keys: {sorted(parse_qs(parsed.query))}"
         )
 
-    def refresh_after_auth_failure(self, reason: str = "upstream authentication failure") -> bool:
+    def _start_token_check_thread(self) -> None:
+        self._token_check_thread = threading.Thread(
+            target=self._run_token_check_loop,
+            name="genai-token-check",
+            daemon=True,
+        )
+        self._token_check_thread.start()
+
+    def _run_token_check_loop(self) -> None:
+        self._logger.info(
+            "Periodic GenAI token confirmation enabled: every %d seconds",
+            self._token_check_interval,
+        )
+        while not self._stop_event.is_set():
+            try:
+                self._confirm_token_for_background()
+            except Exception:
+                self._logger.exception("Periodic GenAI token confirmation failed")
+
+            if self._stop_event.wait(self._token_check_interval):
+                break
+
+    def _confirm_token_for_background(self) -> None:
+        with self._lock:
+            if self._shutdown_done:
+                return
+            if self._needs_refresh():
+                self._refresh_token()
+            token = self._token
+
+        if not token:
+            return
+
+        if self._stop_event.is_set():
+            return
+
+        if self._token_was_rejected_by_upstream(token):
+            if self._stop_event.is_set():
+                return
+            self.refresh_after_auth_failure(
+                "periodic token confirmation",
+                rejected_token=token,
+            )
+
+    def _token_was_rejected_by_upstream(self, token: str) -> bool:
+        try:
+            response = requests.get(
+                GENAI_CONFIRM_TOKEN_URL.format(token=token),
+                params={"_t": int(time.time() * 1000)},
+                headers={
+                    "Accept": "application/json",
+                    "X-Access-Token": token,
+                },
+                timeout=self.TOKEN_CONFIRM_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            self._logger.warning(
+                "Periodic token confirmation request failed: %s",
+                exc.__class__.__name__,
+            )
+            return False
+
+        if response.status_code in (401, 403):
+            return True
+        if response.status_code != 200:
+            self._logger.warning(
+                "Periodic token confirmation HTTP error %d",
+                response.status_code,
+            )
+            return False
+
+        try:
+            payload = response.json()
+        except ValueError:
+            self._logger.warning("Periodic token confirmation returned invalid JSON")
+            return False
+
+        if is_genai_auth_failure(payload):
+            return True
+        code = payload.get("code", 200)
+        try:
+            failed_code = int(code) >= 400
+        except (TypeError, ValueError):
+            failed_code = False
+        if payload.get("success") is False or failed_code:
+            self._logger.warning(
+                "Periodic token confirmation business error: code=%s message=%s",
+                code,
+                payload.get("message"),
+            )
+        return False
+
+    def refresh_after_auth_failure(
+        self,
+        reason: str = "upstream authentication failure",
+        rejected_token: str | None = None,
+    ) -> bool:
         if not self._keystore_path:
             self._logger.warning(
                 "GenAI token was rejected by upstream (%s), but no keystore is configured",
@@ -280,12 +403,21 @@ class TokenManager:
             return False
 
         with self._lock:
+            if self._shutdown_done or self._stop_event.is_set():
+                return False
+
+            if rejected_token is not None and self._token and self._token != rejected_token:
+                self._logger.info(
+                    "Skipping token refresh for %s because another refresh already replaced it",
+                    reason,
+                )
+                return True
+
             self._logger.warning("GenAI token was rejected by upstream (%s); refreshing", reason)
             self._token = None
             self._token_exp = None
-            self._delete_cached_token()
             try:
-                self._refresh_token(force=True)
+                self._refresh_token(force=True, rejected_token=rejected_token)
             except Exception:
                 self._logger.exception("Failed to refresh GenAI token after upstream rejection")
                 return False
@@ -306,6 +438,15 @@ class TokenManager:
             return self._token
 
     def shutdown(self) -> None:
+        self._stop_event.set()
+        token_check_thread = self._token_check_thread
+        if (
+            token_check_thread
+            and token_check_thread.is_alive()
+            and token_check_thread is not threading.current_thread()
+        ):
+            token_check_thread.join(timeout=5)
+
         with self._lock:
             if self._shutdown_done:
                 return

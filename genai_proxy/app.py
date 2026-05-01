@@ -13,7 +13,12 @@ def create_app(config, logger):
     app = Flask(__name__)
     CORS(app)
 
-    token_manager = TokenManager(logger, token=config.token, keystore_path=config.keystore)
+    token_manager = TokenManager(
+        logger,
+        token=config.token,
+        keystore_path=config.keystore,
+        token_check_interval=config.token_check_interval,
+    )
     model_manager = ModelManager(logger, token_manager)
     genai_service = GenAIService(logger, token_manager, model_manager)
 
