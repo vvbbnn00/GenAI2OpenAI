@@ -5,6 +5,7 @@ from flask import Blueprint, Response, current_app, jsonify, request, stream_wit
 
 from genai_proxy.compat.openai import openai_error
 from genai_proxy.errors import ProxyError
+from genai_proxy.routes import prime_stream
 
 
 bp = Blueprint("openai", __name__)
@@ -41,6 +42,7 @@ def chat_completions():
     service = current_app.extensions["genai_service"]
     logger = current_app.extensions["logger"]
     stream = False
+    streaming_response_started = False
 
     try:
         req_data = request.get_json()
@@ -55,7 +57,8 @@ def chat_completions():
         )
 
         if stream:
-            gen = service.stream_openai_completion(req_data)
+            gen = prime_stream(service.stream_openai_completion(req_data))
+            streaming_response_started = True
             return Response(
                 stream_with_context(_stream_with_completion_log(gen, logger, request_id, start_time)),
                 mimetype="text/event-stream",
@@ -83,7 +86,7 @@ def chat_completions():
             status=500,
         )
     finally:
-        if not stream:
+        if not streaming_response_started:
             elapsed = time.monotonic() - start_time
             logger.info("[%s] completed in %.2fs", request_id, elapsed)
 

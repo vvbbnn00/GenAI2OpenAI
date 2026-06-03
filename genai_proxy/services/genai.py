@@ -112,6 +112,7 @@ class GenAIService:
         complete_content = ""
         collected_tool_calls = []
         finish_reason = "stop"
+        stream_error_message = None
 
         for payload in self._stream_prepared_openai_completion(prepared):
             for line in _iter_sse_lines(payload):
@@ -141,6 +142,15 @@ class GenAIService:
 
                 if choice.get("finish_reason") is not None:
                     finish_reason = choice["finish_reason"]
+                    if finish_reason == "error":
+                        stream_error_message = content or "Upstream error"
+
+        if stream_error_message:
+            raise ProxyError(
+                _strip_error_prefix(stream_error_message),
+                error_type="upstream_error",
+                status=502,
+            )
 
         if collected_tool_calls:
             message_obj = {
@@ -170,10 +180,8 @@ class GenAIService:
                 finish_reason = "tool_calls"
             else:
                 message_obj = {"role": "assistant", "content": complete_content}
-                finish_reason = "stop"
         else:
             message_obj = {"role": "assistant", "content": complete_content}
-            finish_reason = "stop"
 
         completion_estimate_text = complete_content or ""
         if message_obj.get("tool_calls"):
@@ -512,6 +520,7 @@ class GenAIService:
             self._logger.debug("  [%d] role=%s, content=%s", index, role, preview)
 
         auth_retry_used = False
+        sent_any_chunk = False
         while True:
             response = None
             retry_after_refresh = False
@@ -543,11 +552,20 @@ class GenAIService:
                             auth_retry_used = True
                             retry_after_refresh = True
                             continue
+                        if not sent_any_chunk:
+                            raise _upstream_auth_error()
                         yield make_error_chunk("Upstream authentication failed", prepared.model)
                     elif response.status_code == 429:
-                        yield make_error_chunk("Upstream rate limit exceeded", prepared.model)
+                        yield _error_chunk_or_raise(
+                            sent_any_chunk,
+                            "Upstream rate limit exceeded",
+                            prepared.model,
+                            error_type="rate_limit_error",
+                            status=429,
+                        )
                     else:
-                        yield make_error_chunk(
+                        yield _error_chunk_or_raise(
+                            sent_any_chunk,
                             f"Upstream API error: {response.status_code}",
                             prepared.model,
                         )
@@ -592,6 +610,8 @@ class GenAIService:
                             auth_retry_used = True
                             retry_after_refresh = True
                             break
+                        if not sent_any_chunk:
+                            raise _upstream_auth_error()
                         yield make_error_chunk("Upstream authentication failed", prepared.model)
                         return
 
@@ -603,7 +623,11 @@ class GenAIService:
                             err_code,
                             err_msg,
                         )
-                        yield make_error_chunk(f"Upstream error: {err_msg}", prepared.model)
+                        yield _error_chunk_or_raise(
+                            sent_any_chunk,
+                            f"Upstream error: {err_msg}",
+                            prepared.model,
+                        )
                         return
 
                     choice = None
@@ -622,10 +646,12 @@ class GenAIService:
                         delta["tool_calls"] = tool_calls
 
                     if delta:
+                        sent_any_chunk = True
                         yield self._make_chunk(prepared.model, delta)
 
                     if finish_reason is not None:
                         finished = True
+                        sent_any_chunk = True
                         yield self._make_chunk(prepared.model, {}, finish_reason=finish_reason)
                         yield "data: [DONE]\n\n"
                         break
@@ -637,17 +663,26 @@ class GenAIService:
 
                 if not finished:
                     self._logger.warning("Stream ended without finish_reason from GenAI")
-                    yield make_error_chunk(
+                    yield _error_chunk_or_raise(
+                        sent_any_chunk,
                         "Stream ended unexpectedly without completion",
                         prepared.model,
                     )
                 return
             except requests.Timeout as exc:
                 self._logger.warning("GenAI stream timed out or stalled: %s", exc)
-                yield make_error_chunk("Upstream stream timed out or stalled", prepared.model)
+                yield _error_chunk_or_raise(
+                    sent_any_chunk,
+                    "Upstream stream timed out or stalled",
+                    prepared.model,
+                )
                 return
+            except ProxyError:
+                raise
             except Exception as exc:
                 self._logger.exception("Error in _stream_genai_response")
+                if not sent_any_chunk:
+                    raise
                 yield make_error_chunk(str(exc), prepared.model)
                 return
             finally:
@@ -710,9 +745,6 @@ class GenAIService:
             prepared,
             prepared.messages,
         )
-        if attempt.get("error"):
-            yield attempt["error"]
-            return
 
         tool_calls = attempt.get("tool_calls") or []
         content = attempt.get("content") or ""
@@ -783,10 +815,14 @@ class GenAIService:
                         continue
 
                     choice = data["choices"][0]
-                    if choice.get("finish_reason") == "error":
-                        return {"error": f"{line}\n\ndata: [DONE]\n\n"}
-
                     delta = choice.get("delta", {})
+                    if choice.get("finish_reason") == "error":
+                        raise ProxyError(
+                            _strip_error_prefix(delta.get("content") or "Upstream error"),
+                            error_type="upstream_error",
+                            status=502,
+                        )
+
                     content = delta.get("content") or ""
                     if content:
                         complete_content += content
@@ -819,6 +855,34 @@ class GenAIService:
             ],
         }
         return f"data: {json.dumps(response)}\n\n"
+
+
+def _upstream_auth_error() -> ProxyError:
+    return ProxyError(
+        "Upstream GenAI token is invalid or expired",
+        error_type="authentication_error",
+        code="upstream_auth_failed",
+        status=502,
+    )
+
+
+def _error_chunk_or_raise(
+    sent_any_chunk: bool,
+    message: str,
+    model: str,
+    *,
+    error_type: str = "upstream_error",
+    code: str | None = None,
+    status: int = 502,
+) -> str:
+    if not sent_any_chunk:
+        raise ProxyError(message, error_type=error_type, code=code, status=status)
+    return make_error_chunk(message, model)
+
+
+def _strip_error_prefix(message: str) -> str:
+    return message.removeprefix("[Error] ").strip() or "Upstream error"
+
 
 def _iter_sse_lines(payload: str):
     for line in str(payload).splitlines():

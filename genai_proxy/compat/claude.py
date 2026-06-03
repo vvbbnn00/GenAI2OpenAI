@@ -1,5 +1,6 @@
 import json
 import uuid
+from itertools import chain
 
 from flask import jsonify
 
@@ -210,6 +211,16 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
         original_request.get("tools"),
     )
     output_text_parts = []
+    openai_iterator = iter(openai_stream)
+    try:
+        first_openai_payload = next(openai_iterator)
+    except StopIteration:
+        openai_payloads = iter(())
+    else:
+        first_error = _openai_error_chunk_message(first_openai_payload)
+        if first_error:
+            raise ProxyError(first_error, error_type="upstream_error", status=502)
+        openai_payloads = chain([first_openai_payload], openai_iterator)
 
     yield _claude_event(
         EVENT_MESSAGE_START,
@@ -243,7 +254,7 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
     final_stop_reason = STOP_END_TURN
 
     try:
-        for payload in openai_stream:
+        for payload in openai_payloads:
             for line in _iter_openai_sse_lines(payload):
                 if not line.strip() or not line.startswith("data: "):
                     continue
@@ -265,6 +276,17 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
                 choice = choices[0]
                 delta = choice.get("delta", {})
                 finish_reason = choice.get("finish_reason")
+
+                if finish_reason == "error":
+                    message = _strip_error_prefix(delta.get("content") or "Streaming error")
+                    yield _claude_event(
+                        "error",
+                        {
+                            "type": "error",
+                            "error": {"type": "api_error", "message": message},
+                        },
+                    )
+                    return
 
                 if delta.get("content") is not None:
                     output_text_parts.append(delta["content"])
@@ -516,6 +538,31 @@ def _normalize_tool_result(content):
 
 def _claude_event(event, payload):
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _openai_error_chunk_message(payload):
+    for line in _iter_openai_sse_lines(payload):
+        chunk_data = line[6:].strip()
+        if chunk_data == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(chunk_data)
+        except json.JSONDecodeError:
+            continue
+
+        choices = chunk.get("choices", [])
+        if not choices:
+            continue
+
+        choice = choices[0]
+        if choice.get("finish_reason") == "error":
+            delta = choice.get("delta", {})
+            return _strip_error_prefix(delta.get("content") or "Streaming error")
+    return None
+
+
+def _strip_error_prefix(message: str) -> str:
+    return message.removeprefix("[Error] ").strip() or "Streaming error"
 
 
 def _iter_openai_sse_lines(payload):

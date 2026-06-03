@@ -11,6 +11,7 @@ from genai_proxy.compat.claude import (
     stream_openai_to_claude,
 )
 from genai_proxy.errors import ProxyError
+from genai_proxy.routes import prime_stream
 
 
 bp = Blueprint("claude", __name__)
@@ -47,6 +48,7 @@ def create_message():
     logger = current_app.extensions["logger"]
     config = current_app.extensions["config"]
     stream = False
+    streaming_response_started = False
 
     try:
         original_req_data = request.get_json() or {}
@@ -73,11 +75,14 @@ def create_message():
 
         stream = bool(openai_request.get("stream"))
         if stream:
-            gen = stream_openai_to_claude(
-                service.stream_openai_completion(openai_request),
-                original_req_with_estimator,
-                logger,
+            gen = prime_stream(
+                stream_openai_to_claude(
+                    service.stream_openai_completion(openai_request),
+                    original_req_with_estimator,
+                    logger,
+                )
             )
+            streaming_response_started = True
             return Response(
                 stream_with_context(_stream_with_completion_log(gen, logger, request_id, start_time)),
                 mimetype="text/event-stream",
@@ -96,7 +101,7 @@ def create_message():
         logger.exception("[%s] Unhandled Claude error", request_id)
         return claude_error(str(exc), "api_error", 500)
     finally:
-        if not stream:
+        if not streaming_response_started:
             elapsed = time.monotonic() - start_time
             logger.info("[%s] completed in %.2fs", request_id, elapsed)
 

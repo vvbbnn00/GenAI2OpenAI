@@ -8,7 +8,12 @@ import time
 import unittest
 from unittest.mock import patch
 
+from flask import Flask
+
+from genai_proxy.compat.claude import stream_openai_to_claude
+from genai_proxy.compat.openai import make_error_chunk
 from genai_proxy.errors import ProxyError
+from genai_proxy.routes.openai import bp as openai_bp
 from genai_proxy.services.genai import GenAIService
 from genai_proxy.services.models import ModelManager
 from genai_proxy.services.token_manager import (
@@ -46,6 +51,19 @@ class FakeResponse:
         return self._payload
 
 
+class FakeStreamingResponse(FakeResponse):
+    def __init__(self, lines, status_code=200, payload=None):
+        super().__init__(payload=payload, status_code=status_code)
+        self._lines = lines
+        self.closed = False
+
+    def iter_lines(self):
+        return iter(self._lines)
+
+    def close(self):
+        self.closed = True
+
+
 class FakeTokenManager:
     def __init__(self):
         self._token = "stale-token"
@@ -76,6 +94,24 @@ class FakeTokenManager:
     @property
     def billing_user_id(self):
         return self._billing_user_id
+
+
+class FailedRefreshTokenManager(FakeTokenManager):
+    def refresh_after_auth_failure(self, reason, rejected_token=None):
+        self.refresh_count += 1
+        self.rejected_token = rejected_token
+        return False
+
+
+class FakeModelManager:
+    def resolve_model(self, model):
+        return model or "chatglm"
+
+    def get_model_record(self, model):
+        return {"aiType": model, "rootAiType": "xinference"}
+
+    def root_ai_type_for(self, model):
+        return "xinference"
 
 
 class FakeSession:
@@ -159,6 +195,330 @@ class AuthRefreshTests(unittest.TestCase):
         self.assertEqual(service._with_token_auth_retry("unit test", fetch), "ok")
         self.assertEqual(seen_tokens, ["stale-token", "fresh-token"])
         self.assertEqual(token_manager.rejected_token, "stale-token")
+
+    def test_non_stream_completion_raises_when_stream_auth_refresh_fails(self):
+        token_manager = FailedRefreshTokenManager()
+        service = GenAIService(self.logger, token_manager, FakeModelManager())
+        auth_failure = {"success": False, "message": "Token失效，请重新登录", "code": 500, "result": None}
+
+        with patch(
+            "genai_proxy.services.genai.requests.post",
+            return_value=FakeStreamingResponse([json.dumps(auth_failure, ensure_ascii=False).encode()]),
+        ):
+            with self.assertRaises(ProxyError) as raised:
+                service.build_openai_completion(
+                    {
+                        "model": "chatglm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    }
+                )
+
+        self.assertEqual(raised.exception.code, "upstream_auth_failed")
+        self.assertEqual(raised.exception.status, 502)
+        self.assertEqual(token_manager.refresh_count, 1)
+        self.assertEqual(token_manager.rejected_token, "stale-token")
+
+    def test_tool_stream_raises_when_stream_auth_refresh_fails(self):
+        token_manager = FailedRefreshTokenManager()
+        service = GenAIService(self.logger, token_manager, FakeModelManager())
+        auth_failure = {"success": False, "message": "Token失效，请重新登录", "code": 500, "result": None}
+
+        with patch(
+            "genai_proxy.services.genai.requests.post",
+            return_value=FakeStreamingResponse([json.dumps(auth_failure, ensure_ascii=False).encode()]),
+        ):
+            stream = service.stream_openai_completion(
+                {
+                    "model": "chatglm",
+                    "messages": [{"role": "user", "content": "what is the weather"}],
+                    "stream": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "description": "Get weather",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"location": {"type": "string"}},
+                                    "required": ["location"],
+                                },
+                            },
+                        }
+                    ],
+                }
+            )
+            with self.assertRaises(ProxyError) as raised:
+                list(stream)
+
+        self.assertEqual(raised.exception.code, "upstream_auth_failed")
+        self.assertEqual(token_manager.refresh_count, 1)
+
+    def test_non_stream_completion_preserves_upstream_finish_reason(self):
+        service = GenAIService(self.logger, FakeTokenManager(), FakeModelManager())
+        completion_line = json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {"content": "partial answer"},
+                        "finish_reason": "length",
+                    }
+                ]
+            }
+        )
+
+        with patch(
+            "genai_proxy.services.genai.requests.post",
+            return_value=FakeStreamingResponse([completion_line.encode()]),
+        ):
+            response = service.build_openai_completion(
+                {
+                    "model": "chatglm",
+                    "messages": [{"role": "user", "content": "hello"}],
+                }
+            )
+
+        choice = response["choices"][0]
+        self.assertEqual(choice["message"]["content"], "partial answer")
+        self.assertEqual(choice["finish_reason"], "length")
+
+    def test_non_stream_completion_raises_on_internal_stream_error_chunk(self):
+        service = GenAIService(self.logger, FakeTokenManager(), FakeModelManager())
+        business_error = {
+            "success": False,
+            "message": "temporary upstream failure",
+            "code": 500,
+            "result": None,
+        }
+
+        with patch(
+            "genai_proxy.services.genai.requests.post",
+            return_value=FakeStreamingResponse([json.dumps(business_error).encode()]),
+        ):
+            with self.assertRaises(ProxyError) as raised:
+                service.build_openai_completion(
+                    {
+                        "model": "chatglm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    }
+                )
+
+        self.assertEqual(raised.exception.error_type, "upstream_error")
+        self.assertEqual(raised.exception.status, 502)
+        self.assertEqual(raised.exception.message, "Upstream error: temporary upstream failure")
+
+    def test_stream_completion_raises_on_initial_business_error(self):
+        service = GenAIService(self.logger, FakeTokenManager(), FakeModelManager())
+        business_error = {
+            "success": False,
+            "message": "temporary upstream failure",
+            "code": 500,
+            "result": None,
+        }
+
+        with patch(
+            "genai_proxy.services.genai.requests.post",
+            return_value=FakeStreamingResponse([json.dumps(business_error).encode()]),
+        ):
+            stream = service.stream_openai_completion(
+                {
+                    "model": "chatglm",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                }
+            )
+            with self.assertRaises(ProxyError) as raised:
+                next(stream)
+
+        self.assertEqual(raised.exception.error_type, "upstream_error")
+        self.assertEqual(raised.exception.status, 502)
+        self.assertEqual(raised.exception.message, "Upstream error: temporary upstream failure")
+
+    def test_tool_stream_raises_when_buffered_attempt_errors_after_content(self):
+        service = GenAIService(self.logger, FakeTokenManager(), FakeModelManager())
+        lines = [
+            json.dumps({"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]}).encode(),
+            json.dumps(
+                {
+                    "success": False,
+                    "message": "temporary upstream failure",
+                    "code": 500,
+                    "result": None,
+                }
+            ).encode(),
+        ]
+
+        with patch(
+            "genai_proxy.services.genai.requests.post",
+            return_value=FakeStreamingResponse(lines),
+        ):
+            stream = service.stream_openai_completion(
+                {
+                    "model": "chatglm",
+                    "messages": [{"role": "user", "content": "what is the weather"}],
+                    "stream": True,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "description": "Get weather",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"location": {"type": "string"}},
+                                    "required": ["location"],
+                                },
+                            },
+                        }
+                    ],
+                }
+            )
+            with self.assertRaises(ProxyError) as raised:
+                list(stream)
+
+        self.assertEqual(raised.exception.error_type, "upstream_error")
+        self.assertEqual(raised.exception.status, 502)
+        self.assertEqual(raised.exception.message, "Upstream error: temporary upstream failure")
+
+    def test_non_stream_empty_error_finish_uses_generic_error_message(self):
+        service = GenAIService(self.logger, FakeTokenManager(), FakeModelManager())
+        lines = [
+            json.dumps({"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]}).encode(),
+            json.dumps({"choices": [{"delta": {}, "finish_reason": "error"}]}).encode(),
+        ]
+
+        with patch(
+            "genai_proxy.services.genai.requests.post",
+            return_value=FakeStreamingResponse(lines),
+        ):
+            with self.assertRaises(ProxyError) as raised:
+                service.build_openai_completion(
+                    {
+                        "model": "chatglm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    }
+                )
+
+        self.assertEqual(raised.exception.message, "Upstream error")
+
+    def test_openai_stream_route_returns_502_when_first_chunk_raises_proxy_error(self):
+        class FailingStreamService:
+            def stream_openai_completion(self, req_data):
+                def gen():
+                    raise ProxyError(
+                        "Upstream GenAI token is invalid or expired",
+                        error_type="authentication_error",
+                        code="upstream_auth_failed",
+                        status=502,
+                    )
+                    yield ""
+
+                return gen()
+
+        app = Flask(__name__)
+        app.extensions["genai_service"] = FailingStreamService()
+        app.extensions["logger"] = self.logger
+        app.register_blueprint(openai_bp)
+
+        response = app.test_client().post(
+            "/v1/chat/completions",
+            json={
+                "model": "chatglm",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json["error"]["code"], "upstream_auth_failed")
+
+    def test_openai_stream_route_returns_500_when_first_chunk_raises_unhandled_error(self):
+        class FailingStreamService:
+            def stream_openai_completion(self, req_data):
+                def gen():
+                    raise RuntimeError("unexpected stream failure")
+                    yield ""
+
+                return gen()
+
+        app = Flask(__name__)
+        app.extensions["genai_service"] = FailingStreamService()
+        app.extensions["logger"] = self.logger
+        app.register_blueprint(openai_bp)
+
+        with patch.object(self.logger, "exception"):
+            response = app.test_client().post(
+                "/v1/chat/completions",
+                json={
+                    "model": "chatglm",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json["error"]["code"], "internal_error")
+
+    def test_claude_stream_conversion_raises_before_message_start_when_openai_auth_fails(self):
+        def failing_openai_stream():
+            raise ProxyError(
+                "Upstream GenAI token is invalid or expired",
+                error_type="authentication_error",
+                code="upstream_auth_failed",
+                status=502,
+            )
+            yield ""
+
+        stream = stream_openai_to_claude(
+            failing_openai_stream(),
+            {
+                "model": "claude-sonnet",
+                "_estimator_model": "chatglm",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            self.logger,
+        )
+
+        with self.assertRaises(ProxyError):
+            next(stream)
+
+    def test_claude_stream_conversion_raises_before_message_start_for_openai_error_chunk(self):
+        stream = stream_openai_to_claude(
+            iter([make_error_chunk("upstream failed", "chatglm")]),
+            {
+                "model": "claude-sonnet",
+                "_estimator_model": "chatglm",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            self.logger,
+        )
+
+        with self.assertRaises(ProxyError) as raised:
+            next(stream)
+
+        self.assertEqual(raised.exception.status, 502)
+        self.assertEqual(raised.exception.message, "upstream failed")
+
+    def test_claude_stream_conversion_emits_error_event_for_late_openai_error_chunk(self):
+        normal_chunk = (
+            "data: "
+            + json.dumps({"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]})
+            + "\n\n"
+        )
+        stream = stream_openai_to_claude(
+            iter([normal_chunk, make_error_chunk("late failure", "chatglm")]),
+            {
+                "model": "claude-sonnet",
+                "_estimator_model": "chatglm",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            self.logger,
+        )
+
+        events = list(stream)
+
+        self.assertTrue(any("event: content_block_delta" in event for event in events))
+        self.assertTrue(any("event: error" in event and "late failure" in event for event in events))
 
     def test_billing_stores_token_returned_by_current_user_response(self):
         old_token = make_jwt(exp=int(time.time()) + 3600)
