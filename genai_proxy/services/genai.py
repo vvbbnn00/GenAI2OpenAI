@@ -13,6 +13,22 @@ from genai_proxy.compat.openai import (
     inject_tool_prompt,
     make_error_chunk,
 )
+from genai_proxy.compat.responses import (
+    convert_responses_to_openai_request,
+    make_message_added_item,
+    make_message_item,
+    make_response_id,
+    make_response_tool_item,
+    response_completed_event,
+    response_created_event,
+    response_custom_tool_call_input_delta,
+    response_failed_event,
+    response_output_item_added,
+    response_output_item_done,
+    response_output_text,
+    response_output_text_delta,
+    response_reasoning_text_delta,
+)
 from genai_proxy.errors import ProxyError
 from genai_proxy.optimizations import (
     GLM_5_2_ADAPTER,
@@ -77,6 +93,147 @@ class GenAIService:
     def stream_openai_completion(self, req_data):
         prepared = self._prepare_chat_request(req_data)
         return self._stream_prepared_openai_completion(prepared)
+
+    def build_response(self, req_data):
+        response = None
+        output = []
+        for payload in self.stream_responses(req_data):
+            for line in _iter_sse_lines(payload):
+                data_str = line[6:].strip()
+                try:
+                    event = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type")
+                if event_type == "response.output_item.done" and isinstance(event.get("item"), dict):
+                    output.append(event["item"])
+                elif event_type == "response.completed":
+                    response = event.get("response") or {}
+                elif event_type == "response.failed":
+                    error = (event.get("response") or {}).get("error") or {}
+                    raise ProxyError(
+                        error.get("message") or "Responses request failed",
+                        error_type="upstream_error",
+                        code=error.get("code"),
+                        status=502,
+                    )
+
+        if response is None:
+            raise ProxyError("Responses stream ended without response.completed", error_type="upstream_error", status=502)
+
+        response = dict(response)
+        response.setdefault("output", output)
+        response["output_text"] = response_output_text(response.get("output") or [])
+        return response
+
+    def stream_responses(self, req_data):
+        context = convert_responses_to_openai_request(req_data)
+        openai_request = dict(context.openai_request)
+        openai_request["stream"] = True
+
+        model = openai_request.get("model", "unknown")
+        response_id = make_response_id()
+        created = int(datetime.now().timestamp())
+        output_items = []
+        output_text = ""
+        tool_call_deltas = []
+        message_item_id = None
+        openai_stream = self.stream_openai_completion(openai_request)
+
+        yield response_created_event(response_id, model, created)
+
+        try:
+            for payload in openai_stream:
+                for line in _iter_sse_lines(payload):
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        continue
+
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+
+                    choice = choices[0]
+                    delta = choice.get("delta") or {}
+                    finish_reason = choice.get("finish_reason")
+
+                    reasoning = delta.get("reasoning_content")
+                    if reasoning:
+                        yield response_reasoning_text_delta(reasoning)
+
+                    content = delta.get("content")
+                    if content:
+                        if message_item_id is None:
+                            message_item_id = f"msg_{uuid.uuid4().hex[:24]}"
+                            yield response_output_item_added(
+                                make_message_added_item(message_item_id)
+                            )
+                        output_text += content
+                        yield response_output_text_delta(content)
+
+                    for tool_call in delta.get("tool_calls") or []:
+                        tool_call_deltas.append(_normalize_stream_tool_call(tool_call))
+
+                    if finish_reason == "error":
+                        message = _strip_error_prefix(content or "Upstream error")
+                        yield response_failed_event(response_id, message)
+                        return
+
+                    if finish_reason == "tool_calls":
+                        if output_text:
+                            item = make_message_item(output_text, message_item_id)
+                            output_items.append(item)
+                            yield response_output_item_done(item)
+                        for tool_call in _merge_tool_call_deltas(tool_call_deltas):
+                            item = make_response_tool_item(tool_call, context.tool_map)
+                            if item.get("type") == "custom_tool_call":
+                                item_id = item.get("id") or item.get("call_id") or response_id
+                                yield response_custom_tool_call_input_delta(
+                                    item_id,
+                                    item.get("call_id") or item_id,
+                                    item.get("input") or "",
+                                )
+                            output_items.append(item)
+                            yield response_output_item_done(item)
+                        yield response_completed_event(
+                            response_id,
+                            model=model,
+                            output=output_items,
+                            end_turn=False,
+                            created=created,
+                        )
+                        return
+
+                    if finish_reason is not None:
+                        if message_item_id is None:
+                            message_item_id = f"msg_{uuid.uuid4().hex[:24]}"
+                            yield response_output_item_added(
+                                make_message_added_item(message_item_id)
+                            )
+                        item = make_message_item(output_text, message_item_id)
+                        output_items.append(item)
+                        yield response_output_item_done(item)
+                        yield response_completed_event(
+                            response_id,
+                            model=model,
+                            output=output_items,
+                            end_turn=True,
+                            created=created,
+                        )
+                        return
+
+            yield response_failed_event(
+                response_id,
+                "Responses stream ended without response.completed",
+            )
+        except ProxyError as exc:
+            yield response_failed_event(response_id, exc.message, code=exc.code)
 
     def fetch_openai_billing_subscription(self):
         def fetch(token):

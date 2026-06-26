@@ -91,6 +91,63 @@ def chat_completions():
             logger.info("[%s] completed in %.2fs", request_id, elapsed)
 
 
+@bp.route("/v1/responses", methods=["POST"])
+def responses():
+    request_id = f"req_{uuid.uuid4().hex[:16]}"
+    start_time = time.monotonic()
+    service = current_app.extensions["genai_service"]
+    logger = current_app.extensions["logger"]
+    streaming_response_started = False
+
+    try:
+        req_data = request.get_json()
+        stream = bool((req_data or {}).get("stream", False))
+        logger.info(
+            "[%s] responses model=%s stream=%s tools=%s input_items=%d",
+            request_id,
+            (req_data or {}).get("model", "GPT-4.1"),
+            stream,
+            bool((req_data or {}).get("tools")),
+            len((req_data or {}).get("input", []))
+            if isinstance((req_data or {}).get("input"), list)
+            else int((req_data or {}).get("input") is not None),
+        )
+
+        if stream:
+            gen = prime_stream(service.stream_responses(req_data))
+            streaming_response_started = True
+            return Response(
+                stream_with_context(_stream_with_completion_log(gen, logger, request_id, start_time)),
+                mimetype="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Content-Type": "text/event-stream",
+                },
+            )
+
+        return jsonify(service.build_response(req_data))
+    except ProxyError as exc:
+        return openai_error(
+            exc.message,
+            error_type=exc.error_type,
+            code=exc.code,
+            status=exc.status,
+        )
+    except Exception as exc:
+        logger.exception("[%s] Unhandled responses error", request_id)
+        return openai_error(
+            str(exc),
+            error_type="server_error",
+            code="internal_error",
+            status=500,
+        )
+    finally:
+        if not streaming_response_started:
+            elapsed = time.monotonic() - start_time
+            logger.info("[%s] completed in %.2fs", request_id, elapsed)
+
+
 @bp.route("/v1/models", methods=["GET"])
 def list_models():
     model_manager = current_app.extensions["model_manager"]
