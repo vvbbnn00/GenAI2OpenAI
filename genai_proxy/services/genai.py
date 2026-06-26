@@ -14,7 +14,13 @@ from genai_proxy.compat.openai import (
     make_error_chunk,
 )
 from genai_proxy.errors import ProxyError
-from genai_proxy.optimizations import select_tool_adapter, tool_start_tags
+from genai_proxy.optimizations import (
+    GLM_5_2_ADAPTER,
+    inject_glm_reasoning_prompt,
+    select_tool_adapter,
+    tool_start_tags,
+)
+from genai_proxy.reasoning import parse_reasoning_config, validate_reasoning_for_adapter
 from genai_proxy.services.token_manager import is_genai_auth_failure, parse_jwt_payload
 from genai_proxy.token_usage import estimate_openai_request_tokens, estimate_token_by_model
 
@@ -229,6 +235,8 @@ class GenAIService:
         tool_choice = req_data.get("tool_choice")
         model_record = self._model_manager.get_model_record(model)
         tool_adapter = select_tool_adapter(model, model_record)
+        reasoning_config = parse_reasoning_config(req_data)
+        validate_reasoning_for_adapter(tool_adapter, reasoning_config)
 
         requested_tools = bool(tools)
         has_tools = requested_tools and not _tool_choice_is_none(tool_choice)
@@ -239,7 +247,10 @@ class GenAIService:
                 tool_choice,
                 model=model,
                 adapter=tool_adapter,
+                reasoning_config=reasoning_config,
             )
+        elif tool_adapter == GLM_5_2_ADAPTER:
+            messages = inject_glm_reasoning_prompt(messages, reasoning_config)
 
         if not self._extract_last_user_message(messages):
             raise ProxyError("No user message found in 'messages'")

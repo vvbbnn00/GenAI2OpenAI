@@ -6,7 +6,7 @@ from datetime import datetime
 from flask import jsonify
 
 from genai_proxy.optimizations import (
-    GLM_ADAPTER,
+    GLM_ADAPTERS,
     MINIMAX_ADAPTER,
     extract_deepseek_tool_calls,
     inject_deepseek_tool_prompt,
@@ -105,6 +105,7 @@ def inject_tool_prompt(
     tool_choice=None,
     model=None,
     adapter=None,
+    reasoning_config=None,
 ):
     resolved_adapter = adapter or (select_tool_adapter(model) if model else None)
     if is_deepseek_adapter(resolved_adapter) or (resolved_adapter is None and is_deepseek_model(model)):
@@ -120,11 +121,13 @@ def inject_tool_prompt(
             tools,
             tool_choice,
         )
-    if resolved_adapter == GLM_ADAPTER:
+    if resolved_adapter in GLM_ADAPTERS:
         return inject_glm_tool_prompt(
             messages,
             tools,
             tool_choice,
+            adapter=resolved_adapter,
+            reasoning_config=reasoning_config,
         )
 
     tool_defs = format_tool_definitions(tools)
