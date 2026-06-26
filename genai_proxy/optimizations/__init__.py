@@ -3,7 +3,7 @@ from genai_proxy.optimizations.deepseek import (
     inject_deepseek_tool_prompt,
     is_deepseek_model,
 )
-from genai_proxy.optimizations.glm import inject_glm_tool_prompt
+from genai_proxy.optimizations.glm import inject_glm_reasoning_prompt, inject_glm_tool_prompt
 from genai_proxy.optimizations.minimax import inject_minimax_tool_prompt
 from genai_proxy.optimizations.registry import (
     DEEPSEEK_ADAPTER,
@@ -14,9 +14,13 @@ from genai_proxy.optimizations.registry import (
     DEEPSEEK_V4_PRO_ADAPTER,
     GENERIC_ADAPTER,
     GLM_ADAPTER,
+    GLM_ADAPTERS,
+    GLM_5_1_ADAPTER,
+    GLM_5_2_ADAPTER,
     MINIMAX_ADAPTER,
     is_deepseek_adapter,
     is_deepseek_v4_adapter,
+    is_glm_adapter,
     select_tool_adapter,
     tool_start_tags,
 )
@@ -30,11 +34,16 @@ __all__ = [
     "DEEPSEEK_V4_PRO_ADAPTER",
     "GENERIC_ADAPTER",
     "GLM_ADAPTER",
+    "GLM_ADAPTERS",
+    "GLM_5_1_ADAPTER",
+    "GLM_5_2_ADAPTER",
     "MINIMAX_ADAPTER",
     "extract_deepseek_tool_calls",
     "is_deepseek_adapter",
     "is_deepseek_v4_adapter",
+    "is_glm_adapter",
     "inject_glm_tool_prompt",
+    "inject_glm_reasoning_prompt",
     "inject_deepseek_tool_prompt",
     "inject_minimax_tool_prompt",
     "is_deepseek_model",

@@ -7,6 +7,8 @@ from genai_proxy.optimizations import (
     DEEPSEEK_V4_PRO_ADAPTER,
     GENERIC_ADAPTER,
     GLM_ADAPTER,
+    GLM_5_1_ADAPTER,
+    GLM_5_2_ADAPTER,
     MINIMAX_ADAPTER,
     select_tool_adapter,
 )
@@ -140,8 +142,24 @@ def test_genai_model_record_mapping():
             "chatglm",
             {"aiName": "GLM", "descInfo": "GLM 5.1适合长任务执行"},
         )
-        == GLM_ADAPTER
+        == GLM_5_1_ADAPTER
     )
+    assert (
+        select_tool_adapter(
+            "chatglm",
+            {"aiName": "GLM", "descInfo": "GLM 5.2适合长任务执行"},
+        )
+        == GLM_5_2_ADAPTER
+    )
+    assert select_tool_adapter("chatglm", None) == GLM_5_2_ADAPTER
+    assert (
+        select_tool_adapter(
+            "chatglm",
+            {"aiName": "GLM 5.2", "rootModelName": "Azure"},
+        )
+        == GENERIC_ADAPTER
+    )
+    assert GLM_ADAPTER == GLM_5_1_ADAPTER
 
 
 def test_glm_malformed_tool_call_close_tag():
@@ -509,11 +527,58 @@ def test_official_prompt_shapes_are_not_mixed_between_model_versions():
     assert '<tool>{"name": "get_weather"' in minimax_prompt
     assert "Rules:" not in minimax_prompt
 
-    glm_prompt = inject_glm_tool_prompt(messages, [WEATHER_TOOL])[0]["content"]
-    assert glm_prompt.startswith("# Tools\n\nYou may call one or more functions")
-    assert "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>" in glm_prompt
-    assert "<minimax:tool_call>" not in glm_prompt
-    assert "Rules:" not in glm_prompt
+    glm51_prompt = inject_glm_tool_prompt(
+        messages,
+        [WEATHER_TOOL],
+        adapter=GLM_5_1_ADAPTER,
+    )[0]["content"]
+    assert glm51_prompt.startswith("# Tools\n\nYou may call one or more functions")
+    assert "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>" in glm51_prompt
+    assert "Reasoning Effort:" not in glm51_prompt
+    assert "<minimax:tool_call>" not in glm51_prompt
+    assert "Rules:" not in glm51_prompt
+
+    glm52_prompt = inject_glm_tool_prompt(
+        messages,
+        [WEATHER_TOOL],
+        adapter=GLM_5_2_ADAPTER,
+    )[0]["content"]
+    assert glm52_prompt.startswith("Reasoning Effort: Max\n\n# Tools\n\n")
+    assert "<tools>" in glm52_prompt
+    assert "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>" in glm52_prompt
+    assert "<|system|>" not in glm52_prompt
+    assert "<minimax:tool_call>" not in glm52_prompt
+    assert "<｜DSML｜tool_calls>" not in glm52_prompt
+    assert "Rules:" not in glm52_prompt
+
+
+def test_glm52_reasoning_effort_prompt_mapping():
+    messages = [{"role": "user", "content": "What's the weather in Beijing?"}]
+
+    high_prompt = inject_glm_tool_prompt(
+        messages,
+        [WEATHER_TOOL],
+        adapter=GLM_5_2_ADAPTER,
+        reasoning_config={"effort": "high"},
+    )[0]["content"]
+    assert high_prompt.startswith("Reasoning Effort: High\n\n# Tools\n\n")
+
+    max_prompt = inject_glm_tool_prompt(
+        messages,
+        [WEATHER_TOOL],
+        adapter=GLM_5_2_ADAPTER,
+        reasoning_config={"effort": "xhigh"},
+    )[0]["content"]
+    assert max_prompt.startswith("Reasoning Effort: Max\n\n# Tools\n\n")
+
+    none_prompt = inject_glm_tool_prompt(
+        messages,
+        [WEATHER_TOOL],
+        adapter=GLM_5_2_ADAPTER,
+        reasoning_config={"effort": "none"},
+    )[0]["content"]
+    assert none_prompt.startswith("# Tools\n\n")
+    assert "Reasoning Effort:" not in none_prompt
 
 
 def test_deepseek_v4_prompt_matches_hf_encoding_test_shape():
@@ -615,6 +680,7 @@ if __name__ == "__main__":
     test_streaming_detection_keeps_claude_code_tool_name_prefix()
     test_tool_result_turn_allows_additional_tools_by_default()
     test_official_prompt_shapes_are_not_mixed_between_model_versions()
+    test_glm52_reasoning_effort_prompt_mapping()
     test_deepseek_v4_prompt_matches_hf_encoding_test_shape()
     test_history_tool_calls_render_in_each_official_adapter_format()
     test_required_tool_choice_still_allows_additional_tool_calls()

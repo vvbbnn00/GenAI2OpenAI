@@ -5,6 +5,7 @@ from itertools import chain
 from flask import jsonify
 
 from genai_proxy.errors import ProxyError
+from genai_proxy.reasoning import parse_claude_reasoning_config
 from genai_proxy.token_usage import estimate_claude_request_tokens, estimate_token_by_model
 
 
@@ -96,6 +97,10 @@ def convert_claude_to_openai(req_data, model_manager):
         openai_request["top_p"] = req_data["top_p"]
     if req_data.get("stop_sequences"):
         openai_request["stop"] = req_data["stop_sequences"]
+
+    reasoning_config = parse_claude_reasoning_config(req_data)
+    if reasoning_config:
+        openai_request["reasoning"] = reasoning_config
 
     tools = req_data.get("tools") or []
     if tools:

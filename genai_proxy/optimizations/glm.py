@@ -1,8 +1,10 @@
 import json
 
+from genai_proxy.optimizations.registry import GLM_5_2_ADAPTER, GLM_ADAPTER
 from genai_proxy.optimizations.xml_tools import inject_xml_tool_prompt
 
 
+GLM52_REASONING_TEMPLATE = "Reasoning Effort: {effort}"
 GLM_TOOL_SYSTEM_TEMPLATE = """\
 # Tools
 
@@ -23,19 +25,84 @@ GLM_SPECIFIC_TOOL_SUFFIX = (
     '\nFor this turn, you must call the tool named "{name}" using a <tool_call> block.'
 )
 GLM_NO_TOOL_SUFFIX = "\nFor this turn, do not call any tool or emit <tool_call> tags."
+GLM52_TOOL_RESULT_SYSTEM_PROMPT = (
+    "The conversation already contains completed tool results. "
+    "Use those results to answer the user's request. "
+    "This turn must end with final assistant text only. "
+    "Do not call any tool or emit <tool_call>, <arg_key>, or <arg_value> tags."
+)
+GLM52_TOOL_RESULT_FINAL_SUFFIX = (
+    "\nThe tool response above is sufficient for the current request. "
+    "Return the final answer only. "
+    "Do not call any tool again. "
+    "Do not emit <tool_call>, <arg_key>, or <arg_value> tags."
+)
 
 
-def inject_glm_tool_prompt(messages, tools, tool_choice=None):
+def inject_glm_tool_prompt(
+    messages,
+    tools,
+    tool_choice=None,
+    *,
+    adapter=GLM_ADAPTER,
+    reasoning_config=None,
+):
+    tool_prompt = (
+        _render_glm52_tool_result_system_prompt(reasoning_config)
+        if _is_glm52_tool_result_final_turn(messages, adapter, tool_choice)
+        else _render_glm_tools_prompt(
+            tools,
+            tool_choice,
+            adapter=adapter,
+            reasoning_config=reasoning_config,
+        )
+    )
     return inject_xml_tool_prompt(
         messages,
-        _render_glm_tools_prompt(tools, tool_choice),
+        tool_prompt,
         allow_additional_tool_calls=_allows_additional_tool_calls(tool_choice),
         render_tool_call_message=_render_glm_tool_call_message,
-        render_tool_results=_render_glm_tool_results,
+        render_tool_results=lambda tool_messages, allow_additional_tool_calls=False: (
+            _render_glm_tool_results(
+                tool_messages,
+                allow_additional_tool_calls=allow_additional_tool_calls,
+                adapter=adapter,
+            )
+        ),
     )
 
 
-def _render_glm_tools_prompt(tools, tool_choice=None):
+def inject_glm_reasoning_prompt(messages, reasoning_config=None):
+    reasoning_prompt = _render_glm52_reasoning_prompt(reasoning_config)
+    if not reasoning_prompt:
+        return messages
+
+    new_messages = []
+    has_system = False
+    for msg in messages:
+        if msg.get("role") == "system":
+            new_messages.append(
+                {
+                    **msg,
+                    "content": msg.get("content", "") + "\n\n" + reasoning_prompt,
+                }
+            )
+            has_system = True
+        else:
+            new_messages.append(msg)
+
+    if not has_system:
+        new_messages.insert(0, {"role": "system", "content": reasoning_prompt})
+    return new_messages
+
+
+def _render_glm_tools_prompt(
+    tools,
+    tool_choice=None,
+    *,
+    adapter=GLM_ADAPTER,
+    reasoning_config=None,
+):
     tool_defs = []
     for tool in tools:
         if tool.get("type") != "function":
@@ -45,6 +112,14 @@ def _render_glm_tools_prompt(tools, tool_choice=None):
             tool_defs.append(json.dumps(function_data, ensure_ascii=False))
 
     prompt = GLM_TOOL_SYSTEM_TEMPLATE.format(tool_definitions="\n".join(tool_defs))
+    reasoning_prompt = (
+        _render_glm52_reasoning_prompt(reasoning_config)
+        if adapter == GLM_5_2_ADAPTER
+        else ""
+    )
+    if reasoning_prompt:
+        prompt = reasoning_prompt + "\n\n" + prompt
+
     if tool_choice == "required":
         prompt += GLM_REQUIRED_TOOL_SUFFIX
     elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
@@ -64,6 +139,38 @@ def _tool_choice_is_none(tool_choice) -> bool:
     )
 
 
+def _requires_tool_call(tool_choice) -> bool:
+    return tool_choice == "required" or (
+        isinstance(tool_choice, dict)
+        and tool_choice.get("type") == "function"
+        and tool_choice.get("function", {}).get("name")
+    )
+
+
+def _is_glm52_tool_result_final_turn(messages, adapter, tool_choice) -> bool:
+    return (
+        adapter == GLM_5_2_ADAPTER
+        and bool(messages)
+        and messages[-1].get("role") == "tool"
+        and not _requires_tool_call(tool_choice)
+    )
+
+
+def _render_glm52_tool_result_system_prompt(reasoning_config=None):
+    reasoning_prompt = _render_glm52_reasoning_prompt(reasoning_config)
+    if reasoning_prompt:
+        return reasoning_prompt + "\n\n" + GLM52_TOOL_RESULT_SYSTEM_PROMPT
+    return GLM52_TOOL_RESULT_SYSTEM_PROMPT
+
+
+def _render_glm52_reasoning_prompt(reasoning_config=None):
+    effort = (reasoning_config or {}).get("effort")
+    if effort == "none":
+        return ""
+    rendered_effort = "High" if effort == "high" else "Max"
+    return GLM52_REASONING_TEMPLATE.format(effort=rendered_effort)
+
+
 def _render_glm_tool_call_message(message):
     parts = []
     if message.get("content"):
@@ -81,11 +188,19 @@ def _render_glm_tool_call_message(message):
     return "\n\n".join(part for part in parts if part).strip()
 
 
-def _render_glm_tool_results(tool_messages, allow_additional_tool_calls=False):
-    return "<|observation|>" + "".join(
+def _render_glm_tool_results(
+    tool_messages,
+    allow_additional_tool_calls=False,
+    *,
+    adapter=GLM_ADAPTER,
+):
+    content = "<|observation|>" + "".join(
         f"<tool_response>{_normalize_content(msg.get('content'))}</tool_response>"
         for msg in tool_messages
     )
+    if adapter != GLM_5_2_ADAPTER:
+        return content
+    return content + GLM52_TOOL_RESULT_FINAL_SUFFIX
 
 
 def _normalize_content(content):
