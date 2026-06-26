@@ -368,7 +368,7 @@ def _normalize_arguments(arguments):
 
 def _parse_arg_key_tool_call(raw: str, tools=None):
     match = re.match(
-        r"\s*(?P<name>[^\s<>{}\[\],:]+)\s*<arg_key>\s*(?P<arguments>.*)\s*$",
+        r"\s*(?P<name>[^\s<>{}\[\],:]+)\s*(?P<arguments><(?:arg_key|arg_value)>.*)\s*$",
         raw,
         re.DOTALL,
     )
@@ -398,7 +398,8 @@ def _parse_arg_key_arguments(raw: str, arg_keys=None):
         if arg_value_args is not None:
             return arg_value_args
     elif "</arg_value>" in raw:
-        close_only_args = _parse_close_only_arg_value_arguments(raw, arg_keys or [])
+        close_only_raw = re.sub(r"^\s*<arg_key>\s*", "", raw)
+        close_only_args = _parse_close_only_arg_value_arguments(close_only_raw, arg_keys or [])
         if close_only_args is not None:
             return close_only_args
 
@@ -421,6 +422,10 @@ def _parse_arg_key_arguments(raw: str, arg_keys=None):
 
 def _parse_arg_value_arguments(raw: str):
     text = raw.strip()
+    reversed_args = _parse_reversed_arg_value_arguments(text)
+    if reversed_args is not None:
+        return reversed_args
+
     if not text.startswith("<arg_key>"):
         text = "<arg_key>" + text
 
@@ -437,6 +442,27 @@ def _parse_arg_value_arguments(raw: str):
     arguments = {}
     for match in matches:
         arguments[match.group("key")] = _parse_jsonish_scalar(match.group("value").strip())
+    return arguments
+
+
+def _parse_reversed_arg_value_arguments(raw: str):
+    matches = list(
+        re.finditer(
+            r"<arg_value>\s*\"?(?P<key>[A-Za-z_][\w./@-]*)\"?\s*</arg_key>\s*"
+            r"<arg_value>(?P<value>.*?)(?=(?:</arg_value>)?\s*<arg_value>\s*\"?[A-Za-z_][\w./@-]*\"?\s*</arg_key>\s*<arg_value>|(?:</arg_value>)?\s*$)",
+            raw,
+            re.DOTALL,
+        )
+    )
+    if not matches:
+        return None
+
+    arguments = {}
+    for match in matches:
+        value = match.group("value").strip()
+        if value.endswith("</arg_value>"):
+            value = value[: -len("</arg_value>")].strip()
+        arguments[match.group("key")] = _parse_jsonish_scalar(value)
     return arguments
 
 
@@ -708,7 +734,11 @@ def _tool_call_prefix_looks_parseable(prefix: str, tools=None) -> bool:
     if text.startswith(("{", "<name>", "<arg_key>")) or '"name"' in text[:80]:
         return True
     for name in _tool_name_set(tools):
-        if re.match(rf"{re.escape(name)}(?:\s*<arg_key>|\s*$)", text, re.IGNORECASE):
+        if re.match(
+            rf"{re.escape(name)}(?:\s*<arg_key>|\s*<arg_value>|\s*$)",
+            text,
+            re.IGNORECASE,
+        ):
             return True
     return False
 
@@ -719,12 +749,12 @@ def _find_arg_key_tool_blocks(content: str, tools=None, occupied_spans=None):
     if tool_names:
         name_pattern = "|".join(re.escape(name) for name in tool_names)
         pattern = re.compile(
-            rf"(?<![\w./@-])(?P<name>{name_pattern})\s*<arg_key>",
+            rf"(?<![\w./@-])(?P<name>{name_pattern})\s*(?:<arg_key>|<arg_value>\s*[A-Za-z_][\w./@-]*\s*</arg_key>\s*<arg_value>)",
             re.DOTALL,
         )
     else:
         pattern = re.compile(
-            r"(?<![\w./@-])(?P<name>[A-Za-z_][\w./@-]*)\s*<arg_key>",
+            r"(?<![\w./@-])(?P<name>[A-Za-z_][\w./@-]*)\s*(?:<arg_key>|<arg_value>\s*[A-Za-z_][\w./@-]*\s*</arg_key>\s*<arg_value>)",
             re.DOTALL,
         )
 

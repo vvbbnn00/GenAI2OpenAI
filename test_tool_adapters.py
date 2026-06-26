@@ -96,6 +96,19 @@ READ_TOOL = {
     },
 }
 
+EXEC_COMMAND_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "exec_command",
+        "description": "Run a shell command.",
+        "parameters": {
+            "type": "object",
+            "properties": {"cmd": {"type": "string"}},
+            "required": ["cmd"],
+        },
+    },
+}
+
 
 def test_genai_model_record_mapping():
     assert (
@@ -289,6 +302,38 @@ def test_glm_official_arg_key_tool_call_is_recovered():
     arguments = json.loads(tool_calls[0]["function"]["arguments"])
     assert remaining is None
     assert arguments == {"command": "ls -la", "timeout": 60000}
+
+
+def test_glm_malformed_reversed_arg_value_tool_call_is_recovered():
+    content = (
+        "<tool_call>exec_command"
+        "<arg_value>cmd</arg_key><arg_value>cd /tmp && rg --files | head</arg_value>"
+        "</tool_call>"
+    )
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[EXEC_COMMAND_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert tool_calls[0]["function"]["name"] == "exec_command"
+    assert arguments == {"cmd": "cd /tmp && rg --files | head"}
+
+
+def test_glm_bare_malformed_reversed_arg_value_tool_call_is_recovered():
+    content = "exec_command<arg_value>cmd</arg_key><arg_value>pwd && git status --short"
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[EXEC_COMMAND_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert tool_calls[0]["function"]["name"] == "exec_command"
+    assert arguments == {"cmd": "pwd && git status --short"}
 
 
 def test_minimax_official_tool_call_is_recovered():
@@ -497,6 +542,16 @@ def test_tool_result_turn_allows_additional_tools_by_default():
     )
     assert deepseek_messages[-1]["content"] == "<tool_result>Shanghai is sunny.</tool_result>"
 
+    glm52_messages = inject_glm_tool_prompt(
+        messages,
+        [WEATHER_TOOL],
+        adapter=GLM_5_2_ADAPTER,
+    )
+    assert "# Tools" in glm52_messages[0]["content"]
+    assert "<tools>" in glm52_messages[0]["content"]
+    assert "This turn must end with final assistant text only" not in glm52_messages[0]["content"]
+    assert "Do not call any tool again" not in glm52_messages[-1]["content"]
+
 
 def test_official_prompt_shapes_are_not_mixed_between_model_versions():
     messages = [{"role": "user", "content": "What's the weather in Beijing?"}]
@@ -579,6 +634,47 @@ def test_glm52_reasoning_effort_prompt_mapping():
     )[0]["content"]
     assert none_prompt.startswith("# Tools\n\n")
     assert "Reasoning Effort:" not in none_prompt
+
+
+def test_glm52_prompt_filters_template_internal_tool_fields():
+    messages = [{"role": "user", "content": "Run a command."}]
+    strict_tool = {
+        "type": "function",
+        "function": {
+            "name": "exec_command",
+            "description": "Run a shell command.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+            },
+        },
+    }
+    deferred_tool = {
+        "type": "function",
+        "function": {
+            "name": "deferred_tool",
+            "description": "Should not be rendered yet.",
+            "defer_loading": True,
+            "parameters": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            },
+        },
+    }
+
+    glm52_prompt = inject_glm_tool_prompt(
+        messages,
+        [strict_tool, deferred_tool],
+        adapter=GLM_5_2_ADAPTER,
+    )[0]["content"]
+    assert '"name": "exec_command"' in glm52_prompt
+    assert '"parameters"' in glm52_prompt
+    assert '"name": "deferred_tool"' not in glm52_prompt
+    assert "strict" not in glm52_prompt
+    assert "defer_loading" not in glm52_prompt
 
 
 def test_deepseek_v4_prompt_matches_hf_encoding_test_shape():
@@ -670,6 +766,8 @@ if __name__ == "__main__":
     test_claude_code_arg_value_tool_call_body_is_recovered()
     test_claude_code_close_only_arg_value_tool_call_body_is_recovered()
     test_glm_official_arg_key_tool_call_is_recovered()
+    test_glm_malformed_reversed_arg_value_tool_call_is_recovered()
+    test_glm_bare_malformed_reversed_arg_value_tool_call_is_recovered()
     test_minimax_official_tool_call_is_recovered()
     test_deepseek_v4_dsml_tool_calls_are_recovered()
     test_json_tool_call_with_shell_regex_backslashes_is_recovered()
@@ -681,6 +779,7 @@ if __name__ == "__main__":
     test_tool_result_turn_allows_additional_tools_by_default()
     test_official_prompt_shapes_are_not_mixed_between_model_versions()
     test_glm52_reasoning_effort_prompt_mapping()
+    test_glm52_prompt_filters_template_internal_tool_fields()
     test_deepseek_v4_prompt_matches_hf_encoding_test_shape()
     test_history_tool_calls_render_in_each_official_adapter_format()
     test_required_tool_choice_still_allows_additional_tool_calls()

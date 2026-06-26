@@ -374,11 +374,11 @@ def test_glm52_tool_result_turn_returns_final_text():
     message = response["choices"][0]["message"]
     assert not message.get("tool_calls")
     assert message["content"] == "Shanghai is sunny."
-    assert "This turn must end with final assistant text only" in captured[0]["messages"][0]["content"]
-    assert "<tools>" not in captured[0]["messages"][0]["content"]
+    assert "This turn must end with final assistant text only" not in captured[0]["messages"][0]["content"]
+    assert "<tools>" in captured[0]["messages"][0]["content"]
     assert captured[0]["messages"][-1]["content"].startswith("<|observation|>")
-    assert "Return the final answer only" in captured[0]["messages"][-1]["content"]
-    assert "Do not emit <tool_call>, <arg_key>, or <arg_value> tags" in captured[0]["messages"][-1]["content"]
+    assert "Return the final answer only" not in captured[0]["messages"][-1]["content"]
+    assert "Do not emit <tool_call>, <arg_key>, or <arg_value> tags" not in captured[0]["messages"][-1]["content"]
 
 
 def test_glm52_native_upstream_tool_call_deltas_are_preserved():

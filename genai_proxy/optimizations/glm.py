@@ -25,12 +25,6 @@ GLM_SPECIFIC_TOOL_SUFFIX = (
     '\nFor this turn, you must call the tool named "{name}" using a <tool_call> block.'
 )
 GLM_NO_TOOL_SUFFIX = "\nFor this turn, do not call any tool or emit <tool_call> tags."
-GLM52_TOOL_RESULT_SYSTEM_PROMPT = (
-    "The conversation already contains completed tool results. "
-    "Use those results to answer the user's request. "
-    "This turn must end with final assistant text only. "
-    "Do not call any tool or emit <tool_call>, <arg_key>, or <arg_value> tags."
-)
 GLM52_TOOL_RESULT_FINAL_SUFFIX = (
     "\nThe tool response above is sufficient for the current request. "
     "Return the final answer only. "
@@ -47,15 +41,11 @@ def inject_glm_tool_prompt(
     adapter=GLM_ADAPTER,
     reasoning_config=None,
 ):
-    tool_prompt = (
-        _render_glm52_tool_result_system_prompt(reasoning_config)
-        if _is_glm52_tool_result_final_turn(messages, adapter, tool_choice)
-        else _render_glm_tools_prompt(
-            tools,
-            tool_choice,
-            adapter=adapter,
-            reasoning_config=reasoning_config,
-        )
+    tool_prompt = _render_glm_tools_prompt(
+        tools,
+        tool_choice,
+        adapter=adapter,
+        reasoning_config=reasoning_config,
     )
     return inject_xml_tool_prompt(
         messages,
@@ -107,7 +97,7 @@ def _render_glm_tools_prompt(
     for tool in tools:
         if tool.get("type") != "function":
             continue
-        function_data = tool.get("function", {})
+        function_data = _render_glm_tool_definition(tool.get("function", {}), adapter=adapter)
         if function_data:
             tool_defs.append(json.dumps(function_data, ensure_ascii=False))
 
@@ -139,28 +129,16 @@ def _tool_choice_is_none(tool_choice) -> bool:
     )
 
 
-def _requires_tool_call(tool_choice) -> bool:
-    return tool_choice == "required" or (
-        isinstance(tool_choice, dict)
-        and tool_choice.get("type") == "function"
-        and tool_choice.get("function", {}).get("name")
-    )
-
-
-def _is_glm52_tool_result_final_turn(messages, adapter, tool_choice) -> bool:
-    return (
-        adapter == GLM_5_2_ADAPTER
-        and bool(messages)
-        and messages[-1].get("role") == "tool"
-        and not _requires_tool_call(tool_choice)
-    )
-
-
-def _render_glm52_tool_result_system_prompt(reasoning_config=None):
-    reasoning_prompt = _render_glm52_reasoning_prompt(reasoning_config)
-    if reasoning_prompt:
-        return reasoning_prompt + "\n\n" + GLM52_TOOL_RESULT_SYSTEM_PROMPT
-    return GLM52_TOOL_RESULT_SYSTEM_PROMPT
+def _render_glm_tool_definition(function_data, *, adapter=GLM_ADAPTER):
+    if not function_data:
+        return {}
+    if adapter == GLM_5_2_ADAPTER and function_data.get("defer_loading"):
+        return {}
+    rendered = dict(function_data)
+    if adapter == GLM_5_2_ADAPTER:
+        rendered.pop("defer_loading", None)
+        rendered.pop("strict", None)
+    return rendered
 
 
 def _render_glm52_reasoning_prompt(reasoning_config=None):
@@ -198,7 +176,7 @@ def _render_glm_tool_results(
         f"<tool_response>{_normalize_content(msg.get('content'))}</tool_response>"
         for msg in tool_messages
     )
-    if adapter != GLM_5_2_ADAPTER:
+    if adapter != GLM_5_2_ADAPTER or allow_additional_tool_calls:
         return content
     return content + GLM52_TOOL_RESULT_FINAL_SUFFIX
 
