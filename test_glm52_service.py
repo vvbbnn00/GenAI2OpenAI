@@ -160,8 +160,13 @@ def first_tool_call(response):
     return tool_calls[0]
 
 
-def test_glm52_rejects_unsupported_reasoning_effort_before_upstream_call():
-    service, _captured, fake_post = make_service([])
+def test_glm52_downgrades_unsupported_reasoning_effort_to_none():
+    service, captured, fake_post = make_service(
+        [
+            sse_line({"content": "Done."}),
+            sse_line({}, "stop"),
+        ]
+    )
     request = {
         "model": "chatglm",
         "messages": [{"role": "user", "content": "Use get_weather for Shanghai."}],
@@ -170,14 +175,11 @@ def test_glm52_rejects_unsupported_reasoning_effort_before_upstream_call():
     }
 
     with patch("genai_proxy.services.genai.requests.post", fake_post):
-        try:
-            service.build_openai_completion(request)
-        except ProxyError as exc:
-            assert exc.status == 400
-            assert "GLM-5.2" in exc.message
-            assert "low" in exc.message
-        else:
-            raise AssertionError("unsupported GLM-5.2 effort did not fail")
+        response = service.build_openai_completion(request)
+
+    assert response["choices"][0]["message"]["content"] == "Done."
+    system_prompt = captured[0]["messages"][0]["content"]
+    assert "Reasoning Effort" not in system_prompt, system_prompt
 
 
 def test_openai_rejects_non_official_reasoning_effort_max():
@@ -625,7 +627,7 @@ def test_claude_rejects_non_official_output_config_effort():
 
 
 if __name__ == "__main__":
-    test_glm52_rejects_unsupported_reasoning_effort_before_upstream_call()
+    test_glm52_downgrades_unsupported_reasoning_effort_to_none()
     test_openai_rejects_non_official_reasoning_effort_max()
     test_glm52_openai_reasoning_effort_alias_injects_prompt_without_tools()
     test_glm52_openai_non_stream_xml_tool_call_uses_reasoning_high()

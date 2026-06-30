@@ -48,21 +48,24 @@ def parse_claude_reasoning_config(req_data: dict | None) -> dict:
     return config
 
 
-def validate_reasoning_for_adapter(adapter: str | None, reasoning_config: dict | None) -> None:
+def normalize_reasoning_for_adapter(
+    adapter: str | None, reasoning_config: dict | None
+) -> dict | None:
     effort = (reasoning_config or {}).get("effort")
     if not effort:
-        return
+        return reasoning_config
 
     if adapter == GLM_5_2_ADAPTER and effort not in GLM52_REASONING_EFFORTS:
-        raise ProxyError(
-            (
-                f"Unsupported reasoning effort '{effort}' for GLM-5.2. "
-                "Supported values are: none, high, xhigh."
-            ),
-            error_type="invalid_request_error",
-            code="unsupported_reasoning_effort",
-            status=400,
-        )
+        return {"effort": "none"}
+
+    return reasoning_config
+
+
+def validate_reasoning_for_adapter(adapter: str | None, reasoning_config: dict | None) -> None:
+    normalized = normalize_reasoning_for_adapter(adapter, reasoning_config)
+    if reasoning_config is not None and normalized is not None:
+        reasoning_config.clear()
+        reasoning_config.update(normalized)
 
 
 def _normalize_reasoning_effort(effort, *, allowed_efforts: tuple[str, ...], field_name: str) -> dict:
