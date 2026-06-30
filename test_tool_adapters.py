@@ -118,6 +118,82 @@ LIST_MCP_RESOURCES_TOOL = {
     },
 }
 
+GENERIC_STRING_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run_anything",
+        "description": "A generic string argument tool.",
+        "parameters": {
+            "type": "object",
+            "properties": {"payload": {"type": "string"}},
+            "required": ["payload"],
+        },
+    },
+}
+
+GENERIC_TRANSCRIPT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "generic_runner",
+        "description": "A generic transcript-style runner.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "payload": {"type": "string"},
+                "description": {"type": "string"},
+                "timeout": {"type": "integer"},
+            },
+            "required": ["payload"],
+        },
+    },
+}
+
+UNTYPED_ARGUMENT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "untyped_runner",
+        "description": "A tool with an untyped argument.",
+        "parameters": {
+            "type": "object",
+            "properties": {"payload": {}},
+            "required": ["payload"],
+        },
+    },
+}
+
+UNION_SCHEMA_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "union_runner",
+        "description": "A tool with nullable schema types.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "payload": {"type": ["string", "null"]},
+                "count": {"type": ["integer", "null"]},
+                "flag": {"type": ["boolean", "null"]},
+            },
+            "required": ["payload"],
+        },
+    },
+}
+
+ANYOF_SCHEMA_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "anyof_runner",
+        "description": "A tool with anyOf nullable schema types.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "payload": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "count": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+            },
+            "required": ["payload"],
+        },
+    },
+}
+
 
 def test_genai_model_record_mapping():
     assert (
@@ -313,6 +389,23 @@ def test_glm_official_arg_key_tool_call_is_recovered():
     assert arguments == {"command": "ls -la", "timeout": 60000}
 
 
+def test_glm_arg_value_shell_command_preserves_trailing_quote():
+    content = (
+        "<tool_call>Bash"
+        "<arg_key>command</arg_key><arg_value>printf '%s\\n' \"hi\"</arg_value>"
+        "</tool_call>"
+    )
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[BASH_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments["command"] == "printf '%s\\n' \"hi\""
+
+
 def test_glm_malformed_reversed_arg_value_tool_call_is_recovered():
     content = (
         "<tool_call>exec_command"
@@ -329,6 +422,254 @@ def test_glm_malformed_reversed_arg_value_tool_call_is_recovered():
     assert remaining is None
     assert tool_calls[0]["function"]["name"] == "exec_command"
     assert arguments == {"cmd": "cd /tmp && rg --files | head"}
+
+
+def test_glm_malformed_reversed_shell_command_preserves_trailing_quote():
+    content = (
+        "<tool_call>exec_command"
+        "<arg_value>cmd</arg_key><arg_value>python -c \"print(\\\"hi\\\")\"</arg_value>"
+        "</tool_call>"
+    )
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[EXEC_COMMAND_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments["cmd"] == "python -c \"print(\\\"hi\\\")\""
+
+
+def test_glm_string_typed_shell_arguments_preserve_literal_values():
+    commands = (
+        "true",
+        "123",
+        "null",
+        '"./script with spaces.sh" --flag',
+    )
+    cases = (
+        (BASH_TOOL, "Bash", "command"),
+        (EXEC_COMMAND_TOOL, "exec_command", "cmd"),
+    )
+
+    for tool, tool_name, argument_name in cases:
+        for command in commands:
+            contents = (
+                (
+                    f"<tool_call>{tool_name}"
+                    f"<arg_key>{argument_name}</arg_key><arg_value>{command}</arg_value>"
+                    "</tool_call>"
+                ),
+                (
+                    f"<tool_call>{tool_name}"
+                    f"<arg_value>{argument_name}</arg_key><arg_value>{command}</arg_value>"
+                    "</tool_call>"
+                ),
+            )
+            for content in contents:
+                tool_calls, remaining = extract_tool_calls(
+                    content,
+                    tools=[tool],
+                    model="chatglm",
+                    adapter=GLM_5_2_ADAPTER,
+                )
+                arguments = json.loads(tool_calls[0]["function"]["arguments"])
+                assert remaining is None
+                assert arguments[argument_name] == command
+                assert isinstance(arguments[argument_name], str)
+
+
+def test_glm_close_only_shell_command_preserves_leading_quote():
+    content = (
+        '<tool_call>Bash<arg_key>command "./script with spaces.sh" --flag</arg_value>'
+        "</tool_call>"
+    )
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[BASH_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments["command"] == '"./script with spaces.sh" --flag'
+
+
+def test_string_arguments_are_preserved_for_unknown_tool_names():
+    payloads = (
+        "true",
+        "123",
+        "null",
+        '"./script with spaces.sh" --flag',
+        "printf '%s\\n' \"hi\"",
+    )
+
+    for payload in payloads:
+        cases = (
+            (
+                "<tool_call>run_anything"
+                f"<arg_key>payload</arg_key><arg_value>{payload}</arg_value>"
+                "</tool_call>"
+            ),
+            (
+                "<tool_call>run_anything"
+                f"<arg_value>payload</arg_key><arg_value>{payload}</arg_value>"
+                "</tool_call>"
+            ),
+            (
+                "<minimax:tool_call>"
+                '<invoke name="run_anything">'
+                f'<parameter name="payload">{payload}</parameter>'
+                "</invoke>"
+                "</minimax:tool_call>"
+            ),
+            f"run_anything payload: {payload}",
+        )
+
+        for content in cases:
+            tool_calls, remaining = extract_tool_calls(
+                content,
+                tools=[GENERIC_STRING_TOOL],
+                model="chatglm",
+                adapter=GLM_5_2_ADAPTER,
+            )
+            arguments = json.loads(tool_calls[0]["function"]["arguments"])
+            assert remaining is None
+            assert arguments["payload"] == payload
+            assert isinstance(arguments["payload"], str)
+
+
+def test_inline_heredoc_arguments_are_preserved_for_unknown_tool_names():
+    expected = "python - <<'PY'\nprint(\"hi\")\nPY"
+    content = "run_anything payload: " + expected
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[GENERIC_STRING_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments["payload"] == expected
+
+
+def test_transcript_input_maps_to_single_required_argument_without_tool_name_special_case():
+    content = "generic_runner Run arbitrary payload\nIN\nprintf '%s\\n' \"hi\"\nOUT\n"
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[GENERIC_TRANSCRIPT_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments == {
+        "payload": "printf '%s\\n' \"hi\"",
+        "description": "Run arbitrary payload",
+    }
+
+
+def test_xml_untyped_arguments_default_to_literal_strings():
+    payloads = ("true", "123", '"./script with spaces.sh" --flag')
+    for payload in payloads:
+        cases = (
+            (
+                "<tool_call>untyped_runner"
+                f"<arg_key>payload</arg_key><arg_value>{payload}</arg_value>"
+                "</tool_call>"
+            ),
+            (
+                "<minimax:tool_call>"
+                '<invoke name="untyped_runner">'
+                f'<parameter name="payload">{payload}</parameter>'
+                "</invoke>"
+                "</minimax:tool_call>"
+            ),
+        )
+
+        for content in cases:
+            tool_calls, remaining = extract_tool_calls(
+                content,
+                tools=[UNTYPED_ARGUMENT_TOOL],
+                model="chatglm",
+                adapter=GLM_5_2_ADAPTER,
+            )
+            arguments = json.loads(tool_calls[0]["function"]["arguments"])
+            assert remaining is None
+            assert arguments["payload"] == payload
+            assert isinstance(arguments["payload"], str)
+
+
+def test_nullable_schema_types_are_normalized_before_parsing():
+    content = (
+        "<tool_call>union_runner"
+        "<arg_key>payload</arg_key><arg_value>true</arg_value>"
+        "<arg_key>count</arg_key><arg_value>123</arg_value>"
+        "<arg_key>flag</arg_key><arg_value>true</arg_value>"
+        "</tool_call>"
+    )
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[UNION_SCHEMA_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments == {"payload": "true", "count": 123, "flag": True}
+
+
+def test_json_tool_call_paths_preserve_explicit_json_argument_types():
+    payload = '{"payload": true, "count": "123", "flag": "true"}'
+    cases = (
+        f'<tool_call>{{"name": "union_runner", "arguments": {payload}}}</tool_call>',
+        f'<tool_call>prefix {{"name": "union_runner", "arguments": {payload}}} suffix</tool_call>',
+        f"<tool_call><name>union_runner</name><arguments>{payload}</arguments></tool_call>",
+    )
+
+    for content in cases:
+        tool_calls, remaining = extract_tool_calls(
+            content,
+            tools=[UNION_SCHEMA_TOOL],
+            model="chatglm",
+            adapter=GLM_5_2_ADAPTER,
+        )
+        arguments = json.loads(tool_calls[0]["function"]["arguments"])
+        assert remaining is None
+        assert arguments == {"payload": True, "count": "123", "flag": "true"}
+
+
+def test_anyof_schema_types_are_used_for_text_arguments_only():
+    text_content = (
+        "<tool_call>anyof_runner"
+        "<arg_key>payload</arg_key><arg_value>true</arg_value>"
+        "<arg_key>count</arg_key><arg_value>123</arg_value>"
+        "</tool_call>"
+    )
+    tool_calls, remaining = extract_tool_calls(
+        text_content,
+        tools=[ANYOF_SCHEMA_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments == {"payload": "true", "count": 123}
+
+    json_content = (
+        '<tool_call>{"name": "anyof_runner", "arguments": '
+        '{"payload": true, "count": "123"}}</tool_call>'
+    )
+    tool_calls, remaining = extract_tool_calls(
+        json_content,
+        tools=[ANYOF_SCHEMA_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments == {"payload": True, "count": "123"}
 
 
 def test_glm_bare_malformed_reversed_arg_value_tool_call_is_recovered():
@@ -394,6 +735,53 @@ def test_minimax_official_tool_call_is_recovered():
     assert arguments == {"command": "ls -la", "timeout": 60000}
 
 
+def test_minimax_xml_shell_command_preserves_trailing_quote():
+    content = (
+        "<minimax:tool_call>\n"
+        '<invoke name="Bash">\n'
+        "<parameter name=\"command\">printf '%s\\n' \"hi\"</parameter>\n"
+        "</invoke>\n"
+        "</minimax:tool_call>"
+    )
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[BASH_TOOL],
+        model="MiniMax-M1",
+        adapter=MINIMAX_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments["command"] == "printf '%s\\n' \"hi\""
+
+
+def test_minimax_string_typed_shell_arguments_preserve_literal_values():
+    commands = (
+        "true",
+        "123",
+        "null",
+        '"./script with spaces.sh" --flag',
+    )
+
+    for command in commands:
+        content = (
+            "<minimax:tool_call>\n"
+            '<invoke name="Bash">\n'
+            f'<parameter name="command">{command}</parameter>\n'
+            "</invoke>\n"
+            "</minimax:tool_call>"
+        )
+        tool_calls, remaining = extract_tool_calls(
+            content,
+            tools=[BASH_TOOL],
+            model="MiniMax-M1",
+            adapter=MINIMAX_ADAPTER,
+        )
+        arguments = json.loads(tool_calls[0]["function"]["arguments"])
+        assert remaining is None
+        assert arguments["command"] == command
+        assert isinstance(arguments["command"], str)
+
+
 def test_deepseek_v4_dsml_tool_calls_are_recovered():
     content = (
         "<｜DSML｜tool_calls>\n"
@@ -413,6 +801,74 @@ def test_deepseek_v4_dsml_tool_calls_are_recovered():
     assert remaining is None
     assert tool_calls[0]["function"]["name"] == "Read"
     assert arguments == {"file_path": "f:\\onedrive-vercel\\app\\package.json", "limit": 80}
+
+
+def test_deepseek_fallback_json_shell_command_preserves_backslash_escapes():
+    content = (
+        r'''<tool_call>{"name": "Bash", "arguments": {"command": '''
+        r'''"printf '%s\\n' \"hi\""}}}</tool_call>'''
+    )
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[BASH_TOOL],
+        model="deepseek-pro",
+        adapter=DEEPSEEK_V4_PRO_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments["command"] == "printf '%s\\n' \"hi\""
+
+
+def test_deepseek_fallback_valid_json_preserves_explicit_json_argument_types():
+    content = (
+        '<tool_call>{"name": "union_runner", "arguments": '
+        '{"payload": true, "count": "123", "flag": "true"}}</tool_call>'
+    )
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[UNION_SCHEMA_TOOL],
+        model="deepseek-pro",
+        adapter=DEEPSEEK_V4_PRO_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments == {"payload": True, "count": "123", "flag": "true"}
+
+
+def test_deepseek_fallback_valid_json_uses_anyof_schema_name_but_preserves_types():
+    content = (
+        '<tool_call>{"name": "ANYOF_RUNNER", "arguments": '
+        '{"payload": true, "count": "123"}}</tool_call>'
+    )
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[ANYOF_SCHEMA_TOOL],
+        model="deepseek-pro",
+        adapter=DEEPSEEK_V4_PRO_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert tool_calls[0]["function"]["name"] == "anyof_runner"
+    assert arguments == {"payload": True, "count": "123"}
+
+
+def test_deepseek_fallback_xml_arguments_preserve_explicit_json_types_and_canonical_name():
+    content = (
+        "<tool_call>"
+        "<name>ANYOF_RUNNER</name>"
+        '<arguments>{"payload": true, "count": "123"}</arguments>'
+        "</tool_call>"
+    )
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[ANYOF_SCHEMA_TOOL],
+        model="deepseek-pro",
+        adapter=DEEPSEEK_V4_PRO_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert tool_calls[0]["function"]["name"] == "anyof_runner"
+    assert arguments == {"payload": True, "count": "123"}
 
 
 def test_json_tool_call_with_shell_regex_backslashes_is_recovered():
@@ -467,6 +923,74 @@ def test_bare_claude_code_arg_key_tool_call_is_recovered_for_non_streaming():
     assert remaining == "I will inspect it."
     assert tool_calls[0]["function"]["name"] == "Bash"
     assert json.loads(tool_calls[0]["function"]["arguments"]) == {"command": "npm audit 2>&1"}
+
+
+def test_inline_shell_command_uses_schema_and_preserves_shell_quotes():
+    cases = (
+        ("Bash command: true", "command", "true"),
+        (
+            'Bash command: "./script with spaces.sh" --flag',
+            "command",
+            '"./script with spaces.sh" --flag',
+        ),
+        (
+            'Bash command: "./script with spaces.sh" "arg value"',
+            "command",
+            '"./script with spaces.sh" "arg value"',
+        ),
+    )
+
+    for content, key, expected in cases:
+        tool_calls, remaining = extract_tool_calls(
+            content,
+            tools=[BASH_TOOL],
+            model="chatglm",
+            adapter=GLM_5_2_ADAPTER,
+        )
+        arguments = json.loads(tool_calls[0]["function"]["arguments"])
+        assert remaining is None
+        assert arguments[key] == expected
+        assert isinstance(arguments[key], str)
+
+
+def test_inline_non_shell_string_arguments_still_unquote_jsonish_values():
+    content = 'Glob pattern: "**/package.json" path: "src"'
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[GLOB_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments == {"pattern": "**/package.json", "path": "src"}
+
+
+def test_inline_shell_heredoc_command_collects_body():
+    expected = "python - <<'PY'\nprint(\"hi\")\nPY"
+    content = "Bash command: " + expected
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[BASH_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments["command"] == expected
+
+
+def test_claude_code_transcript_out_marker_without_trailing_newline_is_removed():
+    content = "Bash\nIN\nprintf '%s\\n' \"hi\"\nOUT\n"
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[BASH_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert arguments["command"] == "printf '%s\\n' \"hi\""
 
 
 def test_mixed_claude_code_transcript_and_xml_tool_calls_are_recovered():
@@ -803,15 +1327,36 @@ if __name__ == "__main__":
     test_claude_code_arg_value_tool_call_body_is_recovered()
     test_claude_code_close_only_arg_value_tool_call_body_is_recovered()
     test_glm_official_arg_key_tool_call_is_recovered()
+    test_glm_arg_value_shell_command_preserves_trailing_quote()
     test_glm_malformed_reversed_arg_value_tool_call_is_recovered()
+    test_glm_malformed_reversed_shell_command_preserves_trailing_quote()
+    test_glm_string_typed_shell_arguments_preserve_literal_values()
+    test_glm_close_only_shell_command_preserves_leading_quote()
+    test_string_arguments_are_preserved_for_unknown_tool_names()
+    test_inline_heredoc_arguments_are_preserved_for_unknown_tool_names()
+    test_transcript_input_maps_to_single_required_argument_without_tool_name_special_case()
+    test_xml_untyped_arguments_default_to_literal_strings()
+    test_nullable_schema_types_are_normalized_before_parsing()
+    test_json_tool_call_paths_preserve_explicit_json_argument_types()
+    test_anyof_schema_types_are_used_for_text_arguments_only()
     test_glm_bare_malformed_reversed_arg_value_tool_call_is_recovered()
     test_glm_empty_argument_tool_call_is_recovered()
     test_glm_bare_required_tool_call_is_forwarded_with_empty_arguments()
     test_minimax_official_tool_call_is_recovered()
+    test_minimax_xml_shell_command_preserves_trailing_quote()
+    test_minimax_string_typed_shell_arguments_preserve_literal_values()
     test_deepseek_v4_dsml_tool_calls_are_recovered()
+    test_deepseek_fallback_json_shell_command_preserves_backslash_escapes()
+    test_deepseek_fallback_valid_json_preserves_explicit_json_argument_types()
+    test_deepseek_fallback_valid_json_uses_anyof_schema_name_but_preserves_types()
+    test_deepseek_fallback_xml_arguments_preserve_explicit_json_types_and_canonical_name()
     test_json_tool_call_with_shell_regex_backslashes_is_recovered()
     test_jsonish_tool_call_with_unescaped_command_quotes_is_recovered()
     test_bare_claude_code_arg_key_tool_call_is_recovered_for_non_streaming()
+    test_inline_shell_command_uses_schema_and_preserves_shell_quotes()
+    test_inline_non_shell_string_arguments_still_unquote_jsonish_values()
+    test_inline_shell_heredoc_command_collects_body()
+    test_claude_code_transcript_out_marker_without_trailing_newline_is_removed()
     test_mixed_claude_code_transcript_and_xml_tool_calls_are_recovered()
     test_deepseek_mixed_transcript_and_dsml_prefers_dsml_calls()
     test_streaming_detection_keeps_claude_code_tool_name_prefix()

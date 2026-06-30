@@ -421,13 +421,18 @@ def _output_to_text(output) -> str:
 
 def _local_shell_call_to_chat_message(item: dict) -> dict:
     action = item.get("action") or {}
+    if not isinstance(action, dict):
+        action = {}
     exec_action = (
         action
         if action.get("type") == "exec"
         else action.get("exec") or action.get("Exec") or {}
     )
+    if not isinstance(exec_action, dict):
+        exec_action = {}
+    command = exec_action["command"] if "command" in exec_action else []
     arguments = {
-        "command": " ".join(exec_action.get("command") or []),
+        "command": command,
         "timeout_ms": exec_action.get("timeout_ms"),
         "working_directory": exec_action.get("working_directory"),
     }

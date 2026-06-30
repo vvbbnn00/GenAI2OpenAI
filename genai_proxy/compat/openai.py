@@ -208,13 +208,13 @@ def _parse_tool_call_body(raw, tools=None):
 
     raw = re.sub(r"</?arg_value>", "", raw).strip()
 
-    call = _load_tool_call_json(raw)
+    call = _load_tool_call_json(raw, tools)
     if call:
         return call
 
     json_obj = _extract_first_json_object(raw)
     if json_obj:
-        call = _load_tool_call_json(json_obj)
+        call = _load_tool_call_json(json_obj, tools)
         if call:
             return call
 
@@ -230,6 +230,7 @@ def _parse_tool_call_body(raw, tools=None):
     args_m = re.search(r"<arguments>\s*(.*?)\s*</arguments>", raw, re.DOTALL)
     if name_m:
         name = name_m.group(1).strip()
+        name = _canonical_tool_name(name, tools) or name
         arguments = {}
         if args_m:
             args_str = args_m.group(1).strip()
@@ -237,6 +238,7 @@ def _parse_tool_call_body(raw, tools=None):
                 arguments = json.loads(args_str)
             except (json.JSONDecodeError, ValueError):
                 arguments = {"raw": args_str}
+        arguments = _normalize_arguments(arguments)
         return {"name": name, "arguments": arguments}
 
     return None
@@ -254,7 +256,7 @@ def _parse_bare_tool_name_call(raw: str, tools=None):
     return {"name": name, "arguments": {}}
 
 
-def _load_tool_call_json(raw: str):
+def _load_tool_call_json(raw: str, tools=None):
     candidates = [raw]
     repaired = _escape_invalid_json_backslashes(raw)
     if repaired != raw:
@@ -266,6 +268,11 @@ def _load_tool_call_json(raw: str):
         except (json.JSONDecodeError, ValueError):
             continue
         if isinstance(call, dict) and "name" in call:
+            name = call.get("name")
+            if isinstance(name, str):
+                canonical_name = _canonical_tool_name(name, tools)
+                if canonical_name:
+                    call["name"] = canonical_name
             call["arguments"] = _normalize_arguments(call.get("arguments", {}))
             return call
     return None
@@ -293,7 +300,10 @@ def _repair_jsonish_tool_call(raw: str, tools=None):
         args_end = outer_end
 
     arguments_body = raw[body_start:args_end].strip()
-    arguments = _parse_lenient_key_value_pairs(arguments_body)
+    arguments = _parse_lenient_key_value_pairs(
+        arguments_body,
+        argument_types=_tool_argument_types(name, tools),
+    )
     if arguments is None:
         return None
     return {"name": name, "arguments": arguments}
@@ -395,27 +405,34 @@ def _parse_arg_key_tool_call(raw: str, tools=None):
     if name is None:
         return None
 
+    argument_types = _tool_argument_types(name, tools)
     arguments = _parse_arg_key_arguments(
         match.group("arguments"),
-        arg_keys=_tool_argument_names(name, tools),
+        arg_keys=list(argument_types),
+        argument_types=argument_types,
     )
     if arguments is None:
         return None
     return {"name": name, "arguments": arguments}
 
 
-def _parse_arg_key_arguments(raw: str, arg_keys=None):
+def _parse_arg_key_arguments(raw: str, arg_keys=None, argument_types=None):
     raw = raw.strip()
     if not raw:
         return {}
 
+    argument_types = argument_types or {}
     if "<arg_value>" in raw:
-        arg_value_args = _parse_arg_value_arguments(raw)
+        arg_value_args = _parse_arg_value_arguments(raw, argument_types=argument_types)
         if arg_value_args is not None:
             return arg_value_args
     elif "</arg_value>" in raw:
         close_only_raw = re.sub(r"^\s*<arg_key>\s*", "", raw)
-        close_only_args = _parse_close_only_arg_value_arguments(close_only_raw, arg_keys or [])
+        close_only_args = _parse_close_only_arg_value_arguments(
+            close_only_raw,
+            arg_keys or [],
+            argument_types=argument_types,
+        )
         if close_only_args is not None:
             return close_only_args
 
@@ -429,16 +446,17 @@ def _parse_arg_key_arguments(raw: str, arg_keys=None):
     try:
         parsed = json.loads(object_text)
         if isinstance(parsed, dict):
-            return parsed
+            return _coerce_jsonish_arguments(parsed, argument_types)
     except json.JSONDecodeError:
         pass
 
-    return _parse_lenient_key_value_pairs(jsonish)
+    return _parse_lenient_key_value_pairs(jsonish, argument_types=argument_types)
 
 
-def _parse_arg_value_arguments(raw: str):
+def _parse_arg_value_arguments(raw: str, argument_types=None):
     text = raw.strip()
-    reversed_args = _parse_reversed_arg_value_arguments(text)
+    argument_types = argument_types or {}
+    reversed_args = _parse_reversed_arg_value_arguments(text, argument_types=argument_types)
     if reversed_args is not None:
         return reversed_args
 
@@ -457,11 +475,16 @@ def _parse_arg_value_arguments(raw: str):
 
     arguments = {}
     for match in matches:
-        arguments[match.group("key")] = _parse_jsonish_scalar(match.group("value").strip())
+        key = match.group("key")
+        arguments[key] = _parse_xml_argument_scalar(
+            match.group("value").strip(),
+            argument_types.get(key),
+        )
     return arguments
 
 
-def _parse_reversed_arg_value_arguments(raw: str):
+def _parse_reversed_arg_value_arguments(raw: str, argument_types=None):
+    argument_types = argument_types or {}
     matches = list(
         re.finditer(
             r"<arg_value>\s*\"?(?P<key>[A-Za-z_][\w./@-]*)\"?\s*</arg_key>\s*"
@@ -478,18 +501,24 @@ def _parse_reversed_arg_value_arguments(raw: str):
         value = match.group("value").strip()
         if value.endswith("</arg_value>"):
             value = value[: -len("</arg_value>")].strip()
-        arguments[match.group("key")] = _parse_jsonish_scalar(value)
+        key = match.group("key")
+        arguments[key] = _parse_xml_argument_scalar(value, argument_types.get(key))
     return arguments
 
 
-def _parse_close_only_arg_value_arguments(raw: str, arg_keys):
+def _parse_close_only_arg_value_arguments(raw: str, arg_keys, argument_types=None):
     chunks = [chunk.strip() for chunk in raw.split("</arg_value>") if chunk.strip()]
     if not chunks:
         return None
 
+    argument_types = argument_types or {}
     arguments = {}
     for chunk in chunks:
-        parsed = _split_close_only_argument(chunk, arg_keys)
+        parsed = _split_close_only_argument(
+            chunk,
+            arg_keys,
+            argument_types=argument_types,
+        )
         if not parsed:
             return None
         key, value = parsed
@@ -497,19 +526,32 @@ def _parse_close_only_arg_value_arguments(raw: str, arg_keys):
     return arguments
 
 
-def _split_close_only_argument(chunk: str, arg_keys):
+def _split_close_only_argument(chunk: str, arg_keys, argument_types=None):
+    argument_types = argument_types or {}
     for key in sorted(arg_keys, key=len, reverse=True):
         if chunk == key:
             return key, ""
-        if chunk.startswith(f"{key} ") or chunk.startswith(f"{key}:") or chunk.startswith(f'{key}"'):
+        if chunk.startswith(f"{key} "):
+            value = chunk[len(key) :].strip()
+            return key, _parse_xml_argument_scalar(value, argument_types.get(key))
+        if chunk.startswith(f"{key}:") or chunk.startswith(f'{key}"'):
             value = chunk[len(key) :].strip()
             value = re.sub(r'^"?\s*:\s*', "", value).strip()
-            return key, _parse_jsonish_scalar(value)
+            return key, _parse_jsonish_argument_scalar(
+                value,
+                argument_types.get(key),
+                strip_unclosed_string=True,
+            )
 
     match = re.match(r"\"?(?P<key>[A-Za-z_][\w./@-]*)\"?\s*(?::\s*)?(?P<value>.*)$", chunk, re.DOTALL)
     if not match:
         return None
-    return match.group("key"), _parse_jsonish_scalar(match.group("value").strip())
+    key = match.group("key")
+    return key, _parse_jsonish_argument_scalar(
+        match.group("value").strip(),
+        argument_types.get(key),
+        strip_unclosed_string=True,
+    )
 
 
 def _quote_jsonish_keys(text: str) -> str:
@@ -524,12 +566,13 @@ def _escape_invalid_json_backslashes(text: str) -> str:
     return re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", text)
 
 
-def _parse_lenient_key_value_pairs(text: str):
+def _parse_lenient_key_value_pairs(text: str, argument_types=None):
     key_pattern = re.compile(r"(^|,)\s*\"?([A-Za-z_][\w./@-]*)\"?\s*:\s*")
     matches = list(key_pattern.finditer(text))
     if not matches:
         return None
 
+    argument_types = argument_types or {}
     arguments = {}
     for index, match in enumerate(matches):
         value_start = match.end()
@@ -537,9 +580,93 @@ def _parse_lenient_key_value_pairs(text: str):
         raw_value = text[value_start:value_end].strip()
         if raw_value.endswith(","):
             raw_value = raw_value[:-1].strip()
-        arguments[match.group(2)] = _parse_jsonish_scalar(raw_value)
+        key = match.group(2)
+        arguments[key] = _parse_jsonish_argument_scalar(
+            raw_value,
+            argument_types.get(key),
+            strip_unclosed_string=True,
+        )
 
     return arguments
+
+
+def _parse_xml_argument_scalar(raw: str, expected_type: str | None = None):
+    value = raw.strip()
+    if expected_type in {None, "string"}:
+        return value
+    return _parse_typed_value(value, expected_type)
+
+
+def _parse_jsonish_argument_scalar(
+    raw: str,
+    expected_type: str | None = None,
+    *,
+    strip_unclosed_string: bool = False,
+):
+    value = raw.strip()
+    if expected_type in {None, "string"}:
+        return _parse_jsonish_string_scalar(
+            value,
+            strip_unclosed_string=strip_unclosed_string,
+        )
+    return _parse_typed_value(value, expected_type)
+
+
+def _parse_jsonish_string_scalar(raw: str, *, strip_unclosed_string: bool = False):
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        candidate = _escape_invalid_json_backslashes(value)
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, str) else str(parsed)
+        except json.JSONDecodeError:
+            return value[1:-1] if strip_unclosed_string else value
+    if value.startswith('"') and not value.endswith('"'):
+        if strip_unclosed_string and not _has_unescaped_quote_after_start(value):
+            return value[1:]
+        return value
+    return value
+
+
+def _coerce_jsonish_arguments(arguments: dict, argument_types: dict[str, str | None]):
+    if not argument_types:
+        return arguments
+    coerced = {}
+    for key, value in arguments.items():
+        expected_type = argument_types.get(key)
+        if expected_type == "string":
+            coerced[key] = _coerce_string_value(value)
+        elif expected_type and isinstance(value, str):
+            coerced[key] = _parse_typed_value(value, expected_type)
+        else:
+            coerced[key] = value
+    return coerced
+
+
+def _coerce_string_value(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return str(value).lower()
+    if value is None:
+        return "null"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _has_unescaped_quote_after_start(text: str) -> bool:
+    escaped = False
+    for char in text[1:]:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            return True
+    return False
 
 
 def _parse_jsonish_scalar(raw: str):
@@ -552,8 +679,6 @@ def _parse_jsonish_scalar(raw: str):
             return value[1:-1]
     if value.startswith('"') and not value.endswith('"'):
         return value[1:]
-    if value.endswith('"') and not value.startswith('"'):
-        return value[:-1]
 
     lowered = value.lower()
     if lowered == "true":
@@ -611,6 +736,22 @@ def _tool_argument_names(name: str, tools=None) -> list[str]:
     return list(_tool_argument_types(name, tools))
 
 
+def _tool_required_argument_names(name: str, tools=None) -> list[str]:
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function_data = tool.get("function", {})
+        if not isinstance(function_data, dict):
+            function_data = {}
+        tool_name = function_data.get("name") or tool.get("name")
+        if tool_name != name:
+            continue
+        parameters = function_data.get("parameters", {}) or tool.get("input_schema", {})
+        required = parameters.get("required", []) if isinstance(parameters, dict) else []
+        return required if isinstance(required, list) else []
+    return []
+
+
 def _tool_argument_types(name: str, tools=None) -> dict[str, str | None]:
     for tool in tools or []:
         if not isinstance(tool, dict):
@@ -625,10 +766,42 @@ def _tool_argument_types(name: str, tools=None) -> dict[str, str | None]:
         properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
         if isinstance(properties, dict):
             return {
-                key: value.get("type") if isinstance(value, dict) else None
+                key: _schema_property_type(value)
                 for key, value in properties.items()
             }
     return {}
+
+
+def _schema_property_type(property_schema) -> str | None:
+    if not isinstance(property_schema, dict):
+        return None
+
+    schema_type = property_schema.get("type")
+    if isinstance(schema_type, str):
+        return schema_type
+    if isinstance(schema_type, list):
+        type_names = [item for item in schema_type if isinstance(item, str)]
+        if "string" in type_names:
+            return "string"
+        non_null_types = [item for item in type_names if item != "null"]
+        if len(non_null_types) == 1:
+            return non_null_types[0]
+    for union_key in ("anyOf", "oneOf"):
+        union_schemas = property_schema.get(union_key)
+        if isinstance(union_schemas, list):
+            union_types = [
+                _schema_property_type(item)
+                for item in union_schemas
+                if isinstance(item, dict)
+            ]
+            if "string" in union_types:
+                return "string"
+            non_null_types = [
+                item for item in union_types if item and item != "null"
+            ]
+            if len(set(non_null_types)) == 1:
+                return non_null_types[0]
+    return None
 
 
 def _parse_typed_value(value: str, expected_type: str | None):
@@ -825,7 +998,7 @@ def _parse_minimax_parameters(name: str, body: str, tools=None):
     for parameter in parameter_pattern.finditer(body):
         key = parameter.group("key")
         value = parameter.group("value").strip()
-        arguments[key] = _parse_typed_value(value, argument_types.get(key))
+        arguments[key] = _parse_xml_argument_scalar(value, argument_types.get(key))
     return arguments
 
 
@@ -859,6 +1032,12 @@ def _find_inline_tool_argument_blocks(content: str, tools=None, occupied_spans=N
 
         name, arguments = parsed
         end_index = line_index + 1
+        end_index = _consume_inline_heredoc_arguments(
+            arguments,
+            _tool_argument_types(name, tools),
+            lines,
+            end_index,
+        )
         while end_index < len(lines):
             next_stripped = lines[end_index].strip()
             if not next_stripped:
@@ -876,6 +1055,44 @@ def _find_inline_tool_argument_blocks(content: str, tools=None, occupied_spans=N
         spans.append((line_start, block_end))
 
     return blocks, spans
+
+
+def _consume_inline_heredoc_arguments(
+    arguments: dict,
+    argument_types: dict[str, str | None],
+    lines: list[str],
+    start_index: int,
+) -> int:
+    for key, value in list(arguments.items()):
+        if argument_types.get(key) != "string" or not isinstance(value, str):
+            continue
+        delimiter = _extract_heredoc_delimiter(value)
+        if not delimiter:
+            continue
+
+        collected = []
+        end_index = start_index
+        while end_index < len(lines):
+            line_value = lines[end_index].rstrip("\r\n")
+            collected.append(line_value)
+            end_index += 1
+            if line_value.strip() == delimiter:
+                arguments[key] = value + "\n" + "\n".join(collected)
+                return end_index
+
+    return start_index
+
+
+def _extract_heredoc_delimiter(value: str) -> str | None:
+    matches = list(
+        re.finditer(
+            r"<<-?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][\w.-]*)(?P=quote)",
+            value,
+        )
+    )
+    if not matches:
+        return None
+    return matches[-1].group("delimiter")
 
 
 def _parse_inline_tool_line(line: str, tools=None):
@@ -903,6 +1120,7 @@ def _parse_inline_argument_text(name: str, text: str, tools=None):
     argument_names = _tool_argument_names(name, tools)
     if not argument_names:
         return None
+    argument_types = _tool_argument_types(name, tools)
 
     key_pattern = "|".join(re.escape(key) for key in sorted(argument_names, key=len, reverse=True))
     matches = list(
@@ -924,7 +1142,10 @@ def _parse_inline_argument_text(name: str, text: str, tools=None):
         raw_value = text[value_start:value_end].strip()
         if not raw_value:
             return None
-        arguments[key] = _parse_jsonish_scalar(raw_value)
+        arguments[key] = _parse_jsonish_argument_scalar(
+            raw_value,
+            argument_types.get(key),
+        )
     return arguments
 
 
@@ -999,7 +1220,7 @@ def _find_claude_code_transcript_tool_blocks(content: str, tools=None, occupied_
 
 def _find_transcript_out_marker(content: str, start: int, end: int) -> tuple[int, int] | None:
     search_area = content[start:end]
-    match = re.search(r"(?:\r?\n)OUT(?:\r?\n)", search_area)
+    match = re.search(r"(?:\r?\n)OUT(?:\r?\n|$)", search_area)
     if not match:
         return None
     return start + match.start(), start + match.end()
@@ -1018,13 +1239,24 @@ def _transcript_tool_arguments(name: str, raw_input: str, tools=None, label: str
             pass
 
     argument_names = _tool_argument_names(name, tools)
-    if name.lower() == "bash" and "command" in argument_names:
-        arguments = {"command": raw_input}
-        if label and "description" in argument_names:
+    argument_types = _tool_argument_types(name, tools)
+    required_names = _tool_required_argument_names(name, tools)
+    target_names = required_names if len(required_names) == 1 else argument_names
+    if len(target_names) == 1:
+        target_name = target_names[0]
+        arguments = {
+            target_name: _parse_xml_argument_scalar(
+                raw_input,
+                argument_types.get(target_name),
+            )
+        }
+        if (
+            label
+            and "description" in argument_names
+            and target_name != "description"
+        ):
             arguments["description"] = label
         return arguments
-    if len(argument_names) == 1:
-        return {argument_names[0]: raw_input}
     return None
 
 

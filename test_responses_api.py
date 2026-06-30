@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from genai_proxy.app import create_app
+from genai_proxy.compat.responses import convert_responses_to_openai_request
 from genai_proxy.services.genai import GenAIService
 
 
@@ -215,6 +216,89 @@ def test_responses_input_accepts_easy_message_without_type():
 
     assert completed_event(events)["end_turn"] is True
     assert captured[0]["messages"][-1] == {"role": "user", "content": "hi"}
+
+
+def test_responses_local_shell_call_preserves_command_argv():
+    service, captured, fake_post = make_service(
+        [
+            genai_sse({"content": "Done"}),
+            genai_sse({}, "stop"),
+        ]
+    )
+    command = ["python", "-c", "print('quoted arg')", "path with spaces"]
+    request = {
+        "model": "chatglm",
+        "input": [
+            {
+                "type": "local_shell_call",
+                "call_id": "call_shell",
+                "action": {
+                    "type": "exec",
+                    "command": command,
+                    "timeout_ms": 1000,
+                    "working_directory": "/tmp/work dir",
+                },
+            },
+            {"type": "message", "role": "user", "content": "continue"},
+        ],
+        "stream": True,
+    }
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        events = parse_response_events(service.stream_responses(request))
+
+    assert completed_event(events)["end_turn"] is True
+    tool_message = next(message for message in captured[0]["messages"] if message.get("tool_calls"))
+    arguments = json.loads(tool_message["tool_calls"][0]["function"]["arguments"])
+    assert arguments == {
+        "command": command,
+        "timeout_ms": 1000,
+        "working_directory": "/tmp/work dir",
+    }
+
+    context = convert_responses_to_openai_request(
+        {
+            "model": "chatglm",
+            "input": [
+                {
+                    "type": "local_shell_call",
+                    "call_id": "call_empty",
+                    "action": {"type": "exec", "command": ""},
+                },
+                {"type": "message", "role": "user", "content": "continue"},
+            ],
+        }
+    )
+    empty_tool_message = next(
+        message for message in context.openai_request["messages"] if message.get("tool_calls")
+    )
+    empty_arguments = json.loads(
+        empty_tool_message["tool_calls"][0]["function"]["arguments"]
+    )
+    assert empty_arguments["command"] == ""
+
+    malformed_context = convert_responses_to_openai_request(
+        {
+            "model": "chatglm",
+            "input": [
+                {
+                    "type": "local_shell_call",
+                    "call_id": "call_malformed",
+                    "action": "not an object",
+                },
+                {"type": "message", "role": "user", "content": "continue"},
+            ],
+        }
+    )
+    malformed_tool_message = next(
+        message
+        for message in malformed_context.openai_request["messages"]
+        if message.get("tool_calls")
+    )
+    malformed_arguments = json.loads(
+        malformed_tool_message["tool_calls"][0]["function"]["arguments"]
+    )
+    assert malformed_arguments["command"] == []
 
 
 def test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item():
@@ -502,6 +586,7 @@ def test_responses_ignores_hosted_tools_codex_may_send_by_default():
 if __name__ == "__main__":
     test_responses_text_stream_emits_codex_events_and_reasoning_delta()
     test_responses_input_accepts_easy_message_without_type()
+    test_responses_local_shell_call_preserves_command_argv()
     test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item()
     test_responses_function_call_output_turn_returns_final_message()
     test_responses_custom_apply_patch_tool_becomes_custom_tool_call_with_input_delta()

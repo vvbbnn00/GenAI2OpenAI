@@ -1,5 +1,6 @@
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from genai_proxy.compat.claude import (
@@ -8,6 +9,7 @@ from genai_proxy.compat.claude import (
     stream_openai_to_claude,
 )
 from genai_proxy.errors import ProxyError
+from genai_proxy.routes.claude import map_claude_model_alias
 from genai_proxy.services.genai import GenAIService
 
 
@@ -48,6 +50,20 @@ CLAUDE_WEATHER_TOOL = {
         "type": "object",
         "properties": {"location": {"type": "string"}},
         "required": ["location"],
+    },
+}
+
+CLAUDE_BASH_TOOL = {
+    "name": "Bash",
+    "description": "Run a shell command.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string"},
+            "description": {"type": "string"},
+            "timeout": {"type": "integer"},
+        },
+        "required": ["command"],
     },
 }
 
@@ -98,17 +114,18 @@ class FakeResponse:
         pass
 
 
-def make_service(lines):
+def make_service(lines, record=None):
     captured = []
 
     def fake_post(_url, **kwargs):
         captured.append(kwargs["json"])
         return FakeResponse(lines)
 
+    model_manager = FakeModelManager(record)
     service = GenAIService(
         logging.getLogger("test_glm52_service"),
         FakeTokenManager(),
-        FakeModelManager(),
+        model_manager,
     )
     return service, captured, fake_post
 
@@ -158,6 +175,26 @@ def first_tool_call(response):
     tool_calls = message.get("tool_calls") or []
     assert tool_calls, json.dumps(response, ensure_ascii=False)
     return tool_calls[0]
+
+
+def claude_tool_input_from_events(events, tool_name):
+    tool_indices = set()
+    for event in events:
+        if event["event"] != "content_block_start":
+            continue
+        block = event["data"].get("content_block", {})
+        if block.get("type") == "tool_use" and block.get("name") == tool_name:
+            tool_indices.add(event["data"]["index"])
+
+    for event in events:
+        if event["event"] != "content_block_delta":
+            continue
+        if event["data"].get("index") not in tool_indices:
+            continue
+        delta = event["data"].get("delta", {})
+        if delta.get("type") == "input_json_delta":
+            return json.loads(delta.get("partial_json") or "{}")
+    raise AssertionError(json.dumps(events, ensure_ascii=False))
 
 
 def test_glm52_downgrades_unsupported_reasoning_effort_to_none():
@@ -580,6 +617,97 @@ def test_claude_streaming_bare_required_tool_name_is_forwarded_as_tool_use():
     )
 
 
+def test_claude_non_stream_bash_tool_preserves_shell_string_arguments():
+    model_manager = FakeModelManager()
+    commands = (
+        "true",
+        "printf '%s\\n' \"hi\"",
+        '"./script with spaces.sh" --flag',
+    )
+
+    for command in commands:
+        service, _captured, fake_post = make_service(
+            [
+                sse_line(
+                    {
+                        "content": (
+                            "<tool_call>Bash"
+                            f"<arg_key>command</arg_key><arg_value>{command}</arg_value>"
+                            "</tool_call>"
+                        )
+                    }
+                ),
+                sse_line({}, "stop"),
+            ]
+        )
+        claude_request = {
+            "model": "chatglm",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Use Bash."}],
+            "tools": [CLAUDE_BASH_TOOL],
+            "tool_choice": {"type": "tool", "name": "Bash"},
+        }
+        openai_request = convert_claude_to_openai(claude_request, model_manager)
+
+        with patch("genai_proxy.services.genai.requests.post", fake_post):
+            openai_response = service.build_openai_completion(openai_request)
+
+        response = convert_openai_to_claude_response(
+            openai_response,
+            {**claude_request, "_estimator_model": "chatglm"},
+        )
+        tool_blocks = [block for block in response["content"] if block.get("type") == "tool_use"]
+        assert tool_blocks
+        assert tool_blocks[0]["name"] == "Bash"
+        assert tool_blocks[0]["input"]["command"] == command
+        assert isinstance(tool_blocks[0]["input"]["command"], str)
+        assert response["stop_reason"] == "tool_use"
+
+
+def test_claude_streaming_bash_tool_preserves_heredoc_input_json_delta():
+    model_manager = FakeModelManager()
+    command = "python - <<'PY'\nprint(\"hi\")\nPY"
+    service, _captured, fake_post = make_service(
+        [
+            sse_line(
+                {
+                    "content": (
+                        "<tool_call>Bash"
+                        f"<arg_key>command</arg_key><arg_value>{command}</arg_value>"
+                        "</tool_call>"
+                    )
+                }
+            ),
+            sse_line({}, "stop"),
+        ]
+    )
+    claude_request = {
+        "model": "chatglm",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "Use Bash."}],
+        "tools": [CLAUDE_BASH_TOOL],
+        "tool_choice": {"type": "tool", "name": "Bash"},
+        "stream": True,
+    }
+    openai_request = convert_claude_to_openai(claude_request, model_manager)
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        events = parse_claude_events(
+            stream_openai_to_claude(
+                service.stream_openai_completion(openai_request),
+                {**claude_request, "_estimator_model": "chatglm"},
+                logging.getLogger("test_glm52_service"),
+            )
+        )
+
+    assert claude_tool_input_from_events(events, "Bash") == {"command": command}
+    assert any(
+        event["event"] == "message_delta"
+        and event["data"].get("delta", {}).get("stop_reason") == "tool_use"
+        for event in events
+    )
+
+
 def test_claude_messages_accepts_system_role_message_from_harness():
     model_manager = FakeModelManager()
     claude_request = {
@@ -626,6 +754,115 @@ def test_claude_rejects_non_official_output_config_effort():
         raise AssertionError("non-Claude output_config effort did not fail")
 
 
+def test_claude_model_alias_route_uses_configured_genai_models():
+    config = SimpleNamespace(
+        claude_haiku_model="deepseek-chat",
+        claude_sonnet_model="chatglm",
+        claude_opus_model="MiniMax-M1",
+    )
+
+    assert map_claude_model_alias("claude-3-haiku", config) == "deepseek-chat"
+    assert map_claude_model_alias("claude-3-5-sonnet", config) == "chatglm"
+    assert map_claude_model_alias("claude-3-opus", config) == "MiniMax-M1"
+    assert map_claude_model_alias("chatglm", config) == "chatglm"
+
+
+def test_claude_route_preserves_shell_strings_across_target_adapters():
+    command = "printf '%s\\n' \"hi\""
+    cases = (
+        (
+            {
+                "aiType": "chatglm",
+                "aiName": "GLM",
+                "descInfo": "GLM 5.2",
+                "rootModelName": "Xinference",
+                "rootAiType": "xinference",
+            },
+            (
+                "<tool_call>Bash"
+                f"<arg_key>command</arg_key><arg_value>{command}</arg_value>"
+                "</tool_call>"
+            ),
+        ),
+        (
+            {
+                "aiType": "MiniMax-M1",
+                "aiName": "MiniMax",
+                "descInfo": "MiniMax 2.7",
+                "rootModelName": "Xinference",
+                "rootAiType": "xinference",
+            },
+            (
+                "<minimax:tool_call>"
+                '<invoke name="Bash">'
+                f'<parameter name="command">{command}</parameter>'
+                "</invoke>"
+                "</minimax:tool_call>"
+            ),
+        ),
+        (
+            {
+                "aiType": "deepseek-pro",
+                "aiName": "DeepSeek-V4-Pro",
+                "descInfo": "DeepSeek V4 Pro",
+                "rootModelName": "Xinference",
+                "rootAiType": "xinference",
+            },
+            "<tool_call>"
+            + json.dumps(
+                {"name": "Bash", "arguments": {"command": command}},
+                ensure_ascii=False,
+            )
+            + "</tool_call>",
+        ),
+        (
+            {
+                "aiType": "azure-model",
+                "aiName": "Azure Model",
+                "descInfo": "Generic OpenAI-compatible model",
+                "rootModelName": "Azure",
+                "rootAiType": "azure",
+            },
+            (
+                "<tool_call>Bash"
+                f"<arg_key>command</arg_key><arg_value>{command}</arg_value>"
+                "</tool_call>"
+            ),
+        ),
+    )
+
+    for record, upstream_content in cases:
+        model_manager = FakeModelManager(record)
+        service, _captured, fake_post = make_service(
+            [
+                sse_line({"content": upstream_content}),
+                sse_line({}, "stop"),
+            ],
+            record=record,
+        )
+        claude_request = {
+            "model": record["aiType"],
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Use Bash."}],
+            "tools": [CLAUDE_BASH_TOOL],
+            "tool_choice": {"type": "tool", "name": "Bash"},
+        }
+        openai_request = convert_claude_to_openai(claude_request, model_manager)
+
+        with patch("genai_proxy.services.genai.requests.post", fake_post):
+            openai_response = service.build_openai_completion(openai_request)
+
+        response = convert_openai_to_claude_response(
+            openai_response,
+            {**claude_request, "_estimator_model": record["aiType"]},
+        )
+        tool_blocks = [block for block in response["content"] if block.get("type") == "tool_use"]
+        assert tool_blocks
+        assert tool_blocks[0]["name"] == "Bash"
+        assert tool_blocks[0]["input"]["command"] == command
+        assert isinstance(tool_blocks[0]["input"]["command"], str)
+
+
 if __name__ == "__main__":
     test_glm52_downgrades_unsupported_reasoning_effort_to_none()
     test_openai_rejects_non_official_reasoning_effort_max()
@@ -640,6 +877,10 @@ if __name__ == "__main__":
     test_claude_output_config_effort_maps_to_glm52_openai_reasoning_and_tool_use()
     test_claude_streaming_tool_use_survives_glm52_reasoning_effort()
     test_claude_streaming_bare_required_tool_name_is_forwarded_as_tool_use()
+    test_claude_non_stream_bash_tool_preserves_shell_string_arguments()
+    test_claude_streaming_bash_tool_preserves_heredoc_input_json_delta()
     test_claude_messages_accepts_system_role_message_from_harness()
     test_claude_rejects_non_official_output_config_effort()
+    test_claude_model_alias_route_uses_configured_genai_models()
+    test_claude_route_preserves_shell_strings_across_target_adapters()
     print("glm52 service tests passed")

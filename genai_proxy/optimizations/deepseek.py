@@ -391,13 +391,24 @@ def _repair_tool_call_body(raw: str, tool_schemas: dict[str, dict[str, Any]]):
         return None
 
     name = name_match.group(1).strip()
-    arguments = _extract_arguments(raw, tool_schemas.get(name, {}))
+    name = _canonical_tool_name(name, tool_schemas)
+    arguments = _extract_arguments(raw)
     if arguments is None:
         return None
     return {"name": name, "arguments": arguments}
 
 
-def _extract_arguments(raw: str, schema: dict[str, Any]):
+def _canonical_tool_name(name: str, tool_schemas: dict[str, dict[str, Any]]) -> str:
+    if name in tool_schemas:
+        return name
+    lowered = name.lower()
+    for candidate in tool_schemas:
+        if candidate.lower() == lowered:
+            return candidate
+    return name
+
+
+def _extract_arguments(raw: str):
     xml_match = re.search(r"<arguments>\s*(.*?)\s*</arguments>", raw, re.DOTALL)
     if xml_match:
         raw_args = xml_match.group(1).strip()
@@ -421,46 +432,17 @@ def _extract_arguments(raw: str, schema: dict[str, Any]):
         return {}
 
     try:
+        parsed, _ = json.JSONDecoder().raw_decode(raw[idx:])
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    try:
         parsed, _ = _parse_lenient_json_object(raw, idx)
-        return _coerce_with_schema(parsed, schema)
+        return parsed
     except ValueError:
         return None
-
-
-def _coerce_with_schema(value: Any, schema: dict[str, Any]) -> Any:
-    if not isinstance(value, dict):
-        return value
-
-    properties = schema.get("properties", {})
-    if not isinstance(properties, dict):
-        return value
-
-    coerced = {}
-    for key, raw_value in value.items():
-        prop_schema = properties.get(key, {})
-        prop_type = prop_schema.get("type")
-        coerced[key] = _coerce_scalar(raw_value, prop_type)
-    return coerced
-
-
-def _coerce_scalar(value: Any, expected_type: str | None) -> Any:
-    if expected_type == "boolean" and isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered == "true":
-            return True
-        if lowered == "false":
-            return False
-    if expected_type == "integer" and isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError:
-            return value
-    if expected_type == "number" and isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError:
-            return value
-    return value
 
 
 def _parse_lenient_json_object(text: str, start: int):
