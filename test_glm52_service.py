@@ -536,6 +536,75 @@ def test_claude_streaming_tool_use_survives_glm52_reasoning_effort():
     )
 
 
+def test_claude_streaming_bare_required_tool_name_is_forwarded_as_tool_use():
+    model_manager = FakeModelManager()
+    service, _captured, fake_post = make_service(
+        [
+            sse_line({"content": "<tool_call>get_weather</tool_call>"}),
+            sse_line({}, "stop"),
+        ]
+    )
+    claude_request = {
+        "model": "chatglm",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "Use get_weather."}],
+        "tools": [CLAUDE_WEATHER_TOOL],
+        "stream": True,
+    }
+    openai_request = convert_claude_to_openai(claude_request, model_manager)
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        events = parse_claude_events(
+            stream_openai_to_claude(
+                service.stream_openai_completion(openai_request),
+                {**claude_request, "_estimator_model": "chatglm"},
+                logging.getLogger("test_glm52_service"),
+            )
+        )
+
+    tool_starts = [
+        event["data"]["content_block"]
+        for event in events
+        if event["event"] == "content_block_start"
+        and event["data"].get("content_block", {}).get("type") == "tool_use"
+    ]
+    assert tool_starts
+    assert tool_starts[0]["name"] == "get_weather"
+    assert tool_starts[0]["input"] == {}
+    assert any(
+        event["event"] == "message_delta"
+        and event["data"].get("delta", {}).get("stop_reason") == "tool_use"
+        for event in events
+    )
+
+
+def test_claude_messages_accepts_system_role_message_from_harness():
+    model_manager = FakeModelManager()
+    claude_request = {
+        "model": "chatglm",
+        "max_tokens": 1024,
+        "system": [{"type": "text", "text": "Top-level system."}],
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "Inspect the prompt."}],
+            },
+            {
+                "role": "system",
+                "content": "Available agent types for the Agent tool.",
+            },
+        ],
+    }
+
+    openai_request = convert_claude_to_openai(claude_request, model_manager)
+
+    assert openai_request["messages"] == [
+        {"role": "system", "content": "Top-level system."},
+        {"role": "user", "content": "Inspect the prompt."},
+        {"role": "system", "content": "Available agent types for the Agent tool."},
+    ]
+
+
 def test_claude_rejects_non_official_output_config_effort():
     model_manager = FakeModelManager()
     claude_request = {
@@ -568,5 +637,7 @@ if __name__ == "__main__":
     test_glm52_openai_stream_reasoning_content_passes_through_without_tools()
     test_claude_output_config_effort_maps_to_glm52_openai_reasoning_and_tool_use()
     test_claude_streaming_tool_use_survives_glm52_reasoning_effort()
+    test_claude_streaming_bare_required_tool_name_is_forwarded_as_tool_use()
+    test_claude_messages_accepts_system_role_message_from_harness()
     test_claude_rejects_non_official_output_config_effort()
     print("glm52 service tests passed")

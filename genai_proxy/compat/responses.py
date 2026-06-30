@@ -30,6 +30,9 @@ def convert_responses_to_openai_request(req_data: dict | None) -> ResponsesReque
     request_tools = list(req_data.get("tools") or [])
     request_tools.extend(_additional_tools_from_input(input_items))
     openai_tools, tool_map = _convert_responses_tools(request_tools)
+    tool_choice = req_data.get("tool_choice")
+    if tool_choice is None and _input_has_tool_output(input_items):
+        tool_choice = "none"
 
     messages = []
     instructions = req_data.get("instructions")
@@ -47,11 +50,11 @@ def convert_responses_to_openai_request(req_data: dict | None) -> ResponsesReque
     if openai_tools:
         openai_request["tools"] = openai_tools
         openai_request["tool_choice"] = _convert_tool_choice(
-            req_data.get("tool_choice"),
+            tool_choice,
             tool_map,
         )
-    elif req_data.get("tool_choice") in ("none", "required"):
-        openai_request["tool_choice"] = req_data["tool_choice"]
+    elif tool_choice in ("none", "required"):
+        openai_request["tool_choice"] = tool_choice
 
     if req_data.get("max_output_tokens") is not None:
         openai_request["max_tokens"] = req_data["max_output_tokens"]
@@ -288,6 +291,15 @@ def _additional_tools_from_input(input_items: list) -> list:
     return tools
 
 
+def _input_has_tool_output(input_items: list) -> bool:
+    return any(
+        isinstance(item, dict)
+        and item.get("type")
+        in {"function_call_output", "custom_tool_call_output", "tool_search_output"}
+        for item in input_items
+    )
+
+
 def _convert_response_input_items(
     input_items: list,
     tool_map: dict[str, ResponseToolMapping],
@@ -299,7 +311,7 @@ def _convert_response_input_items(
         item_type = item.get("type")
         if item_type == "additional_tools":
             continue
-        if item_type == "message":
+        if _is_response_message_item(item):
             role = _response_role_to_chat_role(item.get("role"))
             content = _content_to_text(item.get("content"))
             if content:
@@ -366,6 +378,14 @@ def _response_role_to_chat_role(role) -> str:
     return "user"
 
 
+def _is_response_message_item(item: dict) -> bool:
+    return item.get("type") == "message" or (
+        item.get("type") is None
+        and "role" in item
+        and "content" in item
+    )
+
+
 def _content_to_text(content) -> str:
     if isinstance(content, str):
         return content
@@ -380,7 +400,7 @@ def _content_to_text(content) -> str:
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
-        if item_type in {"input_text", "output_text"}:
+        if item_type in {"input_text", "output_text", "text"}:
             parts.append(str(item.get("text") or ""))
         elif item_type == "input_image":
             image_url = item.get("image_url")

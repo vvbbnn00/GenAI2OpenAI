@@ -222,6 +222,10 @@ def _parse_tool_call_body(raw, tools=None):
     if jsonish_call:
         return jsonish_call
 
+    bare_name_call = _parse_bare_tool_name_call(raw, tools)
+    if bare_name_call:
+        return bare_name_call
+
     name_m = re.search(r"<name>\s*(.*?)\s*</name>", raw, re.DOTALL)
     args_m = re.search(r"<arguments>\s*(.*?)\s*</arguments>", raw, re.DOTALL)
     if name_m:
@@ -236,6 +240,18 @@ def _parse_tool_call_body(raw, tools=None):
         return {"name": name, "arguments": arguments}
 
     return None
+
+
+def _parse_bare_tool_name_call(raw: str, tools=None):
+    if not _tool_name_set(tools):
+        return None
+    if not re.fullmatch(r"[A-Za-z_][\w./@-]*", raw.strip()):
+        return None
+
+    name = _canonical_tool_name(raw, tools)
+    if name is None:
+        return None
+    return {"name": name, "arguments": {}}
 
 
 def _load_tool_call_json(raw: str):

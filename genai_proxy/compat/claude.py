@@ -81,6 +81,12 @@ def convert_claude_to_openai(req_data, model_manager):
             openai_messages.extend(tool_messages)
         elif role == ROLE_ASSISTANT:
             openai_messages.append(_convert_claude_assistant_message(content))
+        elif role == ROLE_SYSTEM:
+            system_message_text = _extract_system_text(content)
+            if system_message_text:
+                openai_messages.append(
+                    {"role": ROLE_SYSTEM, "content": system_message_text}
+                )
         else:
             raise ProxyError(f"Unsupported Claude message role: {role}")
 

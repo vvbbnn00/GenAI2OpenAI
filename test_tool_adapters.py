@@ -109,6 +109,15 @@ EXEC_COMMAND_TOOL = {
     },
 }
 
+LIST_MCP_RESOURCES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "list_mcp_resources",
+        "description": "List MCP resources.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
 
 def test_genai_model_record_mapping():
     assert (
@@ -334,6 +343,34 @@ def test_glm_bare_malformed_reversed_arg_value_tool_call_is_recovered():
     assert remaining is None
     assert tool_calls[0]["function"]["name"] == "exec_command"
     assert arguments == {"cmd": "pwd && git status --short"}
+
+
+def test_glm_empty_argument_tool_call_is_recovered():
+    tool_calls, remaining = extract_tool_calls(
+        "<tool_call>list_mcp_resources</tool_call>",
+        tools=[LIST_MCP_RESOURCES_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert tool_calls[0]["function"]["name"] == "list_mcp_resources"
+    assert arguments == {}
+
+
+def test_glm_bare_required_tool_call_is_forwarded_with_empty_arguments():
+    tool_calls, remaining = extract_tool_calls(
+        "<tool_call>exec_command</tool_call>",
+        tools=[EXEC_COMMAND_TOOL],
+        model="chatglm",
+        adapter=GLM_5_2_ADAPTER,
+    )
+
+    arguments = json.loads(tool_calls[0]["function"]["arguments"])
+    assert remaining is None
+    assert tool_calls[0]["function"]["name"] == "exec_command"
+    assert arguments == {}
 
 
 def test_minimax_official_tool_call_is_recovered():
@@ -768,6 +805,8 @@ if __name__ == "__main__":
     test_glm_official_arg_key_tool_call_is_recovered()
     test_glm_malformed_reversed_arg_value_tool_call_is_recovered()
     test_glm_bare_malformed_reversed_arg_value_tool_call_is_recovered()
+    test_glm_empty_argument_tool_call_is_recovered()
+    test_glm_bare_required_tool_call_is_forwarded_with_empty_arguments()
     test_minimax_official_tool_call_is_recovered()
     test_deepseek_v4_dsml_tool_calls_are_recovered()
     test_json_tool_call_with_shell_regex_backslashes_is_recovered()

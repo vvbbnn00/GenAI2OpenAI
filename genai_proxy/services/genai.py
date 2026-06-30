@@ -63,6 +63,7 @@ GENAI_BASE_HEADERS = {
 
 GENAI_USER_INFO_URL = "https://genai.shanghaitech.edu.cn/htk/ai-user-info/list"
 GENAI_CURRENT_USER_URL = "https://genai.shanghaitech.edu.cn/htk/user/info/{token}"
+GENAI_STREAM_TIMEOUT = (10, 600)
 
 
 @dataclass(slots=True)
@@ -699,7 +700,7 @@ class GenAIService:
                     headers=self._get_genai_headers(request_token),
                     json=genai_data,
                     stream=True,
-                    timeout=(10, 75),
+                    timeout=GENAI_STREAM_TIMEOUT,
                 )
                 self._logger.debug("GenAI Response Status: %d", response.status_code)
 

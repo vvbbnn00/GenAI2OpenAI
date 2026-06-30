@@ -197,6 +197,26 @@ def test_responses_text_stream_emits_codex_events_and_reasoning_delta():
     assert captured[0]["messages"][1] == {"role": "user", "content": "Say hello."}
 
 
+def test_responses_input_accepts_easy_message_without_type():
+    service, captured, fake_post = make_service(
+        [
+            genai_sse({"content": "Hello"}),
+            genai_sse({}, "stop"),
+        ]
+    )
+    request = {
+        "model": "chatglm",
+        "input": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        events = parse_response_events(service.stream_responses(request))
+
+    assert completed_event(events)["end_turn"] is True
+    assert captured[0]["messages"][-1] == {"role": "user", "content": "hi"}
+
+
 def test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item():
     service, captured, fake_post = make_service(
         [
@@ -280,7 +300,9 @@ def test_responses_function_call_output_turn_returns_final_message():
         {"type": "output_text", "text": "Shanghai is sunny."}
     ]
     assert completed_event(events)["end_turn"] is True
-    assert "This turn must end with final assistant text only" in captured[0]["messages"][0]["content"]
+    assert "This turn must end with final assistant text only" not in captured[0]["messages"][0]["content"]
+    assert captured[0]["messages"][-1]["content"].startswith("<|observation|>")
+    assert "Return the final answer only" not in captured[0]["messages"][-1]["content"]
 
 
 def test_responses_custom_apply_patch_tool_becomes_custom_tool_call_with_input_delta():
@@ -479,6 +501,7 @@ def test_responses_ignores_hosted_tools_codex_may_send_by_default():
 
 if __name__ == "__main__":
     test_responses_text_stream_emits_codex_events_and_reasoning_delta()
+    test_responses_input_accepts_easy_message_without_type()
     test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item()
     test_responses_function_call_output_turn_returns_final_message()
     test_responses_custom_apply_patch_tool_becomes_custom_tool_call_with_input_delta()

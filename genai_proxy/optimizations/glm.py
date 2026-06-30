@@ -25,12 +25,6 @@ GLM_SPECIFIC_TOOL_SUFFIX = (
     '\nFor this turn, you must call the tool named "{name}" using a <tool_call> block.'
 )
 GLM_NO_TOOL_SUFFIX = "\nFor this turn, do not call any tool or emit <tool_call> tags."
-GLM52_TOOL_RESULT_FINAL_SUFFIX = (
-    "\nThe tool response above is sufficient for the current request. "
-    "Return the final answer only. "
-    "Do not call any tool again. "
-    "Do not emit <tool_call>, <arg_key>, or <arg_value> tags."
-)
 
 
 def inject_glm_tool_prompt(
@@ -176,9 +170,7 @@ def _render_glm_tool_results(
         f"<tool_response>{_normalize_content(msg.get('content'))}</tool_response>"
         for msg in tool_messages
     )
-    if adapter != GLM_5_2_ADAPTER or allow_additional_tool_calls:
-        return content
-    return content + GLM52_TOOL_RESULT_FINAL_SUFFIX
+    return content
 
 
 def _normalize_content(content):
