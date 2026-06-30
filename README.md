@@ -73,9 +73,9 @@ docker compose down
 | `HOST_PORT` | 宿主机暴露端口 | `5000` |
 | `PROXY_API_KEY` | 代理自身的客户端认证密钥，会传给应用的 `API_KEY` 环境变量 | 空 |
 | `APP_DEBUG` | 是否启用 `--debug`，`1` 为开启 | `0` |
-| `CLAUDE_HAIKU_MODEL` | Claude haiku 别名映射到的 GenAI 模型 | `qwen-instruct` |
-| `CLAUDE_SONNET_MODEL` | Claude sonnet 别名映射到的 GenAI 模型 | `qwen-instruct` |
-| `CLAUDE_OPUS_MODEL` | Claude opus 别名映射到的 GenAI 模型 | `deepseek-v3:671b` |
+| `CLAUDE_HAIKU_MODEL` | Claude haiku 别名映射到的 GenAI 模型 | `deepseek-chat` |
+| `CLAUDE_SONNET_MODEL` | Claude sonnet 别名映射到的 GenAI 模型 | `chatglm` |
+| `CLAUDE_OPUS_MODEL` | Claude opus 别名映射到的 GenAI 模型 | `chatglm` |
 | `GUNICORN_WORKERS` | gunicorn worker 进程数 | `2` |
 | `GUNICORN_THREADS` | 每个 worker 的线程数，决定长连接并发承载能力 | `8` |
 | `GUNICORN_TIMEOUT` | 单请求超时，适合 LLM 长响应 | `180` |
@@ -93,7 +93,7 @@ uv run main.py --token <token> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --keystore <path/to/ids-passkey.keystore> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --token <token> --keystore <path/to/ids-passkey.keystore> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --keystore <path/to/ids-passkey.keystore> --token-check-interval 60
-uv run main.py --token <token> --claude-opus-model deepseek-chat --claude-sonnet-model MiniMax-M1 --claude-haiku-model chatglm
+uv run main.py --token <token> --claude-opus-model chatglm --claude-sonnet-model chatglm --claude-haiku-model deepseek-chat
 ```
 
 认证参数说明：
@@ -111,9 +111,9 @@ uv run main.py --token <token> --claude-opus-model deepseek-chat --claude-sonnet
 | `--port` | 服务监听端口 | `5000` |
 | `--api-key` | 客户端认证密钥（也可通过 `API_KEY` 环境变量设置） | 无（不校验） |
 | `--debug` | 启用详细日志输出 | 关闭 |
-| `--claude-haiku-model` | 模型名包含 `haiku` 时映射到的 GenAI 模型，也可通过 `CLAUDE_HAIKU_MODEL` 环境变量设置 | `qwen-instruct` |
-| `--claude-sonnet-model` | 模型名包含 `sonnet` 时映射到的 GenAI 模型，也可通过 `CLAUDE_SONNET_MODEL` 环境变量设置 | `qwen-instruct` |
-| `--claude-opus-model` | 模型名包含 `opus` 时映射到的 GenAI 模型，也可通过 `CLAUDE_OPUS_MODEL` 环境变量设置 | `deepseek-v3:671b` |
+| `--claude-haiku-model` | 模型名包含 `haiku` 时映射到的 GenAI 模型，也可通过 `CLAUDE_HAIKU_MODEL` 环境变量设置 | `deepseek-chat` |
+| `--claude-sonnet-model` | 模型名包含 `sonnet` 时映射到的 GenAI 模型，也可通过 `CLAUDE_SONNET_MODEL` 环境变量设置 | `chatglm` |
+| `--claude-opus-model` | 模型名包含 `opus` 时映射到的 GenAI 模型，也可通过 `CLAUDE_OPUS_MODEL` 环境变量设置 | `chatglm` |
 
 ### 启动示例
 
@@ -142,6 +142,7 @@ uv run main.py \
 ### OpenAI 兼容接口
 
 - `POST /v1/chat/completions` — 聊天补全（流式/非流式）
+- `POST /v1/responses` — OpenAI Responses API 兼容接口（流式/非流式）
 - `GET /v1/models` — 列出可用模型
 - `GET /v1/dashboard/billing/subscription` — 当前代理账号的订阅额度信息
 - `GET /v1/dashboard/billing/usage` — 当前代理账号的使用量信息
@@ -194,9 +195,9 @@ GenAI 的模型名并不总是直接等于上游模型名，代理会结合 `/v1
 | `deepseek-chat` | DeepSeek V4 Flash / DeepSeek V4 | Xinference | DeepSeek V4 官方 DSML `<｜DSML｜tool_calls>` 注入与解析，兼容旧 `<｜DSML｜function_calls>` |
 | `deepseek-pro` | DeepSeek V4 Pro / DeepSeek V4 | Xinference | DeepSeek V4 官方 DSML `<｜DSML｜tool_calls>` 注入与解析，兼容旧 `<｜DSML｜function_calls>` |
 | `MiniMax-M1` | MiniMax 2.7 | Xinference | MiniMax-M2.7 官方 `<minimax:tool_call>` 注入与解析，兼容 XML/JSON-ish 变体和 `<think>` 过滤 |
-| `chatglm` | GLM 5.1 | Xinference | GLM-5.1 官方 `<tool_call>name<arg_key>...<arg_value>...` 注入与解析，兼容非标准闭合标签 |
+| `chatglm` | GLM 5.2；旧记录中也可能出现 GLM 5.1 | Xinference | GLM-5.2 官方 `Reasoning Effort`、`<tools>`、`<tool_call>name<arg_key>...<arg_value>...` 注入与解析；GLM-5.1 记录会回落到 5.1 模板 |
 
-DeepSeek 同厂不同版本不会共用同一个 adapter：`deepseek-chat` 使用 `deepseek_v4_flash`，`deepseek-pro` 使用 `deepseek_v4_pro`，旧 DeepSeek 名称使用 `deepseek_legacy`。V4 初始工具提示词按 DeepSeek V4 Pro `encoding_dsv4.py` / `encoding/tests` 的 `## Tools`、`<｜DSML｜tool_calls>`、`### Available Tool Schemas` 结构生成；MiniMax 和 GLM 分别按官方 `chat_template.jinja` 的 `<minimax:tool_call>` 与 `<tool_call>...<arg_key>...` 结构生成。
+DeepSeek 同厂不同版本不会共用同一个 adapter：`deepseek-chat` 使用 `deepseek_v4_flash`，`deepseek-pro` 使用 `deepseek_v4_pro`，旧 DeepSeek 名称使用 `deepseek_legacy`。V4 初始工具提示词按 DeepSeek V4 Pro `encoding_dsv4.py` / `encoding/tests` 的 `## Tools`、`<｜DSML｜tool_calls>`、`### Available Tool Schemas` 结构生成；MiniMax 和 GLM 分别按官方 `chat_template.jinja` 的 `<minimax:tool_call>` 与 `<tool_call>...<arg_key>...` 结构生成。`chatglm` 没有明确版本线索时按 GLM-5.2 处理。
 
 GenAI 网页通道 `/htk/chat/start/chat` 目前不暴露可靠的原生 `tools/tool_choice` 通道，因此代理不会向上游请求体拼接 `tools` 或 `tool_choice` 字段，而是把工具定义写入模型专用的隐藏提示词。返回时统一解析成 OpenAI 或 Claude Messages API 的结构化工具调用响应，不把模型生成的 `<tool_call>`、`<minimax:tool_call>`、DSML 或 Claude Code transcript 片段直接透传给客户端。
 
@@ -235,18 +236,18 @@ GenAI 网页通道 `/htk/chat/start/chat` 目前不暴露可靠的原生 `tools/
 
 目前 Claude 路由使用关键词匹配来做 alias 映射：
 
-- 模型名包含 `haiku` -> 默认映射到 `qwen-instruct`
-- 模型名包含 `sonnet` -> 默认映射到 `qwen-instruct`
-- 模型名包含 `opus` -> 默认映射到 `deepseek-v3:671b`
+- 模型名包含 `haiku` -> 默认映射到 `deepseek-chat`（DeepSeek V4 Flash）
+- 模型名包含 `sonnet` -> 默认映射到 `chatglm`（GLM-5.2）
+- 模型名包含 `opus` -> 默认映射到 `chatglm`（GLM-5.2）
 
 这些默认值都可以通过启动参数覆盖，例如：
 
 ```bash
 uv run main.py \
   --keystore /path/to/ids-passkey.keystore \
-  --claude-haiku-model chatglm \
-  --claude-sonnet-model MiniMax-M1 \
-  --claude-opus-model deepseek-chat
+  --claude-haiku-model deepseek-chat \
+  --claude-sonnet-model chatglm \
+  --claude-opus-model chatglm
 ```
 
 例如下面这些模型名都可以工作，只要名称中带有 `haiku`、`sonnet` 或 `opus`：
@@ -290,7 +291,7 @@ uv run python -m compileall genai_proxy test_tool_adapters.py test_allowed_model
 uv run python test_tool_adapters.py
 ```
 
-使用 `docker-deploy.keystore` 对 DeepSeek V4 Flash、DeepSeek V4 Pro、MiniMax 2.7、GLM-5.1 做 20 轮变体集成测试：
+使用 `docker-deploy.keystore` 对 DeepSeek V4 Flash、DeepSeek V4 Pro、MiniMax 2.7、GLM-5.2 做 20 轮变体集成测试：
 
 ```bash
 uv run python test_allowed_models_integration.py --repeat 20 --models deepseek-chat deepseek-pro MiniMax-M1 chatglm

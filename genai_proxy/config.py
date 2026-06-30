@@ -56,19 +56,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--claude-haiku-model",
         type=str,
-        default=os.environ.get("CLAUDE_HAIKU_MODEL", "qwen-instruct"),
+        default=os.environ.get("CLAUDE_HAIKU_MODEL", "deepseek-chat"),
         help="Mapped GenAI model for Claude model names containing 'haiku'",
     )
     parser.add_argument(
         "--claude-sonnet-model",
         type=str,
-        default=os.environ.get("CLAUDE_SONNET_MODEL", "qwen-instruct"),
+        default=os.environ.get("CLAUDE_SONNET_MODEL", "chatglm"),
         help="Mapped GenAI model for Claude model names containing 'sonnet'",
     )
     parser.add_argument(
         "--claude-opus-model",
         type=str,
-        default=os.environ.get("CLAUDE_OPUS_MODEL", "deepseek-v3:671b"),
+        default=os.environ.get("CLAUDE_OPUS_MODEL", "chatglm"),
         help="Mapped GenAI model for Claude model names containing 'opus'",
     )
     return parser
