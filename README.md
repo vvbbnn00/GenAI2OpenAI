@@ -69,6 +69,8 @@ docker compose down
 | `KEYSTORE_PATH` | 容器内的 keystore 路径，用于 passkey 自动登录/刷新 | 空 |
 | `KEYSTORE_HOST_PATH` | 宿主机上的 keystore 文件路径，会挂载到容器内 | `./docker-deploy.keystore` |
 | `TOKEN_CHECK_INTERVAL` | 后台检查 token 过期时间并同步共享缓存的间隔秒数；`0` 表示关闭 | `60` |
+| `GENAI_MAX_RETRIES` | 聊天请求在尚未输出响应时遇到临时网络故障的最大重试次数；`0` 表示关闭 | `5` |
+| `GENAI_RETRY_BACKOFF` | 首次重试等待秒数，后续每次翻倍；`0` 表示立即重试 | `0.5` |
 | `APP_PORT` | 容器内和映射到宿主机的监听端口 | `5000` |
 | `HOST_PORT` | 宿主机暴露端口 | `5000` |
 | `PROXY_API_KEY` | 代理自身的客户端认证密钥，会传给应用的 `API_KEY` 环境变量 | 空 |
@@ -93,6 +95,7 @@ uv run main.py --token <token> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --keystore <path/to/ids-passkey.keystore> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --token <token> --keystore <path/to/ids-passkey.keystore> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --keystore <path/to/ids-passkey.keystore> --token-check-interval 60
+uv run main.py --keystore <path/to/ids-passkey.keystore> --genai-max-retries 5 --genai-retry-backoff 0.5
 uv run main.py --token <token> --claude-opus-model chatglm --claude-sonnet-model chatglm --claude-haiku-model deepseek-chat
 ```
 
@@ -108,6 +111,8 @@ uv run main.py --token <token> --claude-opus-model chatglm --claude-sonnet-model
 | `--token` | GenAI 平台的访问令牌（JWT）；和 `--keystore` 二选一或同时提供 | — |
 | `--keystore` | `shanghaitech-ids-passkey` 生成的 keystore 文件路径，用于自动登录/刷新 token | — |
 | `--token-check-interval` | 后台检查 token 过期时间并同步共享缓存的间隔秒数；`0` 表示关闭 | `60` |
+| `--genai-max-retries` | 聊天请求在尚未输出响应时遇到临时网络故障的最大重试次数；`0` 表示关闭 | `5` |
+| `--genai-retry-backoff` | 首次重试等待秒数，后续每次翻倍；`0` 表示立即重试 | `0.5` |
 | `--port` | 服务监听端口 | `5000` |
 | `--api-key` | 客户端认证密钥（也可通过 `API_KEY` 环境变量设置） | 无（不校验） |
 | `--debug` | 启用详细日志输出 | 关闭 |

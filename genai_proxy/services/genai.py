@@ -64,6 +64,7 @@ GENAI_BASE_HEADERS = {
 GENAI_USER_INFO_URL = "https://genai.shanghaitech.edu.cn/htk/ai-user-info/list"
 GENAI_CURRENT_USER_URL = "https://genai.shanghaitech.edu.cn/htk/user/info/{token}"
 GENAI_STREAM_TIMEOUT = (10, 600)
+GENAI_RETRYABLE_STATUS_CODES = frozenset({408, 502, 503, 504})
 
 
 @dataclass(slots=True)
@@ -80,10 +81,20 @@ class PreparedChatRequest:
 
 
 class GenAIService:
-    def __init__(self, logger, token_manager, model_manager):
+    def __init__(
+        self,
+        logger,
+        token_manager,
+        model_manager,
+        *,
+        max_retries: int = 5,
+        retry_backoff: float = 0.5,
+    ):
         self._logger = logger
         self._token_manager = token_manager
         self._model_manager = model_manager
+        self._max_retries = max(0, int(max_retries))
+        self._retry_backoff = max(0.0, float(retry_backoff))
         self._billing_user_id = getattr(token_manager, "billing_user_id", None)
         self._billing_user_id_lock = threading.Lock()
 
@@ -689,6 +700,7 @@ class GenAIService:
             self._logger.debug("  [%d] role=%s, content=%s", index, role, preview)
 
         auth_retry_used = False
+        network_retry_count = 0
         sent_any_chunk = False
         while True:
             response = None
@@ -710,6 +722,16 @@ class GenAIService:
                         response.status_code,
                         response.text[:500],
                     )
+                    if (
+                        response.status_code in GENAI_RETRYABLE_STATUS_CODES
+                        and self._schedule_chat_retry(
+                            network_retry_count,
+                            f"HTTP {response.status_code}",
+                            sent_any_chunk=sent_any_chunk,
+                        )
+                    ):
+                        network_retry_count += 1
+                        continue
                     if response.status_code in (401, 403):
                         if (
                             not auth_retry_used
@@ -832,17 +854,36 @@ class GenAIService:
 
                 if not finished:
                     self._logger.warning("Stream ended without finish_reason from GenAI")
+                    if self._schedule_chat_retry(
+                        network_retry_count,
+                        "stream ended before any response data",
+                        sent_any_chunk=sent_any_chunk,
+                    ):
+                        network_retry_count += 1
+                        continue
                     yield _error_chunk_or_raise(
                         sent_any_chunk,
                         "Stream ended unexpectedly without completion",
                         prepared.model,
                     )
                 return
-            except requests.Timeout as exc:
-                self._logger.warning("GenAI stream timed out or stalled: %s", exc)
+            except requests.RequestException as exc:
+                self._logger.warning("GenAI chat request failed: %s", exc)
+                if self._schedule_chat_retry(
+                    network_retry_count,
+                    str(exc),
+                    sent_any_chunk=sent_any_chunk,
+                ):
+                    network_retry_count += 1
+                    continue
+                message = (
+                    "Upstream stream timed out or stalled"
+                    if isinstance(exc, requests.Timeout)
+                    else "Failed to connect to upstream GenAI"
+                )
                 yield _error_chunk_or_raise(
                     sent_any_chunk,
-                    "Upstream stream timed out or stalled",
+                    message,
                     prepared.model,
                 )
                 return
@@ -857,6 +898,28 @@ class GenAIService:
             finally:
                 if response is not None:
                     response.close()
+
+    def _schedule_chat_retry(
+        self,
+        retry_count: int,
+        reason: str,
+        *,
+        sent_any_chunk: bool,
+    ) -> bool:
+        if sent_any_chunk or retry_count >= self._max_retries:
+            return False
+
+        delay = self._retry_backoff * (2**retry_count)
+        self._logger.warning(
+            "Retrying GenAI chat request (%d/%d) in %.2f seconds: %s",
+            retry_count + 1,
+            self._max_retries,
+            delay,
+            reason,
+        )
+        if delay:
+            time.sleep(delay)
+        return True
 
     def _stream_genai_response_with_tools(self, prepared: PreparedChatRequest):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"

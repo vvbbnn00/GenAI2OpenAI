@@ -12,6 +12,13 @@ def _int_env(name: str, default: int) -> int:
     return int(value)
 
 
+def _float_env(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value in (None, ""):
+        return default
+    return float(value)
+
+
 def _config_from_env() -> AppConfig:
     return AppConfig(
         token=os.environ.get("GENAI_TOKEN") or None,
@@ -23,6 +30,8 @@ def _config_from_env() -> AppConfig:
         claude_haiku_model=os.environ.get("CLAUDE_HAIKU_MODEL", "qwen-instruct"),
         claude_sonnet_model=os.environ.get("CLAUDE_SONNET_MODEL", "qwen-instruct"),
         claude_opus_model=os.environ.get("CLAUDE_OPUS_MODEL", "deepseek-v3:671b"),
+        genai_max_retries=max(0, _int_env("GENAI_MAX_RETRIES", 5)),
+        genai_retry_backoff=max(0.0, _float_env("GENAI_RETRY_BACKOFF", 0.5)),
     )
 
 
@@ -49,6 +58,11 @@ def _log_startup(config: AppConfig, logger) -> None:
         config.claude_haiku_model,
         config.claude_sonnet_model,
         config.claude_opus_model,
+    )
+    logger.info(
+        "GenAI chat retries: %d, initial backoff: %.2f seconds",
+        config.genai_max_retries,
+        config.genai_retry_backoff,
     )
 
 

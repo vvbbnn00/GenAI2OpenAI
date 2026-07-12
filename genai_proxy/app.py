@@ -20,7 +20,13 @@ def create_app(config, logger):
         token_check_interval=config.token_check_interval,
     )
     model_manager = ModelManager(logger, token_manager)
-    genai_service = GenAIService(logger, token_manager, model_manager)
+    genai_service = GenAIService(
+        logger,
+        token_manager,
+        model_manager,
+        max_retries=getattr(config, "genai_max_retries", 5),
+        retry_backoff=getattr(config, "genai_retry_backoff", 0.5),
+    )
 
     app.extensions["logger"] = logger
     app.extensions["config"] = config

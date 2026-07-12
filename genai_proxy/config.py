@@ -14,6 +14,8 @@ class AppConfig:
     claude_haiku_model: str
     claude_sonnet_model: str
     claude_opus_model: str
+    genai_max_retries: int = 5
+    genai_retry_backoff: float = 0.5
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,6 +56,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds between background GenAI token expiry/cache checks; set 0 to disable",
     )
     parser.add_argument(
+        "--genai-max-retries",
+        type=int,
+        default=os.environ.get("GENAI_MAX_RETRIES") or "5",
+        help="Retries for transient GenAI chat connection failures before response data is sent",
+    )
+    parser.add_argument(
+        "--genai-retry-backoff",
+        type=float,
+        default=os.environ.get("GENAI_RETRY_BACKOFF") or "0.5",
+        help="Initial retry delay in seconds; each subsequent retry doubles it",
+    )
+    parser.add_argument(
         "--claude-haiku-model",
         type=str,
         default=os.environ.get("CLAUDE_HAIKU_MODEL", "deepseek-chat"),
@@ -82,6 +96,10 @@ def parse_args(argv: list[str] | None = None) -> AppConfig:
         parser.error("At least one of --token or --keystore must be provided")
     if args.token_check_interval < 0:
         parser.error("--token-check-interval must be 0 or greater")
+    if args.genai_max_retries < 0:
+        parser.error("--genai-max-retries must be 0 or greater")
+    if args.genai_retry_backoff < 0:
+        parser.error("--genai-retry-backoff must be 0 or greater")
 
     return AppConfig(
         token=args.token,
@@ -93,4 +111,6 @@ def parse_args(argv: list[str] | None = None) -> AppConfig:
         claude_haiku_model=args.claude_haiku_model,
         claude_sonnet_model=args.claude_sonnet_model,
         claude_opus_model=args.claude_opus_model,
+        genai_max_retries=args.genai_max_retries,
+        genai_retry_backoff=args.genai_retry_backoff,
     )
