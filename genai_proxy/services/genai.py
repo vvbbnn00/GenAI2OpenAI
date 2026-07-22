@@ -39,6 +39,15 @@ from genai_proxy.optimizations import (
     tool_start_tags,
 )
 from genai_proxy.reasoning import normalize_reasoning_for_adapter, parse_reasoning_config
+from genai_proxy.retry import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_RETRY_BACKOFF,
+    TRANSIENT_UPSTREAM_ERROR_CODE,
+    is_retryable_business_error,
+    is_retryable_status,
+    schedule_retry,
+    transient_upstream_error,
+)
 from genai_proxy.services.token_manager import is_genai_auth_failure, parse_jwt_payload
 from genai_proxy.token_usage import estimate_openai_request_tokens, estimate_token_by_model
 
@@ -66,7 +75,6 @@ GENAI_BASE_HEADERS = {
 GENAI_USER_INFO_URL = "https://genai.shanghaitech.edu.cn/htk/ai-user-info/list"
 GENAI_CURRENT_USER_URL = "https://genai.shanghaitech.edu.cn/htk/user/info/{token}"
 GENAI_STREAM_TIMEOUT = (10, 600)
-GENAI_RETRYABLE_STATUS_CODES = frozenset({408, 502, 503, 504})
 
 
 @dataclass(slots=True)
@@ -89,8 +97,8 @@ class GenAIService:
         token_manager,
         model_manager,
         *,
-        max_retries: int = 5,
-        retry_backoff: float = 0.5,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        retry_backoff: float = DEFAULT_RETRY_BACKOFF,
     ):
         self._logger = logger
         self._token_manager = token_manager
@@ -111,7 +119,7 @@ class GenAIService:
     def build_response(self, req_data):
         response = None
         output = []
-        for payload in self.stream_responses(req_data):
+        for payload in self.stream_responses(req_data, buffer_upstream=True):
             for line in _iter_sse_lines(payload):
                 data_str = line[6:].strip()
                 try:
@@ -141,7 +149,7 @@ class GenAIService:
         response["output_text"] = response_output_text(response.get("output") or [])
         return response
 
-    def stream_responses(self, req_data):
+    def stream_responses(self, req_data, *, buffer_upstream=False):
         context = convert_responses_to_openai_request(req_data)
         openai_request = dict(context.openai_request)
         openai_request["stream"] = True
@@ -153,7 +161,11 @@ class GenAIService:
         output_text = ""
         tool_call_deltas = []
         message_item_id = None
-        openai_stream = self.stream_openai_completion(openai_request)
+        prepared = self._prepare_chat_request(openai_request)
+        openai_stream = self._stream_prepared_openai_completion(
+            prepared,
+            buffer_until_complete=buffer_upstream,
+        )
 
         yield response_created_event(response_id, model, created)
 
@@ -291,7 +303,10 @@ class GenAIService:
         finish_reason = "stop"
         stream_error_message = None
 
-        for payload in self._stream_prepared_openai_completion(prepared):
+        for payload in self._stream_prepared_openai_completion(
+            prepared,
+            buffer_until_complete=True,
+        ):
             for line in _iter_sse_lines(payload):
                 if not line.startswith("data: "):
                     continue
@@ -387,10 +402,18 @@ class GenAIService:
             },
         }
 
-    def _stream_prepared_openai_completion(self, prepared: PreparedChatRequest):
+    def _stream_prepared_openai_completion(
+        self,
+        prepared: PreparedChatRequest,
+        *,
+        buffer_until_complete=False,
+    ):
         if prepared.has_tools:
             return self._stream_genai_response_with_tools(prepared)
-        return self._stream_genai_response(prepared)
+        return self._stream_genai_response(
+            prepared,
+            buffer_until_complete=buffer_until_complete,
+        )
 
     def _prepare_chat_request(self, req_data) -> PreparedChatRequest:
         if not req_data or "messages" not in req_data:
@@ -471,15 +494,35 @@ class GenAIService:
             return self._billing_user_id
 
     def _with_token_auth_retry(self, reason: str, fetch):
-        token = self._token_manager.token
-        try:
-            return fetch(token)
-        except ProxyError as exc:
-            if exc.code != "upstream_auth_failed":
+        auth_retry_used = False
+        retry_count = 0
+        while True:
+            token = self._token_manager.token
+            try:
+                return fetch(token)
+            except ProxyError as exc:
+                if exc.code == "upstream_auth_failed" and not auth_retry_used:
+                    if not self._token_manager.refresh_after_auth_failure(
+                        reason,
+                        rejected_token=token,
+                    ):
+                        raise
+                    auth_retry_used = True
+                    continue
+                if (
+                    exc.code == TRANSIENT_UPSTREAM_ERROR_CODE
+                    and schedule_retry(
+                        self._logger,
+                        max_retries=self._max_retries,
+                        backoff=self._retry_backoff,
+                        retry_count=retry_count,
+                        operation=reason,
+                        reason=exc.message,
+                    )
+                ):
+                    retry_count += 1
+                    continue
                 raise
-            if not self._token_manager.refresh_after_auth_failure(reason, rejected_token=token):
-                raise
-            return fetch(self._token_manager.token)
 
     def _extract_last_user_message(self, messages):
         for msg in reversed(messages):
@@ -517,9 +560,9 @@ class GenAIService:
             )
         except requests.RequestException as exc:
             self._logger.warning("Failed to fetch user billing info: %s", exc)
-            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502) from exc
+            raise transient_upstream_error("Failed to fetch subscription quota") from exc
 
-        if response.status_code == 401:
+        if response.status_code in (401, 403):
             raise ProxyError(
                 "Upstream GenAI token is invalid or expired",
                 error_type="authentication_error",
@@ -532,13 +575,15 @@ class GenAIService:
                 response.status_code,
                 response.text[:500],
             )
+            if is_retryable_status(response.status_code):
+                raise transient_upstream_error("Failed to fetch subscription quota")
             raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
 
         try:
             payload = response.json()
         except ValueError as exc:
             self._logger.warning("Failed to decode billing response JSON: %s", exc)
-            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502) from exc
+            raise transient_upstream_error("Failed to fetch subscription quota") from exc
 
         if is_genai_auth_failure(payload):
             raise ProxyError(
@@ -550,6 +595,10 @@ class GenAIService:
 
         if payload.get("code", 200) >= 400 or payload.get("success") is False:
             self._logger.warning("GenAI billing business error: %s", payload)
+            if is_retryable_business_error(
+                payload.get("code"), payload.get("message", "")
+            ):
+                raise transient_upstream_error("Failed to fetch subscription quota")
             raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
 
         result = payload.get("result")
@@ -586,9 +635,9 @@ class GenAIService:
             )
         except requests.RequestException as exc:
             self._logger.warning("Failed to fetch current user info: %s", exc)
-            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502) from exc
+            raise transient_upstream_error("Failed to fetch subscription quota") from exc
 
-        if response.status_code == 401:
+        if response.status_code in (401, 403):
             raise ProxyError(
                 "Upstream GenAI token is invalid or expired",
                 error_type="authentication_error",
@@ -601,13 +650,15 @@ class GenAIService:
                 response.status_code,
                 response.text[:500],
             )
+            if is_retryable_status(response.status_code):
+                raise transient_upstream_error("Failed to fetch subscription quota")
             raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
 
         try:
             payload = response.json()
         except ValueError as exc:
             self._logger.warning("Failed to decode current user JSON: %s", exc)
-            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502) from exc
+            raise transient_upstream_error("Failed to fetch subscription quota") from exc
 
         if is_genai_auth_failure(payload):
             raise ProxyError(
@@ -619,6 +670,10 @@ class GenAIService:
 
         if payload.get("code", 200) >= 400 or payload.get("success") is False:
             self._logger.warning("GenAI current user business error: %s", payload)
+            if is_retryable_business_error(
+                payload.get("code"), payload.get("message", "")
+            ):
+                raise transient_upstream_error("Failed to fetch subscription quota")
             raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
 
         result = payload.get("result")
@@ -671,6 +726,8 @@ class GenAIService:
         self,
         prepared: PreparedChatRequest,
         messages: list | None = None,
+        *,
+        buffer_until_complete=False,
     ):
         root_ai_type = self._model_manager.root_ai_type_for(prepared.model)
         messages = messages if messages is not None else prepared.messages
@@ -713,6 +770,9 @@ class GenAIService:
         while True:
             response = None
             retry_after_refresh = False
+            retry_after_transient_error = False
+            attempt_chunks = []
+            received_any_chunk = False
             request_token = self._token_manager.token
             try:
                 response = requests.post(
@@ -731,7 +791,7 @@ class GenAIService:
                         response.text[:500],
                     )
                     if (
-                        response.status_code in GENAI_RETRYABLE_STATUS_CODES
+                        is_retryable_status(response.status_code)
                         and self._schedule_chat_retry(
                             network_retry_count,
                             f"HTTP {response.status_code}",
@@ -822,6 +882,17 @@ class GenAIService:
                             err_code,
                             err_msg,
                         )
+                        if (
+                            is_retryable_business_error(err_code, err_msg)
+                            and self._schedule_chat_retry(
+                                network_retry_count,
+                                f"stream business error {err_code}: {err_msg}",
+                                sent_any_chunk=sent_any_chunk,
+                            )
+                        ):
+                            network_retry_count += 1
+                            retry_after_transient_error = True
+                            break
                         yield _error_chunk_or_raise(
                             sent_any_chunk,
                             f"Upstream error: {err_msg}",
@@ -844,27 +915,58 @@ class GenAIService:
                     if tool_calls:
                         delta["tool_calls"] = tool_calls
 
+                    if finish_reason == "error":
+                        err_msg = content or reasoning or "Upstream error"
+                        if self._schedule_chat_retry(
+                            network_retry_count,
+                            err_msg,
+                            sent_any_chunk=sent_any_chunk,
+                        ):
+                            network_retry_count += 1
+                            retry_after_transient_error = True
+                            break
+                        yield _error_chunk_or_raise(
+                            sent_any_chunk,
+                            _strip_error_prefix(err_msg),
+                            prepared.model,
+                        )
+                        return
+
                     if delta:
-                        sent_any_chunk = True
-                        yield self._make_chunk(prepared.model, delta)
+                        received_any_chunk = True
+                        chunk = self._make_chunk(prepared.model, delta)
+                        if buffer_until_complete:
+                            attempt_chunks.append(chunk)
+                        else:
+                            sent_any_chunk = True
+                            yield chunk
 
                     if finish_reason is not None:
                         finished = True
-                        sent_any_chunk = True
-                        yield self._make_chunk(prepared.model, {}, finish_reason=finish_reason)
-                        yield "data: [DONE]\n\n"
+                        finish_chunk = self._make_chunk(
+                            prepared.model,
+                            {},
+                            finish_reason=finish_reason,
+                        )
+                        if buffer_until_complete:
+                            attempt_chunks.extend([finish_chunk, "data: [DONE]\n\n"])
+                        else:
+                            sent_any_chunk = True
+                            yield finish_chunk
+                            yield "data: [DONE]\n\n"
                         break
 
-                if retry_after_refresh:
+                if retry_after_refresh or retry_after_transient_error:
                     continue
 
                 self._logger.debug("Total lines received: %d, finished: %s", line_count, finished)
 
                 if not finished:
                     self._logger.warning("Stream ended without finish_reason from GenAI")
+                    stream_state = "after partial response data" if received_any_chunk else "before any response data"
                     if self._schedule_chat_retry(
                         network_retry_count,
-                        "stream ended before any response data",
+                        f"stream ended {stream_state}",
                         sent_any_chunk=sent_any_chunk,
                     ):
                         network_retry_count += 1
@@ -874,8 +976,11 @@ class GenAIService:
                         "Stream ended unexpectedly without completion",
                         prepared.model,
                     )
+                elif buffer_until_complete:
+                    sent_any_chunk = bool(attempt_chunks)
+                    yield from attempt_chunks
                 return
-            except requests.RequestException as exc:
+            except (requests.RequestException, OSError, EOFError) as exc:
                 self._logger.warning("GenAI chat request failed: %s", exc)
                 if self._schedule_chat_retry(
                     network_retry_count,
@@ -905,7 +1010,10 @@ class GenAIService:
                 return
             finally:
                 if response is not None:
-                    response.close()
+                    try:
+                        response.close()
+                    except Exception as exc:
+                        self._logger.debug("Failed to close GenAI response: %s", exc)
 
     def _schedule_chat_retry(
         self,
@@ -917,17 +1025,14 @@ class GenAIService:
         if sent_any_chunk or retry_count >= self._max_retries:
             return False
 
-        delay = self._retry_backoff * (2**retry_count)
-        self._logger.warning(
-            "Retrying GenAI chat request (%d/%d) in %.2f seconds: %s",
-            retry_count + 1,
-            self._max_retries,
-            delay,
-            reason,
+        return schedule_retry(
+            self._logger,
+            max_retries=self._max_retries,
+            backoff=self._retry_backoff,
+            retry_count=retry_count,
+            operation="GenAI chat request",
+            reason=reason,
         )
-        if delay:
-            time.sleep(delay)
-        return True
 
     def _stream_genai_response_with_tools(self, prepared: PreparedChatRequest):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -1035,7 +1140,11 @@ class GenAIService:
     ) -> dict:
         complete_content = ""
         collected_tool_calls = []
-        stream = self._stream_genai_response(prepared, messages=messages)
+        stream = self._stream_genai_response(
+            prepared,
+            messages=messages,
+            buffer_until_complete=True,
+        )
         try:
             for payload in stream:
                 for line in _iter_sse_lines(payload):

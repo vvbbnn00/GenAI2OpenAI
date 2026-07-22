@@ -283,7 +283,12 @@ class AuthRefreshTests(unittest.TestCase):
         self.assertEqual(choice["finish_reason"], "length")
 
     def test_non_stream_completion_raises_on_internal_stream_error_chunk(self):
-        service = GenAIService(self.logger, FakeTokenManager(), FakeModelManager())
+        service = GenAIService(
+            self.logger,
+            FakeTokenManager(),
+            FakeModelManager(),
+            max_retries=0,
+        )
         business_error = {
             "success": False,
             "message": "temporary upstream failure",
@@ -308,7 +313,12 @@ class AuthRefreshTests(unittest.TestCase):
         self.assertEqual(raised.exception.message, "Upstream error: temporary upstream failure")
 
     def test_stream_completion_raises_on_initial_business_error(self):
-        service = GenAIService(self.logger, FakeTokenManager(), FakeModelManager())
+        service = GenAIService(
+            self.logger,
+            FakeTokenManager(),
+            FakeModelManager(),
+            max_retries=0,
+        )
         business_error = {
             "success": False,
             "message": "temporary upstream failure",
@@ -335,7 +345,12 @@ class AuthRefreshTests(unittest.TestCase):
         self.assertEqual(raised.exception.message, "Upstream error: temporary upstream failure")
 
     def test_tool_stream_raises_when_buffered_attempt_errors_after_content(self):
-        service = GenAIService(self.logger, FakeTokenManager(), FakeModelManager())
+        service = GenAIService(
+            self.logger,
+            FakeTokenManager(),
+            FakeModelManager(),
+            max_retries=0,
+        )
         lines = [
             json.dumps({"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]}).encode(),
             json.dumps(
@@ -381,7 +396,12 @@ class AuthRefreshTests(unittest.TestCase):
         self.assertEqual(raised.exception.message, "Upstream error: temporary upstream failure")
 
     def test_non_stream_empty_error_finish_uses_generic_error_message(self):
-        service = GenAIService(self.logger, FakeTokenManager(), FakeModelManager())
+        service = GenAIService(
+            self.logger,
+            FakeTokenManager(),
+            FakeModelManager(),
+            max_retries=0,
+        )
         lines = [
             json.dumps({"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]}).encode(),
             json.dumps({"choices": [{"delta": {}, "finish_reason": "error"}]}).encode(),
@@ -634,7 +654,7 @@ class AuthRefreshTests(unittest.TestCase):
 
     def test_model_list_result_null_raises_proxy_error_instead_of_attribute_error(self):
         token_manager = FakeTokenManager()
-        manager = ModelManager(self.logger, token_manager)
+        manager = ModelManager(self.logger, token_manager, max_retries=0)
 
         with patch(
             "genai_proxy.services.models.requests.get",

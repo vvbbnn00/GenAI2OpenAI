@@ -2,6 +2,8 @@ import argparse
 import os
 from dataclasses import dataclass
 
+from genai_proxy.retry import DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BACKOFF
+
 
 @dataclass(slots=True)
 class AppConfig:
@@ -14,8 +16,8 @@ class AppConfig:
     claude_haiku_model: str
     claude_sonnet_model: str
     claude_opus_model: str
-    genai_max_retries: int = 5
-    genai_retry_backoff: float = 0.5
+    genai_max_retries: int = DEFAULT_MAX_RETRIES
+    genai_retry_backoff: float = DEFAULT_RETRY_BACKOFF
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,14 +60,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--genai-max-retries",
         type=int,
-        default=os.environ.get("GENAI_MAX_RETRIES") or "5",
-        help="Retries for transient GenAI chat connection failures before response data is sent",
+        default=os.environ.get("GENAI_MAX_RETRIES") or str(DEFAULT_MAX_RETRIES),
+        help="Retries for transient GenAI upstream failures",
     )
     parser.add_argument(
         "--genai-retry-backoff",
         type=float,
-        default=os.environ.get("GENAI_RETRY_BACKOFF") or "0.5",
-        help="Initial retry delay in seconds; each subsequent retry doubles it",
+        default=os.environ.get("GENAI_RETRY_BACKOFF") or str(DEFAULT_RETRY_BACKOFF),
+        help="Initial retry delay in seconds; later delays double up to 5 seconds",
     )
     parser.add_argument(
         "--claude-haiku-model",

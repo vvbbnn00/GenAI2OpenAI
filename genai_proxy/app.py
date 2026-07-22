@@ -4,6 +4,7 @@ from flask_cors import CORS
 from genai_proxy.auth import register_auth
 from genai_proxy.routes.claude import bp as claude_bp
 from genai_proxy.routes.openai import bp as openai_bp
+from genai_proxy.retry import DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BACKOFF
 from genai_proxy.services.genai import GenAIService
 from genai_proxy.services.models import ModelManager
 from genai_proxy.services.token_manager import TokenManager
@@ -19,13 +20,20 @@ def create_app(config, logger):
         keystore_path=config.keystore,
         token_check_interval=config.token_check_interval,
     )
-    model_manager = ModelManager(logger, token_manager)
+    max_retries = getattr(config, "genai_max_retries", DEFAULT_MAX_RETRIES)
+    retry_backoff = getattr(config, "genai_retry_backoff", DEFAULT_RETRY_BACKOFF)
+    model_manager = ModelManager(
+        logger,
+        token_manager,
+        max_retries=max_retries,
+        retry_backoff=retry_backoff,
+    )
     genai_service = GenAIService(
         logger,
         token_manager,
         model_manager,
-        max_retries=getattr(config, "genai_max_retries", 5),
-        retry_backoff=getattr(config, "genai_retry_backoff", 0.5),
+        max_retries=max_retries,
+        retry_backoff=retry_backoff,
     )
 
     app.extensions["logger"] = logger

@@ -1,9 +1,19 @@
+import threading
 import time
 from datetime import datetime, timezone
 
 import requests
 
 from genai_proxy.errors import ProxyError
+from genai_proxy.retry import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_RETRY_BACKOFF,
+    TRANSIENT_UPSTREAM_ERROR_CODE,
+    is_retryable_business_error,
+    is_retryable_status,
+    schedule_retry,
+    transient_upstream_error,
+)
 from genai_proxy.services.token_manager import is_genai_auth_failure
 
 
@@ -17,11 +27,21 @@ MODEL_CACHE_TTL = 300
 
 
 class ModelManager:
-    def __init__(self, logger, token_manager):
+    def __init__(
+        self,
+        logger,
+        token_manager,
+        *,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        retry_backoff: float = DEFAULT_RETRY_BACKOFF,
+    ):
         self._logger = logger
         self._token_manager = token_manager
+        self._max_retries = max(0, int(max_retries))
+        self._retry_backoff = max(0.0, float(retry_backoff))
         self._models_cache = None
         self._models_cache_at = 0.0
+        self._models_cache_lock = threading.Lock()
 
     def resolve_model(self, model: str) -> str:
         return model or DEFAULT_MODEL
@@ -56,33 +76,68 @@ class ModelManager:
         return models
 
     def list_genai_models(self, force_refresh: bool = False) -> list[dict]:
-        if not force_refresh and self._models_cache is not None:
-            if time.time() - self._models_cache_at < MODEL_CACHE_TTL:
+        if self._has_fresh_cache(force_refresh):
+            return self._models_cache
+
+        with self._models_cache_lock:
+            if self._has_fresh_cache(force_refresh):
+                return self._models_cache
+            try:
+                models = self._fetch_models()
+            except ProxyError as exc:
+                if (
+                    exc.code != TRANSIENT_UPSTREAM_ERROR_CODE
+                    or self._models_cache is None
+                    or force_refresh
+                ):
+                    raise
+                self._logger.warning(
+                    "Using stale GenAI model cache after upstream refresh failed"
+                )
+                self._models_cache_at = time.time()
                 return self._models_cache
 
-        models = self._fetch_models()
-        self._models_cache = models
-        self._models_cache_at = time.time()
-        return models
+            self._models_cache = models
+            self._models_cache_at = time.time()
+            return models
+
+    def _has_fresh_cache(self, force_refresh: bool) -> bool:
+        return (
+            not force_refresh
+            and self._models_cache is not None
+            and time.time() - self._models_cache_at < MODEL_CACHE_TTL
+        )
 
     def _fetch_models(self) -> list[dict]:
         return self._fetch_models_with_retry()
 
     def _fetch_models_with_retry(self) -> list[dict]:
-        refreshed = False
+        auth_retry_used = False
+        retry_count = 0
         while True:
             token = self._token_manager.token
             try:
                 return self._fetch_models_once(token)
             except ProxyError as exc:
-                if exc.code != "upstream_auth_failed" or refreshed:
-                    raise
-                refreshed = True
-                if not self._token_manager.refresh_after_auth_failure(
-                    "model list rejected token",
-                    rejected_token=token,
+                if exc.code == "upstream_auth_failed" and not auth_retry_used:
+                    auth_retry_used = True
+                    if not self._token_manager.refresh_after_auth_failure(
+                        "model list rejected token",
+                        rejected_token=token,
+                    ):
+                        raise
+                    continue
+                if exc.code == TRANSIENT_UPSTREAM_ERROR_CODE and schedule_retry(
+                    self._logger,
+                    max_retries=self._max_retries,
+                    backoff=self._retry_backoff,
+                    retry_count=retry_count,
+                    operation="GenAI model list request",
+                    reason=exc.message,
                 ):
-                    raise
+                    retry_count += 1
+                    continue
+                raise
 
     def _fetch_models_once(self, token: str | None) -> list[dict]:
         url = GENAI_MODEL_LIST_URL.format(timestamp=int(time.time()))
@@ -97,7 +152,7 @@ class ModelManager:
             )
         except requests.RequestException as exc:
             self._logger.warning("Failed to fetch GenAI model list: %s", exc)
-            raise ProxyError("Failed to fetch GenAI models", error_type="upstream_error", status=502) from exc
+            raise transient_upstream_error("Failed to fetch GenAI models") from exc
 
         if response.status_code in (401, 403):
             raise ProxyError(
@@ -108,13 +163,15 @@ class ModelManager:
             )
         if response.status_code != 200:
             self._logger.warning("GenAI model list HTTP error %d: %s", response.status_code, response.text[:500])
+            if is_retryable_status(response.status_code):
+                raise transient_upstream_error("Failed to fetch GenAI models")
             raise ProxyError("Failed to fetch GenAI models", error_type="upstream_error", status=502)
 
         try:
             payload = response.json()
         except ValueError as exc:
             self._logger.warning("Failed to decode GenAI model list JSON: %s", exc)
-            raise ProxyError("Failed to fetch GenAI models", error_type="upstream_error", status=502) from exc
+            raise transient_upstream_error("Failed to fetch GenAI models") from exc
 
         if is_genai_auth_failure(payload):
             raise ProxyError(
@@ -126,12 +183,16 @@ class ModelManager:
 
         if payload.get("success") is False or payload.get("code", 200) >= 400:
             self._logger.warning("GenAI model list business error: %s", payload)
+            if is_retryable_business_error(
+                payload.get("code"), payload.get("message", "")
+            ):
+                raise transient_upstream_error("Failed to fetch GenAI models")
             raise ProxyError("Failed to fetch GenAI models", error_type="upstream_error", status=502)
 
         result = payload.get("result")
         if not isinstance(result, dict):
             self._logger.warning("GenAI model list response missing result object: %s", payload)
-            raise ProxyError("Failed to fetch GenAI models", error_type="upstream_error", status=502)
+            raise transient_upstream_error("Failed to fetch GenAI models")
 
         records = result.get("records") or []
         models = []
