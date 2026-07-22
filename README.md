@@ -69,8 +69,8 @@ docker compose down
 | `KEYSTORE_PATH` | 容器内的 keystore 路径，用于 passkey 自动登录/刷新 | 空 |
 | `KEYSTORE_HOST_PATH` | 宿主机上的 keystore 文件路径，会挂载到容器内 | `./docker-deploy.keystore` |
 | `TOKEN_CHECK_INTERVAL` | 后台检查 token 过期时间并同步共享缓存的间隔秒数；`0` 表示关闭 | `60` |
-| `GENAI_MAX_RETRIES` | 聊天请求在尚未输出响应时遇到临时网络故障的最大重试次数；`0` 表示关闭 | `5` |
-| `GENAI_RETRY_BACKOFF` | 首次重试等待秒数，后续每次翻倍；`0` 表示立即重试 | `0.5` |
+| `GENAI_MAX_RETRIES` | GenAI 聊天、模型列表和计费请求遇到临时网络故障、HTTP 408/425/429/500/502/503/504、无效响应或意外断流时的最大重试次数；`0` 表示关闭 | `10` |
+| `GENAI_RETRY_BACKOFF` | 首次重试等待秒数，后续每次翻倍并封顶 5 秒；`0` 表示立即重试 | `0.5` |
 | `APP_PORT` | 容器内和映射到宿主机的监听端口 | `5000` |
 | `HOST_PORT` | 宿主机暴露端口 | `5000` |
 | `PROXY_API_KEY` | 代理自身的客户端认证密钥，会传给应用的 `API_KEY` 环境变量 | 空 |
@@ -95,7 +95,7 @@ uv run main.py --token <token> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --keystore <path/to/ids-passkey.keystore> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --token <token> --keystore <path/to/ids-passkey.keystore> [--port 5000] [--api-key <key>] [--debug]
 uv run main.py --keystore <path/to/ids-passkey.keystore> --token-check-interval 60
-uv run main.py --keystore <path/to/ids-passkey.keystore> --genai-max-retries 5 --genai-retry-backoff 0.5
+uv run main.py --keystore <path/to/ids-passkey.keystore> --genai-max-retries 10 --genai-retry-backoff 0.5
 uv run main.py --token <token> --claude-opus-model chatglm --claude-sonnet-model chatglm --claude-haiku-model deepseek-chat
 ```
 
@@ -111,14 +111,16 @@ uv run main.py --token <token> --claude-opus-model chatglm --claude-sonnet-model
 | `--token` | GenAI 平台的访问令牌（JWT）；和 `--keystore` 二选一或同时提供 | — |
 | `--keystore` | `shanghaitech-ids-passkey` 生成的 keystore 文件路径，用于自动登录/刷新 token | — |
 | `--token-check-interval` | 后台检查 token 过期时间并同步共享缓存的间隔秒数；`0` 表示关闭 | `60` |
-| `--genai-max-retries` | 聊天请求在尚未输出响应时遇到临时网络故障的最大重试次数；`0` 表示关闭 | `5` |
-| `--genai-retry-backoff` | 首次重试等待秒数，后续每次翻倍；`0` 表示立即重试 | `0.5` |
+| `--genai-max-retries` | GenAI 上游临时故障的最大重试次数；`0` 表示关闭 | `10` |
+| `--genai-retry-backoff` | 首次重试等待秒数，后续每次翻倍并封顶 5 秒；`0` 表示立即重试 | `0.5` |
 | `--port` | 服务监听端口 | `5000` |
 | `--api-key` | 客户端认证密钥（也可通过 `API_KEY` 环境变量设置） | 无（不校验） |
 | `--debug` | 启用详细日志输出 | 关闭 |
 | `--claude-haiku-model` | 模型名包含 `haiku` 时映射到的 GenAI 模型，也可通过 `CLAUDE_HAIKU_MODEL` 环境变量设置 | `deepseek-chat` |
 | `--claude-sonnet-model` | 模型名包含 `sonnet` 时映射到的 GenAI 模型，也可通过 `CLAUDE_SONNET_MODEL` 环境变量设置 | `chatglm` |
 | `--claude-opus-model` | 模型名包含 `opus` 时映射到的 GenAI 模型，也可通过 `CLAUDE_OPUS_MODEL` 环境变量设置 | `chatglm` |
+
+重试只会重放尚未交付给客户端的响应。非流式请求和工具调用会先收齐一轮上游响应，因此上游在返回部分内容后断流时也可以安全地整轮重试。普通实时流一旦已经向客户端发送文本或推理内容，就不会从头重放，以免产生重复或互相矛盾的内容；此时代理会发送明确的流错误并结束请求。
 
 ### 启动示例
 
@@ -204,6 +206,8 @@ GenAI 的模型名并不总是直接等于上游模型名，代理会结合 `/v1
 
 DeepSeek 同厂不同版本不会共用同一个 adapter：`deepseek-chat` 使用 `deepseek_v4_flash`，`deepseek-pro` 使用 `deepseek_v4_pro`，旧 DeepSeek 名称使用 `deepseek_legacy`。V4 初始工具提示词按 DeepSeek V4 Pro `encoding_dsv4.py` / `encoding/tests` 的 `## Tools`、`<｜DSML｜tool_calls>`、`### Available Tool Schemas` 结构生成；MiniMax 和 GLM 分别按官方 `chat_template.jinja` 的 `<minimax:tool_call>` 与 `<tool_call>...<arg_key>...` 结构生成。`chatglm` 没有明确版本线索时按 GLM-5.2 处理。
 
+GLM-5.2 和 DeepSeek V4 的推理等级统一为 `high`、`max`：`high` 保持为 `high`，`max` 保持为 `max`，`none`、`minimal`、`low`、`medium`、`xhigh` 等其他已支持输入统一映射到 `max`。DeepSeek V4 的 `max` 会把官方 `REASONING_EFFORT_MAX` 文本放在首条消息最前面；`high` 不添加该前缀。未传推理等级时，GLM-5.2 保持现有的 `max` 默认值，DeepSeek V4 不额外添加等级前缀。
+
 GenAI 网页通道 `/htk/chat/start/chat` 目前不暴露可靠的原生 `tools/tool_choice` 通道，因此代理不会向上游请求体拼接 `tools` 或 `tool_choice` 字段，而是把工具定义写入模型专用的隐藏提示词。返回时统一解析成 OpenAI 或 Claude Messages API 的结构化工具调用响应，不把模型生成的 `<tool_call>`、`<minimax:tool_call>`、DSML 或 Claude Code transcript 片段直接透传给客户端。
 
 针对 Claude Code 常见的 `Bash`、`Glob`、`Read`、`Edit`、`Write` 等工具，代理会优先保留请求里的精确工具名，并兼容模型偶发输出的 `Bash<arg_key>`、`<arg_value>`、`Bash\nIN\n...`、`Globpattern: ...`、DSML、MiniMax XML 和 JSON-ish 工具块。工具结果后的多轮会话会继续保留工具定义，允许模型按需继续调用工具；显式 `tool_choice: "none"` 时才禁止工具调用。
@@ -285,7 +289,7 @@ print(resp)
 
 ### 支持的模型
 
-`/v1/models` 会实时读取 GenAI 上游模型列表，返回当前账号在 GenAI 可见的模型。它会自动带出上游的 `rootAiType`，并默认过滤 `gpt-image-1.5`。具体模型集合以 `/v1/models` 的实时返回为准。
+`/v1/models` 会读取 GenAI 上游模型列表，返回当前账号在 GenAI 可见的模型。请求失败时会按统一策略重试；已有缓存过期但刷新仍失败时，会临时返回上一份缓存，避免模型列表短暂故障阻断聊天请求。它会自动带出上游的 `rootAiType`，并默认过滤 `gpt-image-1.5`。具体模型集合以上游返回为准。
 
 ## 测试
 
