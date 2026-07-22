@@ -9,6 +9,7 @@ dependencies = [
     "flask-cors>=4.0.0",
     "requests>=2.32.5",
     "shanghaitech-ids-passkey>=0.1.0",
+    "tokenizers>=0.22.2,<0.23",
 ]
 
 [tool.uv.sources]

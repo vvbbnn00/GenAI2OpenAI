@@ -6,7 +6,10 @@ from flask import jsonify
 
 from genai_proxy.errors import ProxyError
 from genai_proxy.reasoning import parse_claude_reasoning_config
-from genai_proxy.token_usage import estimate_claude_request_tokens, estimate_token_by_model
+from genai_proxy.token_usage import (
+    estimate_claude_request_tokens,
+    estimate_token_by_model,
+)
 
 
 ROLE_ASSISTANT = "assistant"
@@ -52,6 +55,9 @@ def claude_error(message, error_type="invalid_request_error", status=400):
 
 
 def convert_claude_to_openai(req_data, model_manager):
+    if not isinstance(req_data, dict):
+        raise ProxyError("Request body must be a JSON object")
+
     model = req_data.get("model")
     max_tokens = req_data.get("max_tokens")
     messages = req_data.get("messages")
@@ -62,10 +68,15 @@ def convert_claude_to_openai(req_data, model_manager):
         raise ProxyError("Missing 'max_tokens' field in request body")
     if messages is None:
         raise ProxyError("Missing 'messages' field in request body")
+    if not isinstance(messages, list) or any(
+        not isinstance(message, dict) for message in messages
+    ):
+        raise ProxyError("'messages' must be a list of objects")
 
     openai_messages = []
 
     system = req_data.get("system")
+    _validate_claude_content(system, "'system'")
     system_text = _extract_system_text(system)
     if system_text:
         openai_messages.append({"role": ROLE_SYSTEM, "content": system_text})
@@ -73,6 +84,7 @@ def convert_claude_to_openai(req_data, model_manager):
     for message in messages:
         role = message.get("role")
         content = message.get("content")
+        _validate_claude_content(content, "Message 'content'")
 
         if role == ROLE_USER:
             user_message, tool_messages = _convert_claude_user_message(content)
@@ -96,6 +108,8 @@ def convert_claude_to_openai(req_data, model_manager):
         "max_tokens": max_tokens,
         "stream": bool(req_data.get("stream", False)),
     }
+    if openai_request["stream"]:
+        openai_request["stream_options"] = {"include_usage": True}
 
     if req_data.get("temperature") is not None:
         openai_request["temperature"] = req_data["temperature"]
@@ -109,6 +123,8 @@ def convert_claude_to_openai(req_data, model_manager):
         openai_request["reasoning"] = reasoning_config
 
     tools = req_data.get("tools") or []
+    if not isinstance(tools, list) or any(not isinstance(tool, dict) for tool in tools):
+        raise ProxyError("'tools' must be a list of objects")
     if tools:
         openai_request["tools"] = [
             {
@@ -125,6 +141,8 @@ def convert_claude_to_openai(req_data, model_manager):
 
     tool_choice = req_data.get("tool_choice")
     if tool_choice:
+        if not isinstance(tool_choice, dict):
+            raise ProxyError("'tool_choice' must be an object")
         choice_type = tool_choice.get("type")
         if choice_type == "any":
             openai_request["tool_choice"] = "required"
@@ -142,7 +160,9 @@ def convert_claude_to_openai(req_data, model_manager):
 def convert_openai_to_claude_response(openai_response, original_request):
     choices = openai_response.get("choices", [])
     if not choices:
-        raise ProxyError("No choices in upstream response", error_type="api_error", status=502)
+        raise ProxyError(
+            "No choices in upstream response", error_type="api_error", status=502
+        )
 
     choice = choices[0]
     message = choice.get("message", {})
@@ -181,21 +201,27 @@ def convert_openai_to_claude_response(openai_response, original_request):
         "function_call": STOP_TOOL_USE,
     }.get(finish_reason, STOP_END_TURN)
 
-    estimator_model = original_request.get("_estimator_model") or original_request.get("model")
-    usage = openai_response.get("usage", {}) or {}
-    input_tokens = usage.get("prompt_tokens") or estimate_claude_request_tokens(
-        original_request.get("system"),
-        original_request.get("messages"),
-        estimator_model,
-        original_request.get("tools"),
+    estimator_model = original_request.get("_estimator_model") or original_request.get(
+        "model"
     )
+    usage = openai_response.get("usage", {}) or {}
+    input_tokens = usage.get("prompt_tokens")
+    if input_tokens is None:
+        input_tokens = estimate_claude_request_tokens(
+            original_request.get("system"),
+            original_request.get("messages"),
+            estimator_model,
+            original_request.get("tools"),
+        )
     output_tokens = usage.get("completion_tokens")
     if output_tokens is None:
         output_text = text_content or ""
         for block in content_blocks:
             if block.get("type") == CONTENT_TOOL_USE:
                 output_text += block.get("name", "")
-                output_text += json.dumps(block.get("input", {}), ensure_ascii=False, sort_keys=True)
+                output_text += json.dumps(
+                    block.get("input", {}), ensure_ascii=False, sort_keys=True
+                )
         output_tokens = estimate_token_by_model(estimator_model, output_text)
     return {
         "id": openai_response.get("id", f"msg_{uuid.uuid4()}"),
@@ -214,13 +240,18 @@ def convert_openai_to_claude_response(openai_response, original_request):
 
 def stream_openai_to_claude(openai_stream, original_request, logger):
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
-    estimator_model = original_request.get("_estimator_model") or original_request.get("model")
-    input_tokens = estimate_claude_request_tokens(
-        original_request.get("system"),
-        original_request.get("messages"),
-        estimator_model,
-        original_request.get("tools"),
+    estimator_model = original_request.get("_estimator_model") or original_request.get(
+        "model"
     )
+    input_tokens = original_request.get("_input_tokens")
+    if input_tokens is None:
+        input_tokens = estimate_claude_request_tokens(
+            original_request.get("system"),
+            original_request.get("messages"),
+            estimator_model,
+            original_request.get("tools"),
+        )
+    final_usage = None
     output_text_parts = []
     openai_iterator = iter(openai_stream)
     try:
@@ -282,6 +313,8 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
 
                 choices = chunk.get("choices", [])
                 if not choices:
+                    if chunk.get("usage"):
+                        final_usage = chunk["usage"]
                     continue
 
                 choice = choices[0]
@@ -289,7 +322,9 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
                 finish_reason = choice.get("finish_reason")
 
                 if finish_reason == "error":
-                    message = _strip_error_prefix(delta.get("content") or "Streaming error")
+                    message = _strip_error_prefix(
+                        delta.get("content") or "Streaming error"
+                    )
                     yield _claude_event(
                         "error",
                         {
@@ -332,9 +367,15 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
                         tool_call["name"] = function_data["name"]
                         output_text_parts.append(function_data["name"])
 
-                    if tool_call["id"] and tool_call["name"] and not tool_call["started"]:
+                    if (
+                        tool_call["id"]
+                        and tool_call["name"]
+                        and not tool_call["started"]
+                    ):
                         tool_block_counter += 1
-                        tool_call["claude_index"] = text_block_index + tool_block_counter
+                        tool_call["claude_index"] = (
+                            text_block_index + tool_block_counter
+                        )
                         tool_call["started"] = True
                         yield _claude_event(
                             EVENT_CONTENT_BLOCK_START,
@@ -416,24 +457,17 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
             "type": EVENT_MESSAGE_DELTA,
             "delta": {"stop_reason": final_stop_reason, "stop_sequence": None},
             "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": estimate_token_by_model(estimator_model, "".join(output_text_parts)),
+                "input_tokens": (final_usage or {}).get("prompt_tokens", input_tokens),
+                "output_tokens": (final_usage or {}).get(
+                    "completion_tokens",
+                    estimate_token_by_model(
+                        estimator_model, "".join(output_text_parts)
+                    ),
+                ),
             },
         },
     )
     yield _claude_event(EVENT_MESSAGE_STOP, {"type": EVENT_MESSAGE_STOP})
-
-
-def estimate_claude_tokens(req_data):
-    estimator_model = req_data.get("_estimator_model") or req_data.get("model")
-    return {
-        "input_tokens": estimate_claude_request_tokens(
-            req_data.get("system"),
-            req_data.get("messages"),
-            estimator_model,
-            req_data.get("tools"),
-        )
-    }
 
 
 def _convert_claude_user_message(content):
@@ -500,7 +534,9 @@ def _convert_claude_assistant_message(content):
                     "type": TOOL_FUNCTION,
                     TOOL_FUNCTION: {
                         "name": block.get("name", ""),
-                        "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
+                        "arguments": json.dumps(
+                            block.get("input", {}), ensure_ascii=False
+                        ),
                     },
                 }
             )
@@ -523,6 +559,15 @@ def _extract_system_text(system):
             if block.get("type") == CONTENT_TEXT and block.get("text")
         ).strip()
     return ""
+
+
+def _validate_claude_content(content, field_name: str) -> None:
+    if content is None or isinstance(content, str):
+        return
+    if not isinstance(content, list) or any(
+        not isinstance(block, dict) for block in content
+    ):
+        raise ProxyError(f"{field_name} must be a string or a list of objects")
 
 
 def _normalize_tool_result(content):

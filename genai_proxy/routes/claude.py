@@ -1,13 +1,19 @@
 import time
 import uuid
 
-from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
+from flask import (
+    Blueprint,
+    Response,
+    current_app,
+    jsonify,
+    request,
+    stream_with_context,
+)
 
 from genai_proxy.compat.claude import (
     claude_error,
     convert_claude_to_openai,
     convert_openai_to_claude_response,
-    estimate_claude_tokens,
     stream_openai_to_claude,
 )
 from genai_proxy.errors import ProxyError
@@ -18,6 +24,8 @@ bp = Blueprint("claude", __name__)
 
 
 def map_claude_model_alias(model: str | None, config) -> str | None:
+    if model is not None and not isinstance(model, str):
+        raise ProxyError("'model' must be a string")
     if not model:
         return model
 
@@ -51,10 +59,13 @@ def create_message():
     streaming_response_started = False
 
     try:
-        original_req_data = request.get_json() or {}
+        original_req_data = request.get_json(silent=True)
+        if not isinstance(original_req_data, dict):
+            raise ProxyError("Request body must be a JSON object")
         req_data = original_req_data
         original_model = original_req_data.get("model")
-        message_count = len(original_req_data.get("messages", []))
+        messages = original_req_data.get("messages")
+        message_count = len(messages) if isinstance(messages, list) else 0
         mapped_model = map_claude_model_alias(original_model, config)
         original_req_with_estimator = {
             **original_req_data,
@@ -75,6 +86,9 @@ def create_message():
 
         stream = bool(openai_request.get("stream"))
         if stream:
+            original_req_with_estimator["_input_tokens"] = (
+                service.count_openai_input_tokens(openai_request)
+            )
             gen = prime_stream(
                 stream_openai_to_claude(
                     service.stream_openai_completion(openai_request),
@@ -84,7 +98,9 @@ def create_message():
             )
             streaming_response_started = True
             return Response(
-                stream_with_context(_stream_with_completion_log(gen, logger, request_id, start_time)),
+                stream_with_context(
+                    _stream_with_completion_log(gen, logger, request_id, start_time)
+                ),
                 mimetype="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -94,7 +110,9 @@ def create_message():
             )
 
         response = service.build_openai_completion(openai_request)
-        return jsonify(convert_openai_to_claude_response(response, original_req_with_estimator))
+        return jsonify(
+            convert_openai_to_claude_response(response, original_req_with_estimator)
+        )
     except ProxyError as exc:
         return claude_error(exc.message, exc.error_type, exc.status)
     except Exception as exc:
@@ -109,12 +127,26 @@ def create_message():
 @bp.route("/v1/messages/count_tokens", methods=["POST"])
 def count_tokens():
     try:
-        req_data = request.get_json() or {}
+        req_data = request.get_json(silent=True)
+        if not isinstance(req_data, dict):
+            raise ProxyError("Request body must be a JSON object")
         config = current_app.extensions["config"]
-        req_data = {
+        model_manager = current_app.extensions["model_manager"]
+        service = current_app.extensions["genai_service"]
+        mapped_model = map_claude_model_alias(req_data.get("model"), config)
+        converted_request = {
             **req_data,
-            "_estimator_model": map_claude_model_alias(req_data.get("model"), config),
+            "model": mapped_model,
+            # Anthropic's count endpoint does not require a generation limit,
+            # while the shared message converter intentionally does.
+            "max_tokens": req_data.get("max_tokens", 1),
+            "stream": False,
         }
-        return jsonify(estimate_claude_tokens(req_data))
+        openai_request = convert_claude_to_openai(converted_request, model_manager)
+        return jsonify(
+            {"input_tokens": service.count_openai_input_tokens(openai_request)}
+        )
+    except ProxyError as exc:
+        return claude_error(exc.message, exc.error_type, exc.status)
     except Exception as exc:
         return claude_error(str(exc), "api_error", 500)

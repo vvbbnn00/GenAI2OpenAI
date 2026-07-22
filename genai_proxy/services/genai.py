@@ -38,7 +38,10 @@ from genai_proxy.optimizations import (
     select_tool_adapter,
     tool_start_tags,
 )
-from genai_proxy.reasoning import normalize_reasoning_for_adapter, parse_reasoning_config
+from genai_proxy.reasoning import (
+    normalize_reasoning_for_adapter,
+    parse_reasoning_config,
+)
 from genai_proxy.retry import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_RETRY_BACKOFF,
@@ -49,7 +52,12 @@ from genai_proxy.retry import (
     transient_upstream_error,
 )
 from genai_proxy.services.token_manager import is_genai_auth_failure, parse_jwt_payload
-from genai_proxy.token_usage import estimate_openai_request_tokens, estimate_token_by_model
+from genai_proxy.token_usage import (
+    count_openai_completion_tokens,
+    count_openai_reasoning_tokens,
+    count_openai_request_tokens,
+    tokenizer_family_for_model,
+)
 
 
 GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"
@@ -87,7 +95,11 @@ class PreparedChatRequest:
     tools: list
     tool_choice: object
     tool_adapter: str
-    prompt_tokens: int
+    model_record: dict | None
+    include_usage: bool
+    prompt_tokens: int | None
+    token_reasoning_config: dict | None
+    generated_usage: dict | None = None
 
 
 class GenAIService:
@@ -113,8 +125,14 @@ class GenAIService:
         return self._build_openai_completion(prepared)
 
     def stream_openai_completion(self, req_data):
-        prepared = self._prepare_chat_request(req_data)
+        prepared = self._prepare_chat_request(req_data, count_usage=False)
         return self._stream_prepared_openai_completion(prepared)
+
+    def count_openai_input_tokens(self, req_data) -> int:
+        prompt_tokens = self._prepare_chat_request(req_data).prompt_tokens
+        if prompt_tokens is None:
+            raise RuntimeError("Input token counting completed without a token count")
+        return prompt_tokens
 
     def build_response(self, req_data):
         response = None
@@ -128,7 +146,9 @@ class GenAIService:
                     continue
 
                 event_type = event.get("type")
-                if event_type == "response.output_item.done" and isinstance(event.get("item"), dict):
+                if event_type == "response.output_item.done" and isinstance(
+                    event.get("item"), dict
+                ):
                     output.append(event["item"])
                 elif event_type == "response.completed":
                     response = event.get("response") or {}
@@ -142,7 +162,11 @@ class GenAIService:
                     )
 
         if response is None:
-            raise ProxyError("Responses stream ended without response.completed", error_type="upstream_error", status=502)
+            raise ProxyError(
+                "Responses stream ended without response.completed",
+                error_type="upstream_error",
+                status=502,
+            )
 
         response = dict(response)
         response.setdefault("output", output)
@@ -159,6 +183,7 @@ class GenAIService:
         created = int(datetime.now().timestamp())
         output_items = []
         output_text = ""
+        output_reasoning = ""
         tool_call_deltas = []
         message_item_id = None
         prepared = self._prepare_chat_request(openai_request)
@@ -191,6 +216,7 @@ class GenAIService:
 
                     reasoning = delta.get("reasoning_content")
                     if reasoning:
+                        output_reasoning += reasoning
                         yield response_reasoning_text_delta(reasoning)
 
                     content = delta.get("content")
@@ -212,14 +238,17 @@ class GenAIService:
                         return
 
                     if finish_reason == "tool_calls":
+                        merged_tool_calls = _merge_tool_call_deltas(tool_call_deltas)
                         if output_text:
                             item = make_message_item(output_text, message_item_id)
                             output_items.append(item)
                             yield response_output_item_done(item)
-                        for tool_call in _merge_tool_call_deltas(tool_call_deltas):
+                        for tool_call in merged_tool_calls:
                             item = make_response_tool_item(tool_call, context.tool_map)
                             if item.get("type") == "custom_tool_call":
-                                item_id = item.get("id") or item.get("call_id") or response_id
+                                item_id = (
+                                    item.get("id") or item.get("call_id") or response_id
+                                )
                                 yield response_custom_tool_call_input_delta(
                                     item_id,
                                     item.get("call_id") or item_id,
@@ -233,6 +262,19 @@ class GenAIService:
                             output=output_items,
                             end_turn=False,
                             created=created,
+                            usage=_responses_usage(
+                                prepared.generated_usage
+                                or self._usage(
+                                    prepared,
+                                    {
+                                        "role": "assistant",
+                                        "content": output_text or None,
+                                        "reasoning_content": output_reasoning,
+                                        "tool_calls": merged_tool_calls,
+                                    },
+                                    finish_reason="tool_calls",
+                                )
+                            ),
                         )
                         return
 
@@ -251,6 +293,18 @@ class GenAIService:
                             output=output_items,
                             end_turn=True,
                             created=created,
+                            usage=_responses_usage(
+                                prepared.generated_usage
+                                or self._usage(
+                                    prepared,
+                                    {
+                                        "role": "assistant",
+                                        "content": output_text,
+                                        "reasoning_content": output_reasoning,
+                                    },
+                                    finish_reason=finish_reason,
+                                )
+                            ),
                         )
                         return
 
@@ -299,6 +353,7 @@ class GenAIService:
 
     def _build_openai_completion(self, prepared: PreparedChatRequest):
         complete_content = ""
+        complete_reasoning = ""
         collected_tool_calls = []
         finish_reason = "stop"
         stream_error_message = None
@@ -328,6 +383,9 @@ class GenAIService:
                 content = delta.get("content", "")
                 if content:
                     complete_content += content
+                reasoning = delta.get("reasoning_content", "")
+                if reasoning:
+                    complete_reasoning += reasoning
 
                 for tool_call in delta.get("tool_calls", []) or []:
                     collected_tool_calls.append(tool_call)
@@ -375,13 +433,8 @@ class GenAIService:
         else:
             message_obj = {"role": "assistant", "content": complete_content}
 
-        completion_estimate_text = complete_content or ""
-        if message_obj.get("tool_calls"):
-            for tool_call in message_obj["tool_calls"]:
-                function = tool_call.get("function", {})
-                completion_estimate_text += function.get("name", "")
-                completion_estimate_text += function.get("arguments", "")
-        completion_tokens = estimate_token_by_model(prepared.model, completion_estimate_text)
+        if complete_reasoning:
+            message_obj["reasoning_content"] = complete_reasoning
 
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -395,11 +448,8 @@ class GenAIService:
                     "finish_reason": finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": prepared.prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prepared.prompt_tokens + completion_tokens,
-            },
+            "usage": prepared.generated_usage
+            or self._usage(prepared, message_obj, finish_reason=finish_reason),
         }
 
     def _stream_prepared_openai_completion(
@@ -415,22 +465,57 @@ class GenAIService:
             buffer_until_complete=buffer_until_complete,
         )
 
-    def _prepare_chat_request(self, req_data) -> PreparedChatRequest:
+    def _prepare_chat_request(
+        self,
+        req_data,
+        *,
+        count_usage: bool = True,
+    ) -> PreparedChatRequest:
         if not req_data or "messages" not in req_data:
             raise ProxyError("Missing 'messages' field in request body")
 
         messages = req_data.get("messages", [])
-        if not isinstance(messages, list):
-            raise ProxyError("'messages' must be a list")
+        if not isinstance(messages, list) or any(
+            not isinstance(message, dict) for message in messages
+        ):
+            raise ProxyError("'messages' must be a list of objects")
+        _validate_openai_message_shapes(messages)
 
-        model = self._model_manager.resolve_model(req_data.get("model", "GPT-4.1"))
+        requested_model = req_data.get("model", "GPT-4.1")
+        if not isinstance(requested_model, str):
+            raise ProxyError("'model' must be a string")
+        model = self._model_manager.resolve_model(requested_model)
         max_tokens = req_data.get("max_tokens", 30000)
         tools = req_data.get("tools") or []
+        if not isinstance(tools, list) or any(
+            not isinstance(tool, dict) for tool in tools
+        ):
+            raise ProxyError("'tools' must be a list of objects")
+        for tool in tools:
+            if tool.get("type") != "function":
+                continue
+            function = tool.get("function")
+            if not isinstance(function, dict):
+                raise ProxyError("Function tools must contain a 'function' object")
+            if not isinstance(function.get("name"), str) or not function["name"]:
+                raise ProxyError("Function tools must contain a non-empty string name")
+            if function.get("parameters") is not None and not isinstance(
+                function["parameters"], dict
+            ):
+                raise ProxyError("Function tool parameters must be an object")
         tool_choice = req_data.get("tool_choice")
         model_record = self._model_manager.get_model_record(model)
         tool_adapter = select_tool_adapter(model, model_record)
+        messages = _normalize_messages_for_model_template(
+            messages,
+            model,
+            model_record=model_record,
+            tool_adapter=tool_adapter,
+        )
         reasoning_config = parse_reasoning_config(req_data)
-        reasoning_config = normalize_reasoning_for_adapter(tool_adapter, reasoning_config)
+        reasoning_config = normalize_reasoning_for_adapter(
+            tool_adapter, reasoning_config
+        )
 
         requested_tools = bool(tools)
         has_tools = requested_tools and not _tool_choice_is_none(tool_choice)
@@ -455,6 +540,28 @@ class GenAIService:
         if not self._extract_last_user_message(messages):
             raise ProxyError("No user message found in 'messages'")
 
+        # The GenAI transport carries two-level reasoning as injected message
+        # text, not as a tokenizer/template argument. Reapplying the argument
+        # here would count a prompt different from the one sent upstream.
+        token_reasoning_config = (
+            None
+            if tool_adapter == GLM_5_2_ADAPTER or tool_adapter in DEEPSEEK_V4_ADAPTERS
+            else reasoning_config
+        )
+        include_usage = bool(
+            isinstance(req_data.get("stream_options"), dict)
+            and req_data["stream_options"].get("include_usage")
+        )
+        prompt_tokens = None
+        if count_usage or include_usage:
+            prompt_tokens = count_openai_request_tokens(
+                messages,
+                model,
+                model_record=model_record,
+                tool_adapter=tool_adapter,
+                reasoning_config=token_reasoning_config,
+            )
+
         return PreparedChatRequest(
             messages=messages,
             model=model,
@@ -464,12 +571,93 @@ class GenAIService:
             tools=tools if has_tools else [],
             tool_choice=tool_choice if has_tools else None,
             tool_adapter=tool_adapter,
-            prompt_tokens=estimate_openai_request_tokens(messages, model, tools if has_tools else None),
+            model_record=model_record,
+            include_usage=include_usage,
+            prompt_tokens=prompt_tokens,
+            token_reasoning_config=token_reasoning_config,
         )
+
+    def _completion_tokens(
+        self,
+        prepared: PreparedChatRequest,
+        message: dict,
+        *,
+        finish_reason: str = "stop",
+    ) -> int:
+        return count_openai_completion_tokens(
+            message,
+            prepared.model,
+            model_record=prepared.model_record,
+            tool_adapter=prepared.tool_adapter,
+            prompt_messages=prepared.messages,
+            reasoning_config=prepared.token_reasoning_config,
+            finish_reason=finish_reason,
+        )
+
+    def _usage(
+        self,
+        prepared: PreparedChatRequest,
+        message: dict,
+        *,
+        finish_reason: str = "stop",
+    ) -> dict:
+        if prepared.prompt_tokens is None:
+            raise RuntimeError("Completion usage was requested without prompt counting")
+        completion_tokens = self._completion_tokens(
+            prepared,
+            message,
+            finish_reason=finish_reason,
+        )
+        reasoning_tokens = count_openai_reasoning_tokens(
+            str(message.get("reasoning_content") or ""),
+            prepared.model,
+            model_record=prepared.model_record,
+            tool_adapter=prepared.tool_adapter,
+            prompt_messages=prepared.messages,
+            reasoning_config=prepared.token_reasoning_config,
+        )
+        return {
+            "prompt_tokens": prepared.prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prepared.prompt_tokens + completion_tokens,
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": reasoning_tokens},
+        }
+
+    def _record_usage(
+        self,
+        prepared: PreparedChatRequest,
+        message: dict,
+        *,
+        finish_reason: str,
+    ) -> dict:
+        prepared.generated_usage = self._usage(
+            prepared,
+            message,
+            finish_reason=finish_reason,
+        )
+        return prepared.generated_usage
+
+    def _make_usage_chunk(self, prepared: PreparedChatRequest) -> str:
+        if prepared.generated_usage is None:
+            raise RuntimeError(
+                "Completion usage was requested before generation finished"
+            )
+        chunk = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+            "object": "chat.completion.chunk",
+            "created": int(datetime.now().timestamp()),
+            "model": prepared.model,
+            "choices": [],
+            "usage": prepared.generated_usage,
+        }
+        return f"data: {json.dumps(chunk)}\n\n"
 
     def _get_genai_headers(self, token: str | None = None):
         headers = dict(GENAI_BASE_HEADERS)
-        headers["X-Access-Token"] = token if token is not None else self._token_manager.token
+        headers["X-Access-Token"] = (
+            token if token is not None else self._token_manager.token
+        )
         return headers
 
     def _get_user_genai_headers(self, user_token: str):
@@ -490,7 +678,9 @@ class GenAIService:
         with self._billing_user_id_lock:
             if not self._billing_user_id:
                 cached_user_id = getattr(self._token_manager, "billing_user_id", None)
-                self._billing_user_id = cached_user_id or self._fetch_current_user_id(token)
+                self._billing_user_id = cached_user_id or self._fetch_current_user_id(
+                    token
+                )
             return self._billing_user_id
 
     def _with_token_auth_retry(self, reason: str, fetch):
@@ -509,16 +699,13 @@ class GenAIService:
                         raise
                     auth_retry_used = True
                     continue
-                if (
-                    exc.code == TRANSIENT_UPSTREAM_ERROR_CODE
-                    and schedule_retry(
-                        self._logger,
-                        max_retries=self._max_retries,
-                        backoff=self._retry_backoff,
-                        retry_count=retry_count,
-                        operation=reason,
-                        reason=exc.message,
-                    )
+                if exc.code == TRANSIENT_UPSTREAM_ERROR_CODE and schedule_retry(
+                    self._logger,
+                    max_retries=self._max_retries,
+                    backoff=self._retry_backoff,
+                    retry_count=retry_count,
+                    operation=reason,
+                    reason=exc.message,
                 ):
                     retry_count += 1
                     continue
@@ -560,7 +747,9 @@ class GenAIService:
             )
         except requests.RequestException as exc:
             self._logger.warning("Failed to fetch user billing info: %s", exc)
-            raise transient_upstream_error("Failed to fetch subscription quota") from exc
+            raise transient_upstream_error(
+                "Failed to fetch subscription quota"
+            ) from exc
 
         if response.status_code in (401, 403):
             raise ProxyError(
@@ -577,13 +766,19 @@ class GenAIService:
             )
             if is_retryable_status(response.status_code):
                 raise transient_upstream_error("Failed to fetch subscription quota")
-            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
+            raise ProxyError(
+                "Failed to fetch subscription quota",
+                error_type="upstream_error",
+                status=502,
+            )
 
         try:
             payload = response.json()
         except ValueError as exc:
             self._logger.warning("Failed to decode billing response JSON: %s", exc)
-            raise transient_upstream_error("Failed to fetch subscription quota") from exc
+            raise transient_upstream_error(
+                "Failed to fetch subscription quota"
+            ) from exc
 
         if is_genai_auth_failure(payload):
             raise ProxyError(
@@ -599,7 +794,11 @@ class GenAIService:
                 payload.get("code"), payload.get("message", "")
             ):
                 raise transient_upstream_error("Failed to fetch subscription quota")
-            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
+            raise ProxyError(
+                "Failed to fetch subscription quota",
+                error_type="upstream_error",
+                status=502,
+            )
 
         result = payload.get("result")
         records = result.get("records") if isinstance(result, dict) else []
@@ -635,7 +834,9 @@ class GenAIService:
             )
         except requests.RequestException as exc:
             self._logger.warning("Failed to fetch current user info: %s", exc)
-            raise transient_upstream_error("Failed to fetch subscription quota") from exc
+            raise transient_upstream_error(
+                "Failed to fetch subscription quota"
+            ) from exc
 
         if response.status_code in (401, 403):
             raise ProxyError(
@@ -652,13 +853,19 @@ class GenAIService:
             )
             if is_retryable_status(response.status_code):
                 raise transient_upstream_error("Failed to fetch subscription quota")
-            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
+            raise ProxyError(
+                "Failed to fetch subscription quota",
+                error_type="upstream_error",
+                status=502,
+            )
 
         try:
             payload = response.json()
         except ValueError as exc:
             self._logger.warning("Failed to decode current user JSON: %s", exc)
-            raise transient_upstream_error("Failed to fetch subscription quota") from exc
+            raise transient_upstream_error(
+                "Failed to fetch subscription quota"
+            ) from exc
 
         if is_genai_auth_failure(payload):
             raise ProxyError(
@@ -674,14 +881,22 @@ class GenAIService:
                 payload.get("code"), payload.get("message", "")
             ):
                 raise transient_upstream_error("Failed to fetch subscription quota")
-            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
+            raise ProxyError(
+                "Failed to fetch subscription quota",
+                error_type="upstream_error",
+                status=502,
+            )
 
         result = payload.get("result")
         user_info = result.get("userInfo") if isinstance(result, dict) else {}
         user_id = user_info.get("id")
         if not user_id:
             self._logger.warning("Current user response missing id: %s", payload)
-            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
+            raise ProxyError(
+                "Failed to fetch subscription quota",
+                error_type="upstream_error",
+                status=502,
+            )
 
         self._token_manager.update_billing_user_id(user_id)
         refreshed_token = result.get("token") if isinstance(result, dict) else None
@@ -720,7 +935,11 @@ class GenAIService:
             return float(value)
         except (TypeError, ValueError):
             self._logger.warning("Invalid billing amount from upstream: %r", value)
-            raise ProxyError("Failed to fetch subscription quota", error_type="upstream_error", status=502)
+            raise ProxyError(
+                "Failed to fetch subscription quota",
+                error_type="upstream_error",
+                status=502,
+            )
 
     def _stream_genai_response(
         self,
@@ -772,6 +991,9 @@ class GenAIService:
             retry_after_refresh = False
             retry_after_transient_error = False
             attempt_chunks = []
+            attempt_content = ""
+            attempt_reasoning = ""
+            attempt_tool_calls = []
             received_any_chunk = False
             request_token = self._token_manager.token
             try:
@@ -790,13 +1012,12 @@ class GenAIService:
                         response.status_code,
                         response.text[:500],
                     )
-                    if (
-                        is_retryable_status(response.status_code)
-                        and self._schedule_chat_retry(
-                            network_retry_count,
-                            f"HTTP {response.status_code}",
-                            sent_any_chunk=sent_any_chunk,
-                        )
+                    if is_retryable_status(
+                        response.status_code
+                    ) and self._schedule_chat_retry(
+                        network_retry_count,
+                        f"HTTP {response.status_code}",
+                        sent_any_chunk=sent_any_chunk,
                     ):
                         network_retry_count += 1
                         continue
@@ -813,7 +1034,9 @@ class GenAIService:
                             continue
                         if not sent_any_chunk:
                             raise _upstream_auth_error()
-                        yield make_error_chunk("Upstream authentication failed", prepared.model)
+                        yield make_error_chunk(
+                            "Upstream authentication failed", prepared.model
+                        )
                     elif response.status_code == 429:
                         yield _error_chunk_or_raise(
                             sent_any_chunk,
@@ -841,7 +1064,9 @@ class GenAIService:
 
                     line_str = line.decode("utf-8") if isinstance(line, bytes) else line
                     if line_count < 5:
-                        self._logger.debug("Raw line [%d]: %s", line_count, line_str[:300])
+                        self._logger.debug(
+                            "Raw line [%d]: %s", line_count, line_str[:300]
+                        )
                     line_count += 1
 
                     if line_str.startswith("data:"):
@@ -853,12 +1078,16 @@ class GenAIService:
                     try:
                         genai_json = json.loads(line_str)
                     except json.JSONDecodeError as exc:
-                        self._logger.debug("JSON decode error: %s, line: %s", exc, line_str[:200])
+                        self._logger.debug(
+                            "JSON decode error: %s, line: %s", exc, line_str[:200]
+                        )
                         continue
 
                     if is_genai_auth_failure(genai_json):
                         err_msg = genai_json.get("message", "Unknown upstream error")
-                        self._logger.warning("GenAI authentication business error: %s", err_msg)
+                        self._logger.warning(
+                            "GenAI authentication business error: %s", err_msg
+                        )
                         if (
                             not auth_retry_used
                             and self._token_manager.refresh_after_auth_failure(
@@ -871,10 +1100,15 @@ class GenAIService:
                             break
                         if not sent_any_chunk:
                             raise _upstream_auth_error()
-                        yield make_error_chunk("Upstream authentication failed", prepared.model)
+                        yield make_error_chunk(
+                            "Upstream authentication failed", prepared.model
+                        )
                         return
 
-                    if isinstance(genai_json, dict) and genai_json.get("code", 200) >= 400:
+                    if (
+                        isinstance(genai_json, dict)
+                        and genai_json.get("code", 200) >= 400
+                    ):
                         err_msg = genai_json.get("message", "Unknown upstream error")
                         err_code = genai_json.get("code", 500)
                         self._logger.warning(
@@ -882,13 +1116,12 @@ class GenAIService:
                             err_code,
                             err_msg,
                         )
-                        if (
-                            is_retryable_business_error(err_code, err_msg)
-                            and self._schedule_chat_retry(
-                                network_retry_count,
-                                f"stream business error {err_code}: {err_msg}",
-                                sent_any_chunk=sent_any_chunk,
-                            )
+                        if is_retryable_business_error(
+                            err_code, err_msg
+                        ) and self._schedule_chat_retry(
+                            network_retry_count,
+                            f"stream business error {err_code}: {err_msg}",
+                            sent_any_chunk=sent_any_chunk,
                         ):
                             network_retry_count += 1
                             retry_after_transient_error = True
@@ -906,14 +1139,19 @@ class GenAIService:
                         choice = genai_json["choices"][0]
                         finish_reason = choice.get("finish_reason")
 
-                    content, reasoning, tool_calls = self._extract_delta_from_genai(genai_json)
+                    content, reasoning, tool_calls = self._extract_delta_from_genai(
+                        genai_json
+                    )
                     delta = {}
                     if content:
                         delta["content"] = content
+                        attempt_content += content
                     if reasoning:
                         delta["reasoning_content"] = reasoning
+                        attempt_reasoning += reasoning
                     if tool_calls:
                         delta["tool_calls"] = tool_calls
+                        attempt_tool_calls.extend(tool_calls)
 
                     if finish_reason == "error":
                         err_msg = content or reasoning or "Upstream error"
@@ -943,27 +1181,53 @@ class GenAIService:
 
                     if finish_reason is not None:
                         finished = True
+                        terminal_message = {
+                            "role": "assistant",
+                            "content": attempt_content,
+                            "reasoning_content": attempt_reasoning,
+                        }
+                        if attempt_tool_calls:
+                            terminal_message["tool_calls"] = _merge_tool_call_deltas(
+                                attempt_tool_calls
+                            )
+                        if prepared.prompt_tokens is not None:
+                            self._record_usage(
+                                prepared,
+                                terminal_message,
+                                finish_reason=finish_reason,
+                            )
                         finish_chunk = self._make_chunk(
                             prepared.model,
                             {},
                             finish_reason=finish_reason,
                         )
+                        terminal_chunks = [finish_chunk]
+                        if prepared.include_usage:
+                            terminal_chunks.append(self._make_usage_chunk(prepared))
+                        terminal_chunks.append("data: [DONE]\n\n")
                         if buffer_until_complete:
-                            attempt_chunks.extend([finish_chunk, "data: [DONE]\n\n"])
+                            attempt_chunks.extend(terminal_chunks)
                         else:
                             sent_any_chunk = True
-                            yield finish_chunk
-                            yield "data: [DONE]\n\n"
+                            yield from terminal_chunks
                         break
 
                 if retry_after_refresh or retry_after_transient_error:
                     continue
 
-                self._logger.debug("Total lines received: %d, finished: %s", line_count, finished)
+                self._logger.debug(
+                    "Total lines received: %d, finished: %s", line_count, finished
+                )
 
                 if not finished:
-                    self._logger.warning("Stream ended without finish_reason from GenAI")
-                    stream_state = "after partial response data" if received_any_chunk else "before any response data"
+                    self._logger.warning(
+                        "Stream ended without finish_reason from GenAI"
+                    )
+                    stream_state = (
+                        "after partial response data"
+                        if received_any_chunk
+                        else "before any response data"
+                    )
                     if self._schedule_chat_retry(
                         network_retry_count,
                         f"stream ended {stream_state}",
@@ -1075,11 +1339,14 @@ class GenAIService:
                         "tool_calls": [
                             {
                                 "index": index,
-                                "id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                                "id": tool_call.get("id")
+                                or f"call_{uuid.uuid4().hex[:24]}",
                                 "type": tool_call.get("type", "function"),
                                 "function": {
                                     "name": tool_call.get("function", {}).get("name"),
-                                    "arguments": tool_call.get("function", {}).get("arguments", ""),
+                                    "arguments": tool_call.get("function", {}).get(
+                                        "arguments", ""
+                                    ),
                                 },
                             }
                         ]
@@ -1106,7 +1373,9 @@ class GenAIService:
 
         sent_role = False
         if tool_calls:
-            clean_remaining = _strip_visible_tool_syntax(remaining or "", open_tags).strip()
+            clean_remaining = _strip_visible_tool_syntax(
+                remaining or "", open_tags
+            ).strip()
             if clean_remaining:
                 for chunk in emit_response_text(clean_remaining, sent_role):
                     if isinstance(chunk, bool):
@@ -1117,6 +1386,8 @@ class GenAIService:
             for chunk in emit_tool_calls(tool_calls, sent_role):
                 yield chunk
             yield make_chunk({}, finish_reason="tool_calls")
+            if prepared.include_usage:
+                yield self._make_usage_chunk(prepared)
             yield "data: [DONE]\n\n"
             return
 
@@ -1131,6 +1402,8 @@ class GenAIService:
         if not sent_role:
             yield make_chunk({"role": "assistant", "content": ""})
         yield make_chunk({}, finish_reason="stop")
+        if prepared.include_usage:
+            yield self._make_usage_chunk(prepared)
         yield "data: [DONE]\n\n"
 
     def _collect_tool_attempt(
@@ -1167,7 +1440,9 @@ class GenAIService:
                     delta = choice.get("delta", {})
                     if choice.get("finish_reason") == "error":
                         raise ProxyError(
-                            _strip_error_prefix(delta.get("content") or "Upstream error"),
+                            _strip_error_prefix(
+                                delta.get("content") or "Upstream error"
+                            ),
                             error_type="upstream_error",
                             status=502,
                         )
@@ -1175,9 +1450,10 @@ class GenAIService:
                     content = delta.get("content") or ""
                     if content:
                         complete_content += content
-
                     for tool_call in delta.get("tool_calls", []) or []:
-                        collected_tool_calls.append(_normalize_stream_tool_call(tool_call))
+                        collected_tool_calls.append(
+                            _normalize_stream_tool_call(tool_call)
+                        )
 
         finally:
             close = getattr(stream, "close", None)
@@ -1186,7 +1462,9 @@ class GenAIService:
 
         return {
             "content": complete_content,
-            "tool_calls": _merge_tool_call_deltas(collected_tool_calls) if collected_tool_calls else [],
+            "tool_calls": _merge_tool_call_deltas(collected_tool_calls)
+            if collected_tool_calls
+            else [],
         }
 
     def _make_chunk(self, model, delta, finish_reason=None):
@@ -1204,6 +1482,95 @@ class GenAIService:
             ],
         }
         return f"data: {json.dumps(response)}\n\n"
+
+
+def _validate_openai_message_shapes(messages: list[dict]) -> None:
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            not isinstance(part, dict) for part in content
+        ):
+            raise ProxyError("Message content arrays must contain objects")
+
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None:
+            continue
+        if not isinstance(tool_calls, list) or any(
+            not isinstance(tool_call, dict) for tool_call in tool_calls
+        ):
+            raise ProxyError("'tool_calls' must be a list of objects")
+        for tool_call in tool_calls:
+            if not isinstance(tool_call.get("function"), dict):
+                raise ProxyError("Each tool call must contain a 'function' object")
+
+
+def _normalize_messages_for_model_template(
+    messages: list[dict],
+    model: str,
+    *,
+    model_record: dict | None,
+    tool_adapter: str,
+) -> list[dict]:
+    family = tokenizer_family_for_model(model, model_record, tool_adapter)
+    if family not in {"glm_5_2", "qwen_3_5"}:
+        return messages
+
+    normalized = [
+        {**message, "role": "system"} if message.get("role") == "developer" else message
+        for message in messages
+    ]
+    if family != "qwen_3_5":
+        return normalized
+
+    system_messages = [
+        message for message in normalized if message.get("role") == "system"
+    ]
+    if not system_messages:
+        return normalized
+    non_system_messages = [
+        message for message in normalized if message.get("role") != "system"
+    ]
+    return [
+        {
+            "role": "system",
+            "content": _merge_system_contents(system_messages),
+        },
+        *non_system_messages,
+    ]
+
+
+def _merge_system_contents(messages: list[dict]):
+    contents = [message.get("content", "") for message in messages]
+    if all(isinstance(content, str) for content in contents):
+        return "\n\n".join(contents)
+
+    parts = []
+    for index, content in enumerate(contents):
+        if index:
+            parts.append({"type": "text", "text": "\n\n"})
+        if isinstance(content, list):
+            parts.extend(content)
+        else:
+            parts.append({"type": "text", "text": str(content or "")})
+    return parts
+
+
+def _responses_usage(openai_usage: dict | None) -> dict | None:
+    if not openai_usage:
+        return None
+    prompt_details = openai_usage.get("prompt_tokens_details") or {}
+    completion_details = openai_usage.get("completion_tokens_details") or {}
+    return {
+        "input_tokens": openai_usage.get("prompt_tokens", 0),
+        "input_tokens_details": {
+            "cached_tokens": prompt_details.get("cached_tokens", 0),
+        },
+        "output_tokens": openai_usage.get("completion_tokens", 0),
+        "output_tokens_details": {
+            "reasoning_tokens": completion_details.get("reasoning_tokens", 0),
+        },
+        "total_tokens": openai_usage.get("total_tokens", 0),
+    }
 
 
 def _upstream_auth_error() -> ProxyError:
@@ -1260,9 +1627,15 @@ def _request_tool_specs(tools: list | None) -> dict[str, list[str]]:
             function_data = {}
         name = function_data.get("name") or tool.get("name")
         if name:
-            parameters = function_data.get("parameters", {}) or tool.get("input_schema", {})
-            properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
-            specs[name] = list(properties.keys()) if isinstance(properties, dict) else []
+            parameters = function_data.get("parameters", {}) or tool.get(
+                "input_schema", {}
+            )
+            properties = (
+                parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+            )
+            specs[name] = (
+                list(properties.keys()) if isinstance(properties, dict) else []
+            )
     return specs
 
 

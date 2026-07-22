@@ -1,126 +1,312 @@
+import hashlib
 import json
+import logging
 import math
+import os
+import re
+import tempfile
+import threading
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from types import MappingProxyType
+
+import requests
+from jinja2.exceptions import TemplateError
+from jinja2.sandbox import ImmutableSandboxedEnvironment
+from tokenizers import Tokenizer
+
+from genai_proxy.errors import ProxyError
+from genai_proxy.optimizations.registry import (
+    DEEPSEEK_V4_FLASH_ADAPTER,
+    DEEPSEEK_V4_PRO_ADAPTER,
+    GLM_5_2_ADAPTER,
+)
+from genai_proxy.retry import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_RETRY_BACKOFF,
+    is_retryable_status,
+    schedule_retry,
+)
+
+
+HF_BASE_URL = "https://huggingface.co"
+TOKENIZER_CACHE_ENV = "GENAI_TOKENIZER_CACHE"
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
-class Multipliers:
-    word: float
-    number: float
-    cjk: float
-    symbol: float
-    math_symbol: float
-    url_delim: float
-    at_sign: float
-    emoji: float
-    newline: float
-    space: float
-    base_pad: int = 0
+class Artifact:
+    path: str
+    sha256: str
 
 
-OPENAI_MULTIPLIERS = Multipliers(
-    word=1.02,
-    number=1.55,
-    cjk=0.85,
-    symbol=0.4,
-    math_symbol=2.68,
-    url_delim=1.0,
-    at_sign=2.0,
-    emoji=2.12,
-    newline=0.5,
-    space=0.42,
+@dataclass(frozen=True, slots=True)
+class TokenizerSpec:
+    family: str
+    repository: str
+    revision: str
+    tokenizer: Artifact
+    template: Artifact | None = None
+    encoder: Artifact | None = None
+
+
+GLM_5_2_SPEC = TokenizerSpec(
+    family="glm_5_2",
+    repository="zai-org/GLM-5.2",
+    revision="b4734de4facf877f85769a911abafc5283eab3d9",
+    tokenizer=Artifact(
+        "tokenizer.json",
+        "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+    ),
+    template=Artifact(
+        "chat_template.jinja",
+        "172dc74a35e1752df75ecfb2b2cf9326d2852bb1379868ebeec9571654489679",
+    ),
 )
 
-CLAUDE_MULTIPLIERS = Multipliers(
-    word=1.13,
-    number=1.63,
-    cjk=1.21,
-    symbol=0.4,
-    math_symbol=4.52,
-    url_delim=1.26,
-    at_sign=2.82,
-    emoji=2.6,
-    newline=0.89,
-    space=0.39,
+DEEPSEEK_V4_PRO_SPEC = TokenizerSpec(
+    family="deepseek_v4_pro",
+    repository="deepseek-ai/DeepSeek-V4-Pro",
+    revision="b5968e9190ef611bbf34a7229255be88a0e937c1",
+    tokenizer=Artifact(
+        "tokenizer.json",
+        "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
+    ),
+    encoder=Artifact(
+        "encoding/encoding_dsv4.py",
+        "bdbd57c132a1b3725042323d02b98b9d1df28e5f388f134399555d041f5055e0",
+    ),
 )
 
-GEMINI_MULTIPLIERS = Multipliers(
-    word=1.15,
-    number=2.8,
-    cjk=0.68,
-    symbol=0.38,
-    math_symbol=1.05,
-    url_delim=1.2,
-    at_sign=2.5,
-    emoji=1.08,
-    newline=1.15,
-    space=0.2,
+DEEPSEEK_V4_FLASH_SPEC = TokenizerSpec(
+    family="deepseek_v4_flash",
+    repository="deepseek-ai/DeepSeek-V4-Flash",
+    revision="60d8d70770c6776ff598c94bb586a859a38244f1",
+    tokenizer=DEEPSEEK_V4_PRO_SPEC.tokenizer,
+    encoder=DEEPSEEK_V4_PRO_SPEC.encoder,
 )
 
-MATH_SYMBOLS = set(
-    "∑∫∂√∞≤≥≠≈±×÷∈∉∋∌⊂⊃⊆⊇∪∩∧∨¬∀∃∄∅∆∇∝∟∠∡∢°′″‴⁺⁻⁼⁽⁾ⁿ₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎²³¹⁴⁵⁶⁷⁸⁹⁰"
+# The full MoE checkpoint is deliberately the canonical Qwen3.5 source. The
+# smaller checkpoints currently publish identical tokenizer assets, but they
+# are not used as the revision authority here.
+QWEN_3_5_SPEC = TokenizerSpec(
+    family="qwen_3_5",
+    repository="Qwen/Qwen3.5-397B-A17B",
+    revision="8472618112abcbd45acbcdc58436aff4233c23f7",
+    tokenizer=Artifact(
+        "tokenizer.json",
+        "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+    ),
+    template=Artifact(
+        "chat_template.jinja",
+        "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    ),
 )
-URL_DELIMS = set("/:?&=;#%")
+
+SPECS = MappingProxyType(
+    {
+        spec.family: spec
+        for spec in (
+            GLM_5_2_SPEC,
+            DEEPSEEK_V4_PRO_SPEC,
+            DEEPSEEK_V4_FLASH_SPEC,
+            QWEN_3_5_SPEC,
+        )
+    }
+)
+
+_cache_lock = threading.RLock()
+_tokenizers: dict[str, Tokenizer] = {}
+_templates = {}
+_deepseek_encoders = {}
+
+
+def tokenizer_family_for_model(
+    model: str | None,
+    model_record: dict | None = None,
+    tool_adapter: str | None = None,
+) -> str | None:
+    if tool_adapter == GLM_5_2_ADAPTER:
+        return GLM_5_2_SPEC.family
+    if tool_adapter == DEEPSEEK_V4_PRO_ADAPTER:
+        return DEEPSEEK_V4_PRO_SPEC.family
+    if tool_adapter == DEEPSEEK_V4_FLASH_ADAPTER:
+        return DEEPSEEK_V4_FLASH_SPEC.family
+
+    text = _model_text(model, model_record)
+    if _contains_version(text, "qwen", "3", "5"):
+        return QWEN_3_5_SPEC.family
+    if _contains_version(text, "glm", "5", "2"):
+        return GLM_5_2_SPEC.family
+    if "deepseek-pro" in text or "deepseek v4 pro" in text or "deepseek-v4-pro" in text:
+        return DEEPSEEK_V4_PRO_SPEC.family
+    if (
+        "deepseek-chat" in text
+        or "deepseek v4 flash" in text
+        or "deepseek-v4-flash" in text
+    ):
+        return DEEPSEEK_V4_FLASH_SPEC.family
+    return None
+
+
+def count_openai_request_tokens(
+    messages,
+    model: str | None,
+    *,
+    model_record: dict | None = None,
+    tool_adapter: str | None = None,
+    reasoning_config: dict | None = None,
+) -> int:
+    family = tokenizer_family_for_model(model, model_record, tool_adapter)
+    if family is None:
+        return _estimate_openai_request_tokens(messages, model)
+
+    prompt = render_chat_prompt(
+        messages,
+        family,
+        add_generation_prompt=True,
+        reasoning_config=reasoning_config,
+    )
+    return _count_encoded(family, prompt)
+
+
+def count_openai_completion_tokens(
+    message: dict,
+    model: str | None,
+    *,
+    model_record: dict | None = None,
+    tool_adapter: str | None = None,
+    prompt_messages=None,
+    reasoning_config: dict | None = None,
+    finish_reason: str = "stop",
+) -> int:
+    family = tokenizer_family_for_model(model, model_record, tool_adapter)
+    if family is None:
+        return estimate_token_by_model(model, _completion_text(message))
+
+    completion = _serialized_completion(
+        message,
+        family,
+        finish_reason=finish_reason,
+    )
+    if prompt_messages is None:
+        return _count_encoded(family, completion)
+
+    prompt = render_chat_prompt(
+        prompt_messages,
+        family,
+        add_generation_prompt=True,
+        reasoning_config=reasoning_config,
+    )
+    return _count_encoded(family, prompt + completion) - _count_encoded(family, prompt)
+
+
+def count_text_tokens(
+    text: str,
+    model: str | None,
+    *,
+    model_record: dict | None = None,
+    tool_adapter: str | None = None,
+) -> int:
+    if not text:
+        return 0
+    family = tokenizer_family_for_model(model, model_record, tool_adapter)
+    if family is None:
+        return _estimate_tokens(text, _multipliers_for_model(model))
+    return _count_encoded(family, text)
+
+
+def count_openai_reasoning_tokens(
+    reasoning: str,
+    model: str | None,
+    *,
+    model_record: dict | None = None,
+    tool_adapter: str | None = None,
+    prompt_messages=None,
+    reasoning_config: dict | None = None,
+) -> int:
+    if not reasoning:
+        return 0
+    family = tokenizer_family_for_model(model, model_record, tool_adapter)
+    if family is None or prompt_messages is None:
+        return count_text_tokens(
+            reasoning,
+            model,
+            model_record=model_record,
+            tool_adapter=tool_adapter,
+        )
+
+    prompt = render_chat_prompt(
+        prompt_messages,
+        family,
+        add_generation_prompt=True,
+        reasoning_config=reasoning_config,
+    )
+    rendered_reasoning = (
+        reasoning.strip() if family == QWEN_3_5_SPEC.family else reasoning
+    )
+    return _count_encoded(family, prompt + rendered_reasoning) - _count_encoded(
+        family, prompt
+    )
+
+
+def render_chat_prompt(
+    messages,
+    family: str,
+    *,
+    add_generation_prompt: bool,
+    reasoning_config: dict | None = None,
+) -> str:
+    spec = SPECS[family]
+    normalized_messages = _normalize_messages(
+        messages,
+        parse_tool_arguments=spec.encoder is None,
+    )
+
+    if spec.encoder is not None:
+        encode_messages = _load_deepseek_encoder(spec)
+        effort = (reasoning_config or {}).get("effort")
+        return encode_messages(
+            normalized_messages,
+            thinking_mode="thinking",
+            drop_thinking=True,
+            add_default_bos_token=True,
+            reasoning_effort=effort,
+        )
+
+    template = _load_template(spec)
+    effort = (reasoning_config or {}).get("effort")
+    context = {
+        "messages": normalized_messages,
+        "tools": None,
+        "add_generation_prompt": add_generation_prompt,
+        "enable_thinking": True,
+        "clear_thinking": True,
+        "add_vision_id": False,
+    }
+    if effort:
+        context["reasoning_effort"] = effort
+    return template.render(**context)
 
 
 def estimate_token_by_model(model: str | None, text: str) -> int:
-    if not text:
-        return 0
-
-    lowered = (model or "").lower()
-    if "gemini" in lowered:
-        multipliers = GEMINI_MULTIPLIERS
-    elif "claude" in lowered:
-        multipliers = CLAUDE_MULTIPLIERS
-    else:
-        multipliers = OPENAI_MULTIPLIERS
-
-    return _estimate_tokens(text, multipliers)
+    return count_text_tokens(text, model)
 
 
 def estimate_openai_request_tokens(messages, model: str | None, tools=None) -> int:
+    # Kept for callers outside the service. Exact supported-model counting is
+    # available when the actual model record/adapter is supplied above.
+    family = tokenizer_family_for_model(model)
+    if family is not None and not tools:
+        return count_openai_request_tokens(messages, model)
+    return _estimate_openai_request_tokens(messages, model, tools)
+
+
+def estimate_claude_request_tokens(
+    system, messages, model: str | None, tools=None
+) -> int:
     texts = []
-    message_count = 0
-    name_count = 0
-    tool_count = 0
-
-    for message in messages or []:
-        message_count += 1
-        role = message.get("role")
-        if role:
-            texts.append(str(role))
-
-        name = message.get("name")
-        if name:
-            name_count += 1
-            texts.append(str(name))
-
-        texts.extend(_extract_message_texts(message))
-
-    for tool in tools or []:
-        if tool.get("type") != "function":
-            continue
-        tool_count += 1
-        function = tool.get("function", {})
-        if function.get("name"):
-            texts.append(str(function["name"]))
-        if function.get("description"):
-            texts.append(str(function["description"]))
-        if function.get("parameters") is not None:
-            texts.append(json.dumps(function["parameters"], ensure_ascii=False, sort_keys=True))
-
-    token_count = estimate_token_by_model(model, "\n".join(texts))
-    token_count += tool_count * 8
-    token_count += message_count * 3
-    token_count += name_count * 3
-    if message_count:
-        token_count += 3
-    return token_count
-
-
-def estimate_claude_request_tokens(system, messages, model: str | None, tools=None) -> int:
-    texts = []
-
     if isinstance(system, str):
         texts.append(system)
     elif isinstance(system, list):
@@ -140,47 +326,431 @@ def estimate_claude_request_tokens(system, messages, model: str | None, tools=No
         if tool.get("description"):
             texts.append(str(tool["description"]))
         if tool.get("input_schema") is not None:
-            texts.append(json.dumps(tool["input_schema"], ensure_ascii=False, sort_keys=True))
-
+            texts.append(
+                json.dumps(tool["input_schema"], ensure_ascii=False, sort_keys=True)
+            )
     return estimate_token_by_model(model, "\n".join(texts))
+
+
+def _load_tokenizer(spec: TokenizerSpec) -> Tokenizer:
+    with _cache_lock:
+        tokenizer = _tokenizers.get(spec.tokenizer.sha256)
+        if tokenizer is None:
+            path = _artifact_path(spec, spec.tokenizer)
+            try:
+                tokenizer = Tokenizer.from_file(str(path))
+            except Exception as exc:
+                raise _tokenizer_error(spec, "load tokenizer", exc) from exc
+            _tokenizers[spec.tokenizer.sha256] = tokenizer
+        return tokenizer
+
+
+def _load_template(spec: TokenizerSpec):
+    with _cache_lock:
+        template = _templates.get(spec.family)
+        if template is None:
+            if spec.template is None:
+                raise _tokenizer_error(spec, "load missing chat template")
+            source = _artifact_path(spec, spec.template).read_text(encoding="utf-8")
+            environment = ImmutableSandboxedEnvironment(
+                trim_blocks=True,
+                lstrip_blocks=True,
+                autoescape=False,
+                extensions=["jinja2.ext.loopcontrols"],
+            )
+            environment.filters["tojson"] = _tojson
+            environment.globals["raise_exception"] = _raise_template_exception
+            environment.globals["strftime_now"] = _strftime_now
+            template = environment.from_string(source)
+            _templates[spec.family] = template
+        return template
+
+
+def _load_deepseek_encoder(spec: TokenizerSpec):
+    with _cache_lock:
+        cache_key = spec.encoder.sha256 if spec.encoder else spec.family
+        encoder = _deepseek_encoders.get(cache_key)
+        if encoder is None:
+            if spec.encoder is None:
+                raise _tokenizer_error(spec, "load missing message encoder")
+            path = _artifact_path(spec, spec.encoder)
+            namespace = {"__name__": f"_genai_{spec.family}_encoding"}
+            try:
+                source = path.read_text(encoding="utf-8")
+                exec(compile(source, str(path), "exec"), namespace)
+                encoder = namespace["encode_messages"]
+            except Exception as exc:
+                raise _tokenizer_error(spec, "load message encoder", exc) from exc
+            _deepseek_encoders[cache_key] = encoder
+        return encoder
+
+
+def _artifact_path(spec: TokenizerSpec, artifact: Artifact) -> Path:
+    cache_dir = Path(
+        os.environ.get(TOKENIZER_CACHE_ENV)
+        or Path.home() / ".cache" / "genai2openai" / "tokenizers"
+    )
+    filename = f"{artifact.sha256[:12]}-{Path(artifact.path).name}"
+    destination = cache_dir / filename
+
+    with _cache_lock:
+        if destination.is_file() and _sha256(destination) == artifact.sha256:
+            return destination
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        url = f"{HF_BASE_URL}/{spec.repository}/resolve/{spec.revision}/{artifact.path}"
+        retry_count = 0
+        while True:
+            try:
+                _download_artifact(url, cache_dir, destination, artifact.sha256)
+                return destination
+            except Exception as exc:
+                status_code = getattr(
+                    getattr(exc, "response", None), "status_code", None
+                )
+                retryable = (
+                    isinstance(exc, requests.RequestException)
+                    and (status_code is None or is_retryable_status(status_code))
+                ) or isinstance(exc, ArtifactChecksumError)
+                if retryable and schedule_retry(
+                    _logger,
+                    max_retries=DEFAULT_MAX_RETRIES,
+                    backoff=DEFAULT_RETRY_BACKOFF,
+                    retry_count=retry_count,
+                    operation=f"tokenizer artifact download for {spec.repository}",
+                    reason=str(exc),
+                ):
+                    retry_count += 1
+                    continue
+                raise _tokenizer_error(spec, f"download {artifact.path}", exc) from exc
+
+
+class ArtifactChecksumError(ValueError):
+    pass
+
+
+def _download_artifact(
+    url: str,
+    cache_dir: Path,
+    destination: Path,
+    expected_sha256: str,
+) -> None:
+    temporary_path = None
+    response = None
+    try:
+        response = requests.get(url, stream=True, timeout=(10, 120))
+        response.raise_for_status()
+        with tempfile.NamedTemporaryFile(dir=cache_dir, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    temporary.write(chunk)
+        if _sha256(temporary_path) != expected_sha256:
+            raise ArtifactChecksumError("downloaded artifact checksum mismatch")
+        temporary_path.replace(destination)
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _count_encoded(family: str, text: str) -> int:
+    spec = SPECS[family]
+    try:
+        return len(_load_tokenizer(spec).encode(text, add_special_tokens=False).ids)
+    except ProxyError:
+        raise
+    except Exception as exc:
+        raise _tokenizer_error(spec, "encode prompt", exc) from exc
+
+
+def _tokenizer_error(
+    spec: TokenizerSpec, operation: str, exc: Exception | None = None
+) -> ProxyError:
+    detail = f": {exc}" if exc else ""
+    return ProxyError(
+        f"Unable to {operation} for {spec.repository}{detail}",
+        error_type="api_error",
+        code="tokenizer_unavailable",
+        status=503,
+    )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _tojson(
+    value,
+    ensure_ascii=False,
+    indent=None,
+    separators=None,
+    sort_keys=False,
+):
+    return json.dumps(
+        value,
+        ensure_ascii=ensure_ascii,
+        indent=indent,
+        separators=separators,
+        sort_keys=sort_keys,
+    )
+
+
+def _raise_template_exception(message):
+    raise TemplateError(message)
+
+
+def _strftime_now(format_string):
+    return datetime.now().strftime(format_string)
+
+
+def _normalize_messages(messages, *, parse_tool_arguments: bool) -> list[dict]:
+    normalized = []
+    for original in messages or []:
+        message = dict(original)
+        tool_calls = []
+        for original_call in message.get("tool_calls") or []:
+            tool_call = dict(original_call)
+            function = dict(tool_call.get("function") or {})
+            arguments = function.get("arguments", {})
+            if parse_tool_arguments and isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {"arguments": arguments}
+            function["arguments"] = arguments
+            tool_call["function"] = function
+            tool_calls.append(tool_call)
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        normalized.append(message)
+    return normalized
+
+
+def _serialized_completion(
+    message: dict,
+    family: str,
+    *,
+    finish_reason: str = "stop",
+) -> str:
+    reasoning = message.get("reasoning_content") or ""
+    content = message.get("content") or ""
+    tool_calls = message.get("tool_calls") or []
+
+    if finish_reason == "length" and not content and not tool_calls:
+        return (
+            str(reasoning).strip() if family == QWEN_3_5_SPEC.family else str(reasoning)
+        )
+
+    include_end_token = finish_reason != "length"
+
+    if family.startswith("deepseek_v4"):
+        parts = [str(reasoning), "</think>"]
+        parts.append(str(content))
+        if tool_calls:
+            parts.append(_deepseek_tool_calls(tool_calls))
+        if include_end_token:
+            parts.append("<｜end▁of▁sentence｜>")
+        return "".join(parts)
+
+    if family == GLM_5_2_SPEC.family:
+        rendered_content = (
+            "None"
+            if "content" in message and message.get("content") is None
+            else str(content).strip()
+        )
+        parts = [str(reasoning), "</think>", rendered_content]
+        parts.extend(_glm_tool_call(call) for call in tool_calls)
+        return "".join(parts)
+
+    rendered_content = str(content).strip()
+    parts = [str(reasoning).strip(), "\n</think>\n\n", rendered_content]
+    for index, call in enumerate(tool_calls):
+        if index == 0:
+            parts.append("\n\n" if rendered_content else "")
+        else:
+            parts.append("\n")
+        parts.append(_qwen_tool_call(call))
+    if include_end_token:
+        parts.append("<|im_end|>\n")
+    return "".join(parts)
+
+
+def _deepseek_tool_calls(tool_calls) -> str:
+    calls = []
+    for call in tool_calls:
+        function = call.get("function") or {}
+        arguments = _json_arguments(function.get("arguments"))
+        parameters = []
+        for key, value in arguments.items():
+            is_string = isinstance(value, str)
+            rendered = value if is_string else json.dumps(value, ensure_ascii=False)
+            parameters.append(
+                f'<｜DSML｜parameter name="{key}" string="{str(is_string).lower()}">'
+                f"{rendered}</｜DSML｜parameter>"
+            )
+        calls.append(
+            f'<｜DSML｜invoke name="{function.get("name", "")}">\n'
+            + "\n".join(parameters)
+            + "\n</｜DSML｜invoke>"
+        )
+    return "\n\n<｜DSML｜tool_calls>\n" + "\n".join(calls) + "\n</｜DSML｜tool_calls>"
+
+
+def _glm_tool_call(call) -> str:
+    function = call.get("function") or {}
+    arguments = _json_arguments(function.get("arguments"))
+    rendered = "".join(
+        f"<arg_key>{key}</arg_key><arg_value>"
+        f"{value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)}"
+        "</arg_value>"
+        for key, value in arguments.items()
+    )
+    return f"<tool_call>{function.get('name', '')}{rendered}</tool_call>"
+
+
+def _qwen_tool_call(call) -> str:
+    function = call.get("function") or {}
+    arguments = _json_arguments(function.get("arguments"))
+    parameters = "".join(
+        f"<parameter={key}>\n{_qwen_argument_value(value)}\n</parameter>\n"
+        for key, value in arguments.items()
+    )
+    return (
+        f"<tool_call>\n<function={function.get('name', '')}>\n"
+        f"{parameters}</function>\n</tool_call>"
+    )
+
+
+def _qwen_argument_value(value) -> str:
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _json_arguments(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {"arguments": str(value or "")}
+    return parsed if isinstance(parsed, dict) else {"arguments": parsed}
+
+
+def _completion_text(message: dict) -> str:
+    texts = [
+        str(message.get("reasoning_content") or ""),
+        str(message.get("content") or ""),
+    ]
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        texts.extend(
+            (str(function.get("name") or ""), str(function.get("arguments") or ""))
+        )
+    return "".join(texts)
+
+
+@dataclass(frozen=True, slots=True)
+class Multipliers:
+    word: float
+    number: float
+    cjk: float
+    symbol: float
+    math_symbol: float
+    url_delim: float
+    at_sign: float
+    emoji: float
+    newline: float
+    space: float
+
+
+OPENAI_MULTIPLIERS = Multipliers(1.02, 1.55, 0.85, 0.4, 2.68, 1.0, 2.0, 2.12, 0.5, 0.42)
+CLAUDE_MULTIPLIERS = Multipliers(
+    1.13, 1.63, 1.21, 0.4, 4.52, 1.26, 2.82, 2.6, 0.89, 0.39
+)
+GEMINI_MULTIPLIERS = Multipliers(1.15, 2.8, 0.68, 0.38, 1.05, 1.2, 2.5, 1.08, 1.15, 0.2)
+MATH_SYMBOLS = set(
+    "∑∫∂√∞≤≥≠≈±×÷∈∉∋∌⊂⊃⊆⊇∪∩∧∨¬∀∃∄∅∆∇∝∟∠∡∢°′″‴⁺⁻⁼⁽⁾ⁿ₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎²³¹⁴⁵⁶⁷⁸⁹⁰"
+)
+URL_DELIMS = set("/:?&=;#%")
+
+
+def _estimate_openai_request_tokens(messages, model: str | None, tools=None) -> int:
+    texts = []
+    message_count = 0
+    name_count = 0
+    tool_count = 0
+    for message in messages or []:
+        message_count += 1
+        if message.get("role"):
+            texts.append(str(message["role"]))
+        if message.get("name"):
+            name_count += 1
+            texts.append(str(message["name"]))
+        texts.extend(_extract_message_texts(message))
+    for tool in tools or []:
+        if tool.get("type") != "function":
+            continue
+        tool_count += 1
+        function = tool.get("function", {})
+        texts.extend(
+            str(function[key]) for key in ("name", "description") if function.get(key)
+        )
+        if function.get("parameters") is not None:
+            texts.append(
+                json.dumps(function["parameters"], ensure_ascii=False, sort_keys=True)
+            )
+    count = _estimate_tokens("\n".join(texts), _multipliers_for_model(model))
+    return (
+        count
+        + tool_count * 8
+        + message_count * 3
+        + name_count * 3
+        + (3 if message_count else 0)
+    )
+
+
+def _multipliers_for_model(model: str | None) -> Multipliers:
+    lowered = (model or "").lower()
+    if "gemini" in lowered:
+        return GEMINI_MULTIPLIERS
+    if "claude" in lowered:
+        return CLAUDE_MULTIPLIERS
+    return OPENAI_MULTIPLIERS
 
 
 def _extract_message_texts(message) -> list[str]:
     content = message.get("content")
     if isinstance(content, str):
-        return [content]
-
-    texts = []
-    if isinstance(content, list):
+        texts = [content]
+    elif isinstance(content, list):
+        texts = []
         for part in content:
             if not isinstance(part, dict):
                 texts.append(str(part))
-                continue
-            part_type = part.get("type")
-            if part_type == "text":
+            elif part.get("type") == "text":
                 texts.append(part.get("text", ""))
-            elif part_type == "image_url":
-                image_url = part.get("image_url", {})
-                if isinstance(image_url, dict) and image_url.get("url"):
-                    texts.append("[image]")
-            elif part_type == "input_audio":
-                texts.append("[audio]")
-            elif part_type == "file":
-                texts.append("[file]")
+            elif part.get("type") in ("image_url", "input_audio", "file"):
+                texts.append(f"[{part.get('type')}]")
             else:
                 texts.append(json.dumps(part, ensure_ascii=False, sort_keys=True))
-        return texts
-
-    if content is not None:
-        texts.append(json.dumps(content, ensure_ascii=False, sort_keys=True))
-
-    for tool_call in message.get("tool_calls") or []:
-        function = tool_call.get("function", {})
-        if function.get("name"):
-            texts.append(str(function["name"]))
-        if function.get("arguments"):
-            texts.append(str(function["arguments"]))
-
+    elif content is None:
+        texts = []
+    else:
+        texts = [json.dumps(content, ensure_ascii=False, sort_keys=True)]
+    for call in message.get("tool_calls") or []:
+        function = call.get("function", {})
+        texts.extend(
+            str(function[key]) for key in ("name", "arguments") if function.get(key)
+        )
     return texts
 
 
@@ -189,21 +759,18 @@ def _extract_claude_content_texts(content) -> list[str]:
         return []
     if isinstance(content, str):
         return [content]
-
     texts = []
     for block in content:
         if not isinstance(block, dict):
             texts.append(str(block))
-            continue
-        block_type = block.get("type")
-        if block_type == "text":
+        elif block.get("type") == "text":
             texts.append(block.get("text", ""))
-        elif block_type == "tool_use":
-            if block.get("name"):
-                texts.append(str(block["name"]))
-            if block.get("input") is not None:
-                texts.append(json.dumps(block["input"], ensure_ascii=False, sort_keys=True))
-        elif block_type == "tool_result":
+        elif block.get("type") == "tool_use":
+            texts.append(str(block.get("name") or ""))
+            texts.append(
+                json.dumps(block.get("input", {}), ensure_ascii=False, sort_keys=True)
+            )
+        elif block.get("type") == "tool_result":
             texts.append(_normalize_text(block.get("content")))
         else:
             texts.append(json.dumps(block, ensure_ascii=False, sort_keys=True))
@@ -217,9 +784,9 @@ def _normalize_text(value) -> str:
         return value
     if isinstance(value, list):
         return "\n".join(_normalize_text(item) for item in value)
+    if isinstance(value, dict) and value.get("type") == "text":
+        return value.get("text", "")
     if isinstance(value, dict):
-        if value.get("type") == "text":
-            return value.get("text", "")
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
     return str(value)
 
@@ -227,50 +794,60 @@ def _normalize_text(value) -> str:
 def _estimate_tokens(text: str, multipliers: Multipliers) -> int:
     count = 0.0
     current_word_type = None
-
     for char in text:
         if char.isspace():
             current_word_type = None
-            if char in "\n\t":
-                count += multipliers.newline
-            else:
-                count += multipliers.space
-            continue
-
-        if _is_cjk(char):
+            count += multipliers.newline if char in "\n\t" else multipliers.space
+        elif _is_cjk(char):
             current_word_type = None
             count += multipliers.cjk
-            continue
-
-        if _is_emoji(char):
+        elif _is_emoji(char):
             current_word_type = None
             count += multipliers.emoji
-            continue
-
-        if char.isalpha() or char.isnumeric():
+        elif char.isalpha() or char.isnumeric():
             new_type = "number" if char.isnumeric() else "latin"
             if current_word_type != new_type:
-                count += multipliers.number if new_type == "number" else multipliers.word
+                count += (
+                    multipliers.number if new_type == "number" else multipliers.word
+                )
                 current_word_type = new_type
-            continue
-
-        current_word_type = None
-        if _is_math_symbol(char):
-            count += multipliers.math_symbol
-        elif char == "@":
-            count += multipliers.at_sign
-        elif char in URL_DELIMS:
-            count += multipliers.url_delim
         else:
-            count += multipliers.symbol
+            current_word_type = None
+            if _is_math_symbol(char):
+                count += multipliers.math_symbol
+            elif char == "@":
+                count += multipliers.at_sign
+            elif char in URL_DELIMS:
+                count += multipliers.url_delim
+            else:
+                count += multipliers.symbol
+    return max(1, math.ceil(count)) if text else 0
 
-    return int(math.ceil(count)) + multipliers.base_pad
+
+def _model_text(model: str | None, record: dict | None) -> str:
+    values = [model or ""]
+    for key in (
+        "aiType",
+        "aiName",
+        "simpleName",
+        "descInfo",
+        "descInfoEn",
+        "rootModelName",
+    ):
+        if record and record.get(key) is not None:
+            values.append(str(record[key]))
+    return " ".join(values).lower()
+
+
+def _contains_version(text: str, name: str, major: str, minor: str) -> bool:
+    return bool(re.search(rf"{name}[\s_.-]*{major}(?:[\s_.-]*{minor})(?!\d)", text))
 
 
 def _is_cjk(char: str) -> bool:
     code = ord(char)
     return (
-        0x4E00 <= code <= 0x9FFF
+        0x3400 <= code <= 0x9FFF
+        or 0xF900 <= code <= 0xFAFF
         or 0x3040 <= code <= 0x30FF
         or 0xAC00 <= code <= 0xD7A3
     )
@@ -278,12 +855,7 @@ def _is_cjk(char: str) -> bool:
 
 def _is_emoji(char: str) -> bool:
     code = ord(char)
-    return (
-        0x1F300 <= code <= 0x1F9FF
-        or 0x2600 <= code <= 0x26FF
-        or 0x2700 <= code <= 0x27BF
-        or 0x1FA00 <= code <= 0x1FAFF
-    )
+    return 0x1F000 <= code <= 0x1FAFF or 0x2600 <= code <= 0x27BF
 
 
 def _is_math_symbol(char: str) -> bool:

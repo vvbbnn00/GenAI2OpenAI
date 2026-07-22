@@ -22,12 +22,19 @@ class ResponsesRequestContext:
     tool_map: dict[str, ResponseToolMapping]
 
 
-def convert_responses_to_openai_request(req_data: dict | None) -> ResponsesRequestContext:
+def convert_responses_to_openai_request(
+    req_data: dict | None,
+) -> ResponsesRequestContext:
     if not isinstance(req_data, dict):
         raise ProxyError("Request body must be a JSON object")
 
     input_items = _normalize_input(req_data.get("input"))
-    request_tools = list(req_data.get("tools") or [])
+    request_tools = req_data.get("tools") or []
+    if not isinstance(request_tools, list) or any(
+        not isinstance(tool, dict) for tool in request_tools
+    ):
+        raise ProxyError("'tools' must be a list of objects")
+    request_tools = list(request_tools)
     request_tools.extend(_additional_tools_from_input(input_items))
     openai_tools, tool_map = _convert_responses_tools(request_tools)
     tool_choice = req_data.get("tool_choice")
@@ -78,7 +85,9 @@ def make_event(event_name: str, payload: dict) -> str:
     return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def response_created_event(response_id: str, model: str, created: int | None = None) -> str:
+def response_created_event(
+    response_id: str, model: str, created: int | None = None
+) -> str:
     created_at = int(created or datetime.now().timestamp())
     return make_event(
         "response.created",
@@ -116,7 +125,9 @@ def response_reasoning_text_delta(delta: str, content_index: int = 0) -> str:
     )
 
 
-def response_custom_tool_call_input_delta(item_id: str, call_id: str, delta: str) -> str:
+def response_custom_tool_call_input_delta(
+    item_id: str, call_id: str, delta: str
+) -> str:
     return make_event(
         "response.custom_tool_call_input.delta",
         {
@@ -177,7 +188,9 @@ def response_completed_event(
     )
 
 
-def response_failed_event(response_id: str, message: str, *, code: str | None = None) -> str:
+def response_failed_event(
+    response_id: str, message: str, *, code: str | None = None
+) -> str:
     return make_event(
         "response.failed",
         {
@@ -215,7 +228,9 @@ def make_message_added_item(item_id: str) -> dict:
     }
 
 
-def make_response_tool_item(tool_call: dict, tool_map: dict[str, ResponseToolMapping]) -> dict:
+def make_response_tool_item(
+    tool_call: dict, tool_map: dict[str, ResponseToolMapping]
+) -> dict:
     function_data = tool_call.get("function") or {}
     model_name = function_data.get("name") or ""
     mapping = tool_map.get(model_name) or ResponseToolMapping(
@@ -279,6 +294,8 @@ def _normalize_input(input_data) -> list:
     if isinstance(input_data, dict):
         return [input_data]
     if isinstance(input_data, list):
+        if any(not isinstance(item, dict) for item in input_data):
+            raise ProxyError("'input' arrays must contain objects")
         return input_data
     raise ProxyError("'input' must be a string, object, or list")
 
@@ -287,7 +304,12 @@ def _additional_tools_from_input(input_items: list) -> list:
     tools = []
     for item in input_items:
         if isinstance(item, dict) and item.get("type") == "additional_tools":
-            tools.extend(item.get("tools") or [])
+            additional_tools = item.get("tools") or []
+            if not isinstance(additional_tools, list) or any(
+                not isinstance(tool, dict) for tool in additional_tools
+            ):
+                raise ProxyError("'additional_tools.tools' must be a list of objects")
+            tools.extend(additional_tools)
     return tools
 
 
@@ -323,7 +345,8 @@ def _convert_response_input_items(
                     "content": None,
                     "tool_calls": [
                         {
-                            "id": item.get("call_id") or f"call_{uuid.uuid4().hex[:24]}",
+                            "id": item.get("call_id")
+                            or f"call_{uuid.uuid4().hex[:24]}",
                             "type": "function",
                             "function": {
                                 "name": _model_name_for_response_call(item, tool_map),
@@ -340,7 +363,8 @@ def _convert_response_input_items(
                     "content": None,
                     "tool_calls": [
                         {
-                            "id": item.get("call_id") or f"call_{uuid.uuid4().hex[:24]}",
+                            "id": item.get("call_id")
+                            or f"call_{uuid.uuid4().hex[:24]}",
                             "type": "function",
                             "function": {
                                 "name": item.get("name") or "custom_tool",
@@ -362,7 +386,9 @@ def _convert_response_input_items(
                 {
                     "role": "tool",
                     "tool_call_id": item.get("call_id") or "unknown",
-                    "content": _output_to_text(item.get("output", item.get("tools", ""))),
+                    "content": _output_to_text(
+                        item.get("output", item.get("tools", ""))
+                    ),
                 }
             )
         elif item_type == "local_shell_call":
@@ -380,9 +406,7 @@ def _response_role_to_chat_role(role) -> str:
 
 def _is_response_message_item(item: dict) -> bool:
     return item.get("type") == "message" or (
-        item.get("type") is None
-        and "role" in item
-        and "content" in item
+        item.get("type") is None and "role" in item and "content" in item
     )
 
 
@@ -446,7 +470,11 @@ def _local_shell_call_to_chat_message(item: dict) -> dict:
                 "function": {
                     "name": "shell_command",
                     "arguments": json.dumps(
-                        {key: value for key, value in arguments.items() if value is not None},
+                        {
+                            key: value
+                            for key, value in arguments.items()
+                            if value is not None
+                        },
                         ensure_ascii=False,
                     ),
                 },
@@ -455,7 +483,9 @@ def _local_shell_call_to_chat_message(item: dict) -> dict:
     }
 
 
-def _convert_responses_tools(tools: list) -> tuple[list[dict], dict[str, ResponseToolMapping]]:
+def _convert_responses_tools(
+    tools: list,
+) -> tuple[list[dict], dict[str, ResponseToolMapping]]:
     openai_tools = []
     tool_map = {}
     used_names = set()
@@ -497,7 +527,9 @@ def _convert_responses_tools(tools: list) -> tuple[list[dict], dict[str, Respons
                 )
         elif tool_type == "custom":
             response_name = tool.get("name") or "custom_tool"
-            model_name = _unique_tool_name(_sanitize_tool_name(response_name), used_names)
+            model_name = _unique_tool_name(
+                _sanitize_tool_name(response_name), used_names
+            )
             openai_tools.append(_custom_tool_as_openai_function(tool, model_name))
             tool_map[model_name] = ResponseToolMapping(
                 kind="custom",
@@ -519,8 +551,12 @@ def _convert_responses_tools(tools: list) -> tuple[list[dict], dict[str, Respons
     return openai_tools, tool_map
 
 
-def _openai_function_tool(tool: dict, model_name: str, description_prefix: str | None = None) -> dict:
-    function_data = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+def _openai_function_tool(
+    tool: dict, model_name: str, description_prefix: str | None = None
+) -> dict:
+    function_data = (
+        tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    )
     description = function_data.get("description") or ""
     if description_prefix:
         description = f"{description_prefix}: {description}".strip()
@@ -529,13 +565,16 @@ def _openai_function_tool(tool: dict, model_name: str, description_prefix: str |
         "function": {
             "name": model_name,
             "description": description,
-            "parameters": function_data.get("parameters") or {"type": "object", "properties": {}},
+            "parameters": function_data.get("parameters")
+            or {"type": "object", "properties": {}},
         },
     }
 
 
 def _custom_tool_as_openai_function(tool: dict, model_name: str) -> dict:
-    description = tool.get("description") or f"Call custom tool {tool.get('name') or model_name}."
+    description = (
+        tool.get("description") or f"Call custom tool {tool.get('name') or model_name}."
+    )
     fmt = tool.get("format")
     if isinstance(fmt, dict):
         syntax = fmt.get("syntax")
@@ -566,13 +605,16 @@ def _tool_search_as_openai_function(tool: dict, model_name: str) -> dict:
         "function": {
             "name": model_name,
             "description": tool.get("description") or "Search available client tools.",
-            "parameters": tool.get("parameters") or {"type": "object", "properties": {}},
+            "parameters": tool.get("parameters")
+            or {"type": "object", "properties": {}},
         },
     }
 
 
 def _tool_name(tool: dict) -> str:
-    function_data = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+    function_data = (
+        tool.get("function") if isinstance(tool.get("function"), dict) else {}
+    )
     return function_data.get("name") or tool.get("name") or "tool"
 
 
@@ -596,7 +638,7 @@ def _sanitize_tool_name(name: str) -> str:
 def _convert_tool_choice(choice, tool_map: dict[str, ResponseToolMapping]):
     if choice in (None, "auto"):
         return "auto"
-    if choice in {"none", "required"}:
+    if choice in ("none", "required"):
         return choice
     if isinstance(choice, dict):
         choice_type = choice.get("type")
@@ -646,10 +688,18 @@ def _custom_input_from_arguments(arguments: str) -> str:
             return parsed["input"]
         if len(parsed) == 1:
             value = next(iter(parsed.values()))
-            return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            return (
+                value
+                if isinstance(value, str)
+                else json.dumps(value, ensure_ascii=False)
+            )
         return json.dumps(parsed, ensure_ascii=False)
     if parsed is not None:
-        return parsed if isinstance(parsed, str) else json.dumps(parsed, ensure_ascii=False)
+        return (
+            parsed
+            if isinstance(parsed, str)
+            else json.dumps(parsed, ensure_ascii=False)
+        )
     return arguments or ""
 
 

@@ -43,6 +43,7 @@ RUN python -m pip install \
     markupsafe==3.0.3 \
     pycparser==3.0 \
     requests==2.32.5 \
+    tokenizers==0.22.2 \
     urllib3==2.5.0 \
     werkzeug==3.1.3 \
     "shanghaitech-ids-passkey @ git+https://github.com/vvbbnn00/shanghaitech-ids-passkey.git@7c4df62716ceb3d94452d22f3d07f19ff1b8db8b"

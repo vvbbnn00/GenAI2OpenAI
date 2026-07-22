@@ -1,9 +1,17 @@
 import time
 import uuid
 
-from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
+from flask import (
+    Blueprint,
+    Response,
+    current_app,
+    jsonify,
+    request,
+    stream_with_context,
+)
 
 from genai_proxy.compat.openai import openai_error
+from genai_proxy.compat.responses import convert_responses_to_openai_request
 from genai_proxy.errors import ProxyError
 from genai_proxy.routes import prime_stream
 
@@ -11,7 +19,9 @@ from genai_proxy.routes import prime_stream
 bp = Blueprint("openai", __name__)
 
 
-def _billing_error_response(exc: ProxyError, fallback_message: str, fallback_error_type: str):
+def _billing_error_response(
+    exc: ProxyError, fallback_message: str, fallback_error_type: str
+):
     message = exc.message
     error_type = exc.error_type
 
@@ -45,22 +55,28 @@ def chat_completions():
     streaming_response_started = False
 
     try:
-        req_data = request.get_json()
-        stream = bool((req_data or {}).get("stream", False))
+        req_data = request.get_json(silent=True)
+        if not isinstance(req_data, dict):
+            raise ProxyError("Request body must be a JSON object")
+        stream = bool(req_data.get("stream", False))
+        messages = req_data.get("messages")
+        message_count = len(messages) if isinstance(messages, list) else 0
         logger.info(
             "[%s] model=%s stream=%s tools=%s messages=%d",
             request_id,
-            (req_data or {}).get("model", "GPT-4.1"),
+            req_data.get("model", "GPT-4.1"),
             stream,
-            bool((req_data or {}).get("tools")),
-            len((req_data or {}).get("messages", [])),
+            bool(req_data.get("tools")),
+            message_count,
         )
 
         if stream:
             gen = prime_stream(service.stream_openai_completion(req_data))
             streaming_response_started = True
             return Response(
-                stream_with_context(_stream_with_completion_log(gen, logger, request_id, start_time)),
+                stream_with_context(
+                    _stream_with_completion_log(gen, logger, request_id, start_time)
+                ),
                 mimetype="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -117,7 +133,9 @@ def responses():
             gen = prime_stream(service.stream_responses(req_data))
             streaming_response_started = True
             return Response(
-                stream_with_context(_stream_with_completion_log(gen, logger, request_id, start_time)),
+                stream_with_context(
+                    _stream_with_completion_log(gen, logger, request_id, start_time)
+                ),
                 mimetype="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -146,6 +164,36 @@ def responses():
         if not streaming_response_started:
             elapsed = time.monotonic() - start_time
             logger.info("[%s] completed in %.2fs", request_id, elapsed)
+
+
+@bp.route("/v1/responses/input_tokens", methods=["POST"])
+def response_input_tokens():
+    service = current_app.extensions["genai_service"]
+    try:
+        context = convert_responses_to_openai_request(request.get_json(silent=True))
+        return jsonify(
+            {
+                "object": "response.input_tokens",
+                "input_tokens": service.count_openai_input_tokens(
+                    context.openai_request
+                ),
+            }
+        )
+    except ProxyError as exc:
+        return openai_error(
+            exc.message,
+            error_type=exc.error_type,
+            code=exc.code,
+            status=exc.status,
+        )
+    except Exception as exc:
+        current_app.extensions["logger"].exception("Unhandled input token count error")
+        return openai_error(
+            str(exc),
+            error_type="server_error",
+            code="internal_error",
+            status=500,
+        )
 
 
 @bp.route("/v1/models", methods=["GET"])
