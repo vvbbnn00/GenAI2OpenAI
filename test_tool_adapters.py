@@ -44,7 +44,10 @@ SEARCH_TOOL = {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
-                "num_results": {"type": "integer", "description": "Number of results to return"},
+                "num_results": {
+                    "type": "integer",
+                    "description": "Number of results to return",
+                },
             },
             "required": ["query"],
         },
@@ -274,13 +277,15 @@ def test_glm_malformed_tool_call_close_tag():
     )
     assert remaining is None
     assert tool_calls[0]["function"]["name"] == "get_weather"
-    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"location": "Shanghai"}
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "location": "Shanghai"
+    }
 
 
 def test_minimax_think_block_is_not_returned_as_content():
     content = (
         "<think>I should use the weather tool.</think>\n"
-        "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"location\":\"Shanghai\"}}</tool_call>"
+        '<tool_call>{"name":"get_weather","arguments":{"location":"Shanghai"}}</tool_call>'
     )
     tool_calls, remaining = extract_tool_calls(
         content,
@@ -290,7 +295,9 @@ def test_minimax_think_block_is_not_returned_as_content():
     )
     assert remaining is None
     assert tool_calls[0]["function"]["name"] == "get_weather"
-    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"location": "Shanghai"}
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "location": "Shanghai"
+    }
 
 
 def test_claude_code_arg_key_tool_call_body_is_recovered():
@@ -317,7 +324,7 @@ def test_claude_code_arg_key_tool_call_body_is_recovered():
 def test_claude_code_arg_key_tool_call_with_windows_backslashes_is_recovered():
     content = (
         '<tool_call>Bash<arg_key>command": '
-        '"cd \'f:\\onedrive-vercel\\app\' && npm audit --json 2>&1 | head -2000", '
+        "\"cd 'f:\\onedrive-vercel\\app' && npm audit --json 2>&1 | head -2000\", "
         '"timeout": 60000</tool_call>'
     )
     tool_calls, _ = extract_tool_calls(
@@ -327,7 +334,10 @@ def test_claude_code_arg_key_tool_call_with_windows_backslashes_is_recovered():
         adapter=MINIMAX_ADAPTER,
     )
     arguments = json.loads(tool_calls[0]["function"]["arguments"])
-    assert arguments["command"] == "cd 'f:\\onedrive-vercel\\app' && npm audit --json 2>&1 | head -2000"
+    assert (
+        arguments["command"]
+        == "cd 'f:\\onedrive-vercel\\app' && npm audit --json 2>&1 | head -2000"
+    )
     assert arguments["timeout"] == 60000
 
 
@@ -431,7 +441,7 @@ def test_glm_malformed_reversed_arg_value_tool_call_is_recovered():
 def test_glm_malformed_reversed_shell_command_preserves_trailing_quote():
     content = (
         "<tool_call>exec_command"
-        "<arg_value>cmd</arg_key><arg_value>python -c \"print(\\\"hi\\\")\"</arg_value>"
+        '<arg_value>cmd</arg_key><arg_value>python -c "print(\\"hi\\")"</arg_value>'
         "</tool_call>"
     )
     tool_calls, remaining = extract_tool_calls(
@@ -442,7 +452,7 @@ def test_glm_malformed_reversed_shell_command_preserves_trailing_quote():
     )
     arguments = json.loads(tool_calls[0]["function"]["arguments"])
     assert remaining is None
-    assert arguments["cmd"] == "python -c \"print(\\\"hi\\\")\""
+    assert arguments["cmd"] == 'python -c "print(\\"hi\\")"'
 
 
 def test_glm_string_typed_shell_arguments_preserve_literal_values():
@@ -743,7 +753,7 @@ def test_minimax_xml_shell_command_preserves_trailing_quote():
     content = (
         "<minimax:tool_call>\n"
         '<invoke name="Bash">\n'
-        "<parameter name=\"command\">printf '%s\\n' \"hi\"</parameter>\n"
+        '<parameter name="command">printf \'%s\\n\' "hi"</parameter>\n'
         "</invoke>\n"
         "</minimax:tool_call>"
     )
@@ -804,13 +814,16 @@ def test_deepseek_v4_dsml_tool_calls_are_recovered():
     arguments = json.loads(tool_calls[0]["function"]["arguments"])
     assert remaining is None
     assert tool_calls[0]["function"]["name"] == "Read"
-    assert arguments == {"file_path": "f:\\onedrive-vercel\\app\\package.json", "limit": 80}
+    assert arguments == {
+        "file_path": "f:\\onedrive-vercel\\app\\package.json",
+        "limit": 80,
+    }
 
 
 def test_deepseek_fallback_json_shell_command_preserves_backslash_escapes():
     content = (
-        r'''<tool_call>{"name": "Bash", "arguments": {"command": '''
-        r'''"printf '%s\\n' \"hi\""}}}</tool_call>'''
+        r"""<tool_call>{"name": "Bash", "arguments": {"command": """
+        r""""printf '%s\\n' \"hi\""}}}</tool_call>"""
     )
     tool_calls, remaining = extract_tool_calls(
         content,
@@ -877,9 +890,9 @@ def test_deepseek_fallback_xml_arguments_preserve_explicit_json_types_and_canoni
 
 def test_json_tool_call_with_shell_regex_backslashes_is_recovered():
     content = (
-        r'''<tool_call>{"name": "Bash", "arguments": {"command": '''
-        r'''"cat \"f:/onedrive-vercel/app/package.json\" | grep -E '^\s+\"[^\"]+\":' | wc -l", '''
-        r'''"description": "Count direct dependencies"}}</tool_call>'''
+        r"""<tool_call>{"name": "Bash", "arguments": {"command": """
+        r""""cat \"f:/onedrive-vercel/app/package.json\" | grep -E '^\s+\"[^\"]+\":' | wc -l", """
+        r""""description": "Count direct dependencies"}}</tool_call>"""
     )
     tool_calls, remaining = extract_tool_calls(
         content,
@@ -890,7 +903,7 @@ def test_json_tool_call_with_shell_regex_backslashes_is_recovered():
     arguments = json.loads(tool_calls[0]["function"]["arguments"])
     assert remaining is None
     assert arguments["command"] == (
-        "cat \"f:/onedrive-vercel/app/package.json\" | grep -E '^\\s+\"[^\"]+\":' | wc -l"
+        'cat "f:/onedrive-vercel/app/package.json" | grep -E \'^\\s+"[^"]+":\' | wc -l'
     )
     assert arguments["description"] == "Count direct dependencies"
 
@@ -926,7 +939,9 @@ def test_bare_claude_code_arg_key_tool_call_is_recovered_for_non_streaming():
     )
     assert remaining == "I will inspect it."
     assert tool_calls[0]["function"]["name"] == "Bash"
-    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"command": "npm audit 2>&1"}
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "command": "npm audit 2>&1"
+    }
 
 
 def test_inline_shell_command_uses_schema_and_preserves_shell_quotes():
@@ -1093,19 +1108,31 @@ def test_tool_result_turn_allows_additional_tools_by_default():
                 }
             ],
         },
-        {"role": "tool", "tool_call_id": "call_weather", "content": "Shanghai is sunny."},
+        {
+            "role": "tool",
+            "tool_call_id": "call_weather",
+            "content": "Shanghai is sunny.",
+        },
     ]
 
     minimax_messages = inject_minimax_tool_prompt(messages, [WEATHER_TOOL])
-    assert minimax_messages[-1]["content"].startswith("<response>Shanghai is sunny.</response>")
-    assert "Only call another tool if the current result is genuinely insufficient" in minimax_messages[-1]["content"]
+    assert minimax_messages[-1]["content"].startswith(
+        "<response>Shanghai is sunny.</response>"
+    )
+    assert (
+        "Only call another tool if the current result is genuinely insufficient"
+        in minimax_messages[-1]["content"]
+    )
 
     deepseek_messages = inject_deepseek_tool_prompt(
         messages,
         [WEATHER_TOOL],
         adapter=DEEPSEEK_V4_FLASH_ADAPTER,
     )
-    assert deepseek_messages[-1]["content"] == "<tool_result>Shanghai is sunny.</tool_result>"
+    assert (
+        deepseek_messages[-1]["content"]
+        == "<tool_result>Shanghai is sunny.</tool_result>"
+    )
 
     glm52_messages = inject_glm_tool_prompt(
         messages,
@@ -1114,7 +1141,10 @@ def test_tool_result_turn_allows_additional_tools_by_default():
     )
     assert "# Tools" in glm52_messages[0]["content"]
     assert "<tools>" in glm52_messages[0]["content"]
-    assert "This turn must end with final assistant text only" not in glm52_messages[0]["content"]
+    assert (
+        "This turn must end with final assistant text only"
+        not in glm52_messages[0]["content"]
+    )
     assert "Do not call any tool again" not in glm52_messages[-1]["content"]
 
 
@@ -1242,7 +1272,10 @@ def test_glm52_prompt_filters_template_internal_tool_fields():
 
 
 def test_deepseek_v4_prompt_matches_hf_encoding_test_shape():
-    messages = [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "What's the weather in Beijing?"}]
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What's the weather in Beijing?"},
+    ]
     prompt = inject_deepseek_tool_prompt(
         messages,
         [WEATHER_TOOL, SEARCH_TOOL],
@@ -1250,13 +1283,25 @@ def test_deepseek_v4_prompt_matches_hf_encoding_test_shape():
     )[0]["content"]
 
     assert prompt.startswith("You are a helpful assistant.\n\n## Tools\n\n")
-    assert 'You have access to a set of tools to help answer the user\'s question. You can invoke tools by writing a "<｜DSML｜tool_calls>" block like the following:' in prompt
-    assert "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response." in prompt
-    assert "Otherwise, output directly after </think> with tool calls or final response." in prompt
+    assert (
+        'You have access to a set of tools to help answer the user\'s question. You can invoke tools by writing a "<｜DSML｜tool_calls>" block like the following:'
+        in prompt
+    )
+    assert (
+        "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response."
+        in prompt
+    )
+    assert (
+        "Otherwise, output directly after </think> with tool calls or final response."
+        in prompt
+    )
     assert "### Available Tool Schemas" in prompt
     assert '"name": "get_weather"' in prompt
     assert '"name": "search"' in prompt
-    assert "You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls." in prompt
+    assert (
+        "You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls."
+        in prompt
+    )
     assert "<functions>" not in prompt
     assert "function_calls" not in prompt
 
@@ -1292,7 +1337,7 @@ def test_deepseek_v4_reasoning_effort_matches_official_prefix_placement():
     )
     assert max_messages[0] == {
         "role": "system",
-        "content": DEEPSEEK_V4_REASONING_EFFORT_MAX.rstrip(),
+        "content": DEEPSEEK_V4_REASONING_EFFORT_MAX,
     }
     assert max_messages[1] == {"role": "user", "content": "Solve this carefully."}
 
@@ -1329,7 +1374,10 @@ def test_history_tool_calls_render_in_each_official_adapter_format():
     assert '<invoke name="get_weather">' in minimax_messages[-1]["content"]
 
     glm_messages = inject_glm_tool_prompt(messages, [WEATHER_TOOL])
-    assert "<tool_call>get_weather<arg_key>location</arg_key><arg_value>Shanghai</arg_value></tool_call>" in glm_messages[-1]["content"]
+    assert (
+        "<tool_call>get_weather<arg_key>location</arg_key><arg_value>Shanghai</arg_value></tool_call>"
+        in glm_messages[-1]["content"]
+    )
 
 
 def test_required_tool_choice_still_allows_additional_tool_calls():
@@ -1349,12 +1397,23 @@ def test_required_tool_choice_still_allows_additional_tool_calls():
                 }
             ],
         },
-        {"role": "tool", "tool_call_id": "call_weather", "content": "Shanghai is sunny."},
+        {
+            "role": "tool",
+            "tool_call_id": "call_weather",
+            "content": "Shanghai is sunny.",
+        },
     ]
     tool_choice = {"type": "function", "function": {"name": "get_weather"}}
-    minimax_messages = inject_minimax_tool_prompt(messages, [WEATHER_TOOL], tool_choice=tool_choice)
-    assert minimax_messages[-1]["content"].startswith("<response>Shanghai is sunny.</response>")
-    assert "Only call another tool if the current result is genuinely insufficient" in minimax_messages[-1]["content"]
+    minimax_messages = inject_minimax_tool_prompt(
+        messages, [WEATHER_TOOL], tool_choice=tool_choice
+    )
+    assert minimax_messages[-1]["content"].startswith(
+        "<response>Shanghai is sunny.</response>"
+    )
+    assert (
+        "Only call another tool if the current result is genuinely insufficient"
+        in minimax_messages[-1]["content"]
+    )
 
 
 if __name__ == "__main__":

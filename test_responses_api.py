@@ -189,7 +189,9 @@ def test_responses_text_stream_emits_codex_events_and_reasoning_delta():
         for event in events
     )
     message_items = [item for item in output_items(events) if item["type"] == "message"]
-    assert message_items[-1]["content"] == [{"type": "output_text", "text": "Hello world"}]
+    assert message_items[-1]["content"] == [
+        {"type": "output_text", "text": "Hello world"}
+    ]
     assert completed_event(events)["end_turn"] is True
     assert captured[0]["messages"][0] == {
         "role": "system",
@@ -248,7 +250,9 @@ def test_responses_local_shell_call_preserves_command_argv():
         events = parse_response_events(service.stream_responses(request))
 
     assert completed_event(events)["end_turn"] is True
-    tool_message = next(message for message in captured[0]["messages"] if message.get("tool_calls"))
+    tool_message = next(
+        message for message in captured[0]["messages"] if message.get("tool_calls")
+    )
     arguments = json.loads(tool_message["tool_calls"][0]["function"]["arguments"])
     assert arguments == {
         "command": command,
@@ -270,7 +274,9 @@ def test_responses_local_shell_call_preserves_command_argv():
         }
     )
     empty_tool_message = next(
-        message for message in context.openai_request["messages"] if message.get("tool_calls")
+        message
+        for message in context.openai_request["messages"]
+        if message.get("tool_calls")
     )
     empty_arguments = json.loads(
         empty_tool_message["tool_calls"][0]["function"]["arguments"]
@@ -334,7 +340,9 @@ def test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item()
     with patch("genai_proxy.services.genai.requests.post", fake_post):
         events = parse_response_events(service.stream_responses(request))
 
-    function_items = [item for item in output_items(events) if item["type"] == "function_call"]
+    function_items = [
+        item for item in output_items(events) if item["type"] == "function_call"
+    ]
     assert function_items
     assert function_items[0]["name"] == "get_weather"
     assert json.loads(function_items[0]["arguments"]) == {"location": "Shanghai"}
@@ -343,6 +351,22 @@ def test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item()
     prompt = captured[0]["messages"][0]["content"]
     assert prompt.startswith("Reasoning Effort: High\n\n# Tools\n\n")
     assert '"name": "get_weather"' in prompt
+
+
+def test_responses_object_tool_choice_selects_named_function():
+    context = convert_responses_to_openai_request(
+        {
+            "model": "chatglm",
+            "input": "Use weather.",
+            "tools": [RESPONSES_WEATHER_TOOL],
+            "tool_choice": {"type": "function", "name": "get_weather"},
+        }
+    )
+
+    assert context.openai_request["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "get_weather"},
+    }
 
 
 def test_responses_function_call_output_turn_returns_final_message():
@@ -363,7 +387,7 @@ def test_responses_function_call_output_turn_returns_final_message():
             {
                 "type": "function_call",
                 "name": "get_weather",
-                "arguments": "{\"location\":\"Shanghai\"}",
+                "arguments": '{"location":"Shanghai"}',
                 "call_id": "call_weather",
             },
             {
@@ -384,7 +408,10 @@ def test_responses_function_call_output_turn_returns_final_message():
         {"type": "output_text", "text": "Shanghai is sunny."}
     ]
     assert completed_event(events)["end_turn"] is True
-    assert "This turn must end with final assistant text only" not in captured[0]["messages"][0]["content"]
+    assert (
+        "This turn must end with final assistant text only"
+        not in captured[0]["messages"][0]["content"]
+    )
     assert captured[0]["messages"][-1]["content"].startswith("<|observation|>")
     assert "Return the final answer only" not in captured[0]["messages"][-1]["content"]
 
@@ -430,7 +457,9 @@ def test_responses_custom_apply_patch_tool_becomes_custom_tool_call_with_input_d
     ]
     assert delta_events
     assert delta_events[0]["data"]["delta"].startswith("*** Begin Patch")
-    custom_items = [item for item in output_items(events) if item["type"] == "custom_tool_call"]
+    custom_items = [
+        item for item in output_items(events) if item["type"] == "custom_tool_call"
+    ]
     assert custom_items
     assert custom_items[0]["name"] == "apply_patch"
     assert custom_items[0]["input"].startswith("*** Begin Patch")
@@ -467,7 +496,9 @@ def test_responses_namespace_tool_flattens_for_model_and_restores_namespace():
     with patch("genai_proxy.services.genai.requests.post", fake_post):
         events = parse_response_events(service.stream_responses(request))
 
-    function_items = [item for item in output_items(events) if item["type"] == "function_call"]
+    function_items = [
+        item for item in output_items(events) if item["type"] == "function_call"
+    ]
     assert function_items[0]["name"] == "view_image"
     assert function_items[0]["namespace"] == "codex_app"
     assert json.loads(function_items[0]["arguments"]) == {"path": "/tmp/a.png"}

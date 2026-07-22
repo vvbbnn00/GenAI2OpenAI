@@ -217,7 +217,9 @@ def test_glm52_maps_lower_reasoning_effort_to_max():
 
     assert response["choices"][0]["message"]["content"] == "Done."
     system_prompt = captured[0]["messages"][0]["content"]
-    assert system_prompt.startswith("Reasoning Effort: Max\n\n# Tools\n\n"), system_prompt
+    assert system_prompt.startswith("Reasoning Effort: Max\n\n# Tools\n\n"), (
+        system_prompt
+    )
 
 
 def test_openai_reasoning_effort_max_is_preserved_for_glm52():
@@ -293,7 +295,7 @@ def test_deepseek_v4_reasoning_effort_is_normalized_before_prompt_injection():
     assert response["choices"][0]["message"]["content"] == "Done."
     assert captured[0]["messages"][0] == {
         "role": "system",
-        "content": DEEPSEEK_V4_REASONING_EFFORT_MAX.rstrip(),
+        "content": DEEPSEEK_V4_REASONING_EFFORT_MAX,
     }
     assert captured[0]["messages"][1] == {
         "role": "user",
@@ -370,8 +372,14 @@ def test_glm52_openai_stream_bash_tool_call_uses_default_reasoning_max():
     ]
     assert tool_chunks
     assert tool_chunks[0]["function"]["name"] == "Bash"
-    assert any(choice.get("finish_reason") == "tool_calls" for event in events for choice in event["choices"])
-    assert captured[0]["messages"][0]["content"].startswith("Reasoning Effort: Max\n\n# Tools\n\n")
+    assert any(
+        choice.get("finish_reason") == "tool_calls"
+        for event in events
+        for choice in event["choices"]
+    )
+    assert captured[0]["messages"][0]["content"].startswith(
+        "Reasoning Effort: Max\n\n# Tools\n\n"
+    )
 
 
 def test_glm52_required_tool_choice_accepts_xml_tool_call():
@@ -422,7 +430,9 @@ def test_glm52_tool_choice_none_does_not_return_tool_calls():
     message = response["choices"][0]["message"]
     assert not message.get("tool_calls")
     assert message["content"] == "Paris."
-    assert "For this turn, do not call any tool" in captured[0]["messages"][0]["content"]
+    assert (
+        "For this turn, do not call any tool" in captured[0]["messages"][0]["content"]
+    )
 
 
 def test_glm52_tool_result_turn_returns_final_text():
@@ -435,14 +445,21 @@ def test_glm52_tool_result_turn_returns_final_text():
     tool_call = {
         "id": "call_weather",
         "type": "function",
-        "function": {"name": "get_weather", "arguments": json.dumps({"location": "Shanghai"})},
+        "function": {
+            "name": "get_weather",
+            "arguments": json.dumps({"location": "Shanghai"}),
+        },
     }
     request = {
         "model": "chatglm",
         "messages": [
             {"role": "user", "content": "Use get_weather for Shanghai."},
             {"role": "assistant", "content": None, "tool_calls": [tool_call]},
-            {"role": "tool", "tool_call_id": "call_weather", "content": "Shanghai is sunny."},
+            {
+                "role": "tool",
+                "tool_call_id": "call_weather",
+                "content": "Shanghai is sunny.",
+            },
         ],
         "tools": [OPENAI_WEATHER_TOOL],
     }
@@ -453,11 +470,17 @@ def test_glm52_tool_result_turn_returns_final_text():
     message = response["choices"][0]["message"]
     assert not message.get("tool_calls")
     assert message["content"] == "Shanghai is sunny."
-    assert "This turn must end with final assistant text only" not in captured[0]["messages"][0]["content"]
+    assert (
+        "This turn must end with final assistant text only"
+        not in captured[0]["messages"][0]["content"]
+    )
     assert "<tools>" in captured[0]["messages"][0]["content"]
     assert captured[0]["messages"][-1]["content"].startswith("<|observation|>")
     assert "Return the final answer only" not in captured[0]["messages"][-1]["content"]
-    assert "Do not emit <tool_call>, <arg_key>, or <arg_value> tags" not in captured[0]["messages"][-1]["content"]
+    assert (
+        "Do not emit <tool_call>, <arg_key>, or <arg_value> tags"
+        not in captured[0]["messages"][-1]["content"]
+    )
 
 
 def test_glm52_native_upstream_tool_call_deltas_are_preserved():
@@ -475,7 +498,16 @@ def test_glm52_native_upstream_tool_call_deltas_are_preserved():
                     ]
                 }
             ),
-            sse_line({"tool_calls": [{"index": 0, "function": {"arguments": '{"location":"Shanghai"}'}}]}),
+            sse_line(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "function": {"arguments": '{"location":"Shanghai"}'},
+                        }
+                    ]
+                }
+            ),
             sse_line({}, "tool_calls"),
         ]
     )
@@ -556,7 +588,9 @@ def test_claude_output_config_effort_maps_to_glm52_openai_reasoning_and_tool_use
         openai_response,
         {**claude_request, "_estimator_model": "chatglm"},
     )
-    tool_blocks = [block for block in response["content"] if block.get("type") == "tool_use"]
+    tool_blocks = [
+        block for block in response["content"] if block.get("type") == "tool_use"
+    ]
     assert tool_blocks
     assert tool_blocks[0]["name"] == "get_weather"
     assert tool_blocks[0]["input"] == {"location": "Shanghai"}
@@ -696,7 +730,9 @@ def test_claude_non_stream_bash_tool_preserves_shell_string_arguments():
             openai_response,
             {**claude_request, "_estimator_model": "chatglm"},
         )
-        tool_blocks = [block for block in response["content"] if block.get("type") == "tool_use"]
+        tool_blocks = [
+            block for block in response["content"] if block.get("type") == "tool_use"
+        ]
         assert tool_blocks
         assert tool_blocks[0]["name"] == "Bash"
         assert tool_blocks[0]["input"]["command"] == command
@@ -896,7 +932,9 @@ def test_claude_route_preserves_shell_strings_across_target_adapters():
             openai_response,
             {**claude_request, "_estimator_model": record["aiType"]},
         )
-        tool_blocks = [block for block in response["content"] if block.get("type") == "tool_use"]
+        tool_blocks = [
+            block for block in response["content"] if block.get("type") == "tool_use"
+        ]
         assert tool_blocks
         assert tool_blocks[0]["name"] == "Bash"
         assert tool_blocks[0]["input"]["command"] == command
