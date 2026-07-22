@@ -9,6 +9,7 @@ from genai_proxy.compat.claude import (
     stream_openai_to_claude,
 )
 from genai_proxy.errors import ProxyError
+from genai_proxy.optimizations.deepseek import DEEPSEEK_V4_REASONING_EFFORT_MAX
 from genai_proxy.routes.claude import map_claude_model_alias
 from genai_proxy.services.genai import GenAIService
 
@@ -197,7 +198,7 @@ def claude_tool_input_from_events(events, tool_name):
     raise AssertionError(json.dumps(events, ensure_ascii=False))
 
 
-def test_glm52_downgrades_unsupported_reasoning_effort_to_none():
+def test_glm52_maps_lower_reasoning_effort_to_max():
     service, captured, fake_post = make_service(
         [
             sse_line({"content": "Done."}),
@@ -216,11 +217,16 @@ def test_glm52_downgrades_unsupported_reasoning_effort_to_none():
 
     assert response["choices"][0]["message"]["content"] == "Done."
     system_prompt = captured[0]["messages"][0]["content"]
-    assert "Reasoning Effort" not in system_prompt, system_prompt
+    assert system_prompt.startswith("Reasoning Effort: Max\n\n# Tools\n\n"), system_prompt
 
 
-def test_openai_rejects_non_official_reasoning_effort_max():
-    service, _captured, fake_post = make_service([])
+def test_openai_reasoning_effort_max_is_preserved_for_glm52():
+    service, captured, fake_post = make_service(
+        [
+            sse_line({"content": "Done."}),
+            sse_line({}, "stop"),
+        ]
+    )
     request = {
         "model": "chatglm",
         "messages": [{"role": "user", "content": "Answer directly."}],
@@ -228,14 +234,13 @@ def test_openai_rejects_non_official_reasoning_effort_max():
     }
 
     with patch("genai_proxy.services.genai.requests.post", fake_post):
-        try:
-            service.build_openai_completion(request)
-        except ProxyError as exc:
-            assert exc.status == 400
-            assert "OpenAI reasoning.effort" in exc.message
-            assert "max" in exc.message
-        else:
-            raise AssertionError("non-OpenAI reasoning effort did not fail")
+        response = service.build_openai_completion(request)
+
+    assert response["choices"][0]["message"]["content"] == "Done."
+    assert captured[0]["messages"][0] == {
+        "role": "system",
+        "content": "Reasoning Effort: Max",
+    }
 
 
 def test_glm52_openai_reasoning_effort_alias_injects_prompt_without_tools():
@@ -258,6 +263,41 @@ def test_glm52_openai_reasoning_effort_alias_injects_prompt_without_tools():
     assert captured[0]["messages"][0] == {
         "role": "system",
         "content": "Reasoning Effort: High",
+    }
+
+
+def test_deepseek_v4_reasoning_effort_is_normalized_before_prompt_injection():
+    record = {
+        "aiType": "deepseek-pro",
+        "aiName": "DeepSeek V4 Pro",
+        "descInfo": "DeepSeek V4",
+        "rootModelName": "Xinference",
+        "rootAiType": "xinference",
+    }
+    service, captured, fake_post = make_service(
+        [
+            sse_line({"content": "Done."}),
+            sse_line({}, "stop"),
+        ],
+        record=record,
+    )
+    request = {
+        "model": "deepseek-pro",
+        "messages": [{"role": "user", "content": "Answer directly."}],
+        "reasoning": {"effort": "xhigh"},
+    }
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        response = service.build_openai_completion(request)
+
+    assert response["choices"][0]["message"]["content"] == "Done."
+    assert captured[0]["messages"][0] == {
+        "role": "system",
+        "content": DEEPSEEK_V4_REASONING_EFFORT_MAX.rstrip(),
+    }
+    assert captured[0]["messages"][1] == {
+        "role": "user",
+        "content": "Answer directly.",
     }
 
 
@@ -549,7 +589,7 @@ def test_claude_streaming_tool_use_survives_glm52_reasoning_effort():
         "stream": True,
     }
     openai_request = convert_claude_to_openai(claude_request, model_manager)
-    assert openai_request["reasoning"] == {"effort": "xhigh"}
+    assert openai_request["reasoning"] == {"effort": "max"}
 
     with patch("genai_proxy.services.genai.requests.post", fake_post):
         events = parse_claude_events(
@@ -864,9 +904,10 @@ def test_claude_route_preserves_shell_strings_across_target_adapters():
 
 
 if __name__ == "__main__":
-    test_glm52_downgrades_unsupported_reasoning_effort_to_none()
-    test_openai_rejects_non_official_reasoning_effort_max()
+    test_glm52_maps_lower_reasoning_effort_to_max()
+    test_openai_reasoning_effort_max_is_preserved_for_glm52()
     test_glm52_openai_reasoning_effort_alias_injects_prompt_without_tools()
+    test_deepseek_v4_reasoning_effort_is_normalized_before_prompt_injection()
     test_glm52_openai_non_stream_xml_tool_call_uses_reasoning_high()
     test_glm52_openai_stream_bash_tool_call_uses_default_reasoning_max()
     test_glm52_required_tool_choice_accepts_xml_tool_call()

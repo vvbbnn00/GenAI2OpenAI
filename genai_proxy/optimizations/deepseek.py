@@ -3,6 +3,8 @@ import re
 import uuid
 from typing import Any
 
+from genai_proxy.optimizations.registry import DEEPSEEK_V4_ADAPTERS
+
 
 DEEPSEEK_V4_TOOL_SYSTEM_TEMPLATE = """## Tools
 
@@ -69,12 +71,24 @@ DSML_TOOL_CALLS_END = "</｜DSML｜tool_calls>"
 DSML_FUNCTION_CALLS_START = "<｜DSML｜function_calls>"
 DSML_FUNCTION_CALLS_END = "</｜DSML｜function_calls>"
 
+DEEPSEEK_V4_REASONING_EFFORT_MAX = (
+    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+)
+
 
 def is_deepseek_model(model: str | None) -> bool:
     return "deepseek" in (model or "").lower()
 
 
-def inject_deepseek_tool_prompt(messages, tools, tool_choice=None, adapter=None):
+def inject_deepseek_tool_prompt(
+    messages,
+    tools,
+    tool_choice=None,
+    adapter=None,
+    reasoning_config=None,
+):
     tool_prompt = _render_deepseek_tools_prompt(tools, tool_choice, adapter=adapter)
     new_messages = []
     has_system = False
@@ -84,9 +98,10 @@ def inject_deepseek_tool_prompt(messages, tools, tool_choice=None, adapter=None)
         msg = messages[index]
         role = msg.get("role")
 
-        if role == "system":
+        if role == "system" and not has_system:
             new_messages.append(
                 {
+                    **msg,
                     "role": "system",
                     "content": msg.get("content", "") + "\n\n" + tool_prompt,
                 }
@@ -132,6 +147,31 @@ def inject_deepseek_tool_prompt(messages, tools, tool_choice=None, adapter=None)
     if not has_system:
         new_messages.insert(0, {"role": "system", "content": tool_prompt})
 
+    return inject_deepseek_reasoning_prompt(
+        new_messages,
+        reasoning_config,
+        adapter=adapter,
+    )
+
+
+def inject_deepseek_reasoning_prompt(messages, reasoning_config=None, adapter=None):
+    effort = (reasoning_config or {}).get("effort")
+    if adapter not in DEEPSEEK_V4_ADAPTERS or effort != "max":
+        return messages
+
+    new_messages = [dict(message) for message in messages]
+    if new_messages and new_messages[0].get("role") == "system":
+        content = new_messages[0].get("content", "")
+        if not content.startswith(DEEPSEEK_V4_REASONING_EFFORT_MAX):
+            new_messages[0]["content"] = DEEPSEEK_V4_REASONING_EFFORT_MAX + content
+    else:
+        new_messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": DEEPSEEK_V4_REASONING_EFFORT_MAX.rstrip(),
+            },
+        )
     return new_messages
 
 

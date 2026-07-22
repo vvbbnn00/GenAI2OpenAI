@@ -1,5 +1,5 @@
 from genai_proxy.errors import ProxyError
-from genai_proxy.optimizations.registry import GLM_5_2_ADAPTER
+from genai_proxy.optimizations.registry import DEEPSEEK_V4_ADAPTERS, GLM_5_2_ADAPTER
 
 
 OPENAI_REASONING_EFFORTS = (
@@ -9,9 +9,10 @@ OPENAI_REASONING_EFFORTS = (
     "medium",
     "high",
     "xhigh",
+    "max",
 )
 CLAUDE_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
-GLM52_REASONING_EFFORTS = ("none", "high", "xhigh")
+TWO_LEVEL_REASONING_ADAPTERS = (GLM_5_2_ADAPTER, *DEEPSEEK_V4_ADAPTERS)
 
 
 def parse_reasoning_config(req_data: dict | None) -> dict:
@@ -43,8 +44,6 @@ def parse_claude_reasoning_config(req_data: dict | None) -> dict:
         allowed_efforts=CLAUDE_REASONING_EFFORTS,
         field_name="Claude output_config.effort",
     )
-    if config.get("effort") == "max":
-        return {"effort": "xhigh"}
     return config
 
 
@@ -55,8 +54,8 @@ def normalize_reasoning_for_adapter(
     if not effort:
         return reasoning_config
 
-    if adapter == GLM_5_2_ADAPTER and effort not in GLM52_REASONING_EFFORTS:
-        return {"effort": "none"}
+    if adapter in TWO_LEVEL_REASONING_ADAPTERS:
+        return {"effort": "high" if effort == "high" else "max"}
 
     return reasoning_config
 

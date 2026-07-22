@@ -114,6 +114,7 @@ def inject_tool_prompt(
             tools,
             tool_choice,
             adapter=resolved_adapter,
+            reasoning_config=reasoning_config,
         )
     if resolved_adapter == MINIMAX_ADAPTER:
         return inject_minimax_tool_prompt(

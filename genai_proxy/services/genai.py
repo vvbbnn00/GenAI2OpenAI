@@ -31,7 +31,9 @@ from genai_proxy.compat.responses import (
 )
 from genai_proxy.errors import ProxyError
 from genai_proxy.optimizations import (
+    DEEPSEEK_V4_ADAPTERS,
     GLM_5_2_ADAPTER,
+    inject_deepseek_reasoning_prompt,
     inject_glm_reasoning_prompt,
     select_tool_adapter,
     tool_start_tags,
@@ -420,6 +422,12 @@ class GenAIService:
             )
         elif tool_adapter == GLM_5_2_ADAPTER:
             messages = inject_glm_reasoning_prompt(messages, reasoning_config)
+        elif tool_adapter in DEEPSEEK_V4_ADAPTERS:
+            messages = inject_deepseek_reasoning_prompt(
+                messages,
+                reasoning_config,
+                adapter=tool_adapter,
+            )
 
         if not self._extract_last_user_message(messages):
             raise ProxyError("No user message found in 'messages'")

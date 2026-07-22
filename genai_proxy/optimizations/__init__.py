@@ -1,5 +1,6 @@
 from genai_proxy.optimizations.deepseek import (
     extract_deepseek_tool_calls,
+    inject_deepseek_reasoning_prompt,
     inject_deepseek_tool_prompt,
     is_deepseek_model,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "is_glm_adapter",
     "inject_glm_tool_prompt",
     "inject_glm_reasoning_prompt",
+    "inject_deepseek_reasoning_prompt",
     "inject_deepseek_tool_prompt",
     "inject_minimax_tool_prompt",
     "is_deepseek_model",

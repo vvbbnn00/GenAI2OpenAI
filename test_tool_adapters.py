@@ -12,7 +12,11 @@ from genai_proxy.optimizations import (
     MINIMAX_ADAPTER,
     select_tool_adapter,
 )
-from genai_proxy.optimizations.deepseek import inject_deepseek_tool_prompt
+from genai_proxy.optimizations.deepseek import (
+    DEEPSEEK_V4_REASONING_EFFORT_MAX,
+    inject_deepseek_reasoning_prompt,
+    inject_deepseek_tool_prompt,
+)
 from genai_proxy.optimizations.glm import inject_glm_tool_prompt
 from genai_proxy.optimizations.minimax import inject_minimax_tool_prompt
 from genai_proxy.services.genai import _tool_start_tags_for_request
@@ -1183,18 +1187,17 @@ def test_glm52_reasoning_effort_prompt_mapping():
         messages,
         [WEATHER_TOOL],
         adapter=GLM_5_2_ADAPTER,
-        reasoning_config={"effort": "xhigh"},
+        reasoning_config={"effort": "max"},
     )[0]["content"]
     assert max_prompt.startswith("Reasoning Effort: Max\n\n# Tools\n\n")
 
-    none_prompt = inject_glm_tool_prompt(
+    other_prompt = inject_glm_tool_prompt(
         messages,
         [WEATHER_TOOL],
         adapter=GLM_5_2_ADAPTER,
         reasoning_config={"effort": "none"},
     )[0]["content"]
-    assert none_prompt.startswith("# Tools\n\n")
-    assert "Reasoning Effort:" not in none_prompt
+    assert other_prompt.startswith("Reasoning Effort: Max\n\n# Tools\n\n")
 
 
 def test_glm52_prompt_filters_template_internal_tool_fields():
@@ -1256,6 +1259,42 @@ def test_deepseek_v4_prompt_matches_hf_encoding_test_shape():
     assert "You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls." in prompt
     assert "<functions>" not in prompt
     assert "function_calls" not in prompt
+
+
+def test_deepseek_v4_reasoning_effort_matches_official_prefix_placement():
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Solve this carefully."},
+    ]
+
+    max_prompt = inject_deepseek_tool_prompt(
+        messages,
+        [WEATHER_TOOL],
+        adapter=DEEPSEEK_V4_PRO_ADAPTER,
+        reasoning_config={"effort": "max"},
+    )[0]["content"]
+    assert max_prompt.startswith(
+        DEEPSEEK_V4_REASONING_EFFORT_MAX
+        + "You are a helpful assistant.\n\n## Tools\n\n"
+    )
+
+    high_messages = inject_deepseek_reasoning_prompt(
+        [{"role": "user", "content": "Solve this carefully."}],
+        {"effort": "high"},
+        adapter=DEEPSEEK_V4_PRO_ADAPTER,
+    )
+    assert high_messages == [{"role": "user", "content": "Solve this carefully."}]
+
+    max_messages = inject_deepseek_reasoning_prompt(
+        [{"role": "user", "content": "Solve this carefully."}],
+        {"effort": "max"},
+        adapter=DEEPSEEK_V4_PRO_ADAPTER,
+    )
+    assert max_messages[0] == {
+        "role": "system",
+        "content": DEEPSEEK_V4_REASONING_EFFORT_MAX.rstrip(),
+    }
+    assert max_messages[1] == {"role": "user", "content": "Solve this carefully."}
 
 
 def test_history_tool_calls_render_in_each_official_adapter_format():
@@ -1365,6 +1404,7 @@ if __name__ == "__main__":
     test_glm52_reasoning_effort_prompt_mapping()
     test_glm52_prompt_filters_template_internal_tool_fields()
     test_deepseek_v4_prompt_matches_hf_encoding_test_shape()
+    test_deepseek_v4_reasoning_effort_matches_official_prefix_placement()
     test_history_tool_calls_render_in_each_official_adapter_format()
     test_required_tool_choice_still_allows_additional_tool_calls()
     print("tool adapter tests passed")

@@ -137,8 +137,6 @@ def _render_glm_tool_definition(function_data, *, adapter=GLM_ADAPTER):
 
 def _render_glm52_reasoning_prompt(reasoning_config=None):
     effort = (reasoning_config or {}).get("effort")
-    if effort == "none":
-        return ""
     rendered_effort = "High" if effort == "high" else "Max"
     return GLM52_REASONING_TEMPLATE.format(effort=rendered_effort)
 
