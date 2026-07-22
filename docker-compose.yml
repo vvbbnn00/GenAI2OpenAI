@@ -15,6 +15,7 @@ services:
       TOKEN_CHECK_INTERVAL: ${TOKEN_CHECK_INTERVAL:-60}
       GENAI_MAX_RETRIES: ${GENAI_MAX_RETRIES:-10}
       GENAI_RETRY_BACKOFF: ${GENAI_RETRY_BACKOFF:-0.5}
+      GENAI_TOKENIZER_CACHE: ${GENAI_TOKENIZER_CACHE:-/app/.cache/tokenizers}
       API_KEY: ${PROXY_API_KEY:-}
       APP_DEBUG: ${APP_DEBUG:-0}
       CLAUDE_HAIKU_MODEL: ${CLAUDE_HAIKU_MODEL:-deepseek-chat}
@@ -32,6 +33,7 @@ services:
         source: ${KEYSTORE_HOST_PATH:-./docker-deploy.keystore}
         target: /app/docker-deploy.keystore
         read_only: false
+      - tokenizer-cache:/app/.cache/tokenizers
     command:
       - /bin/sh
       - -lc
@@ -73,3 +75,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+volumes:
+  tokenizer-cache:

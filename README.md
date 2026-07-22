@@ -71,6 +71,7 @@ docker compose down
 | `TOKEN_CHECK_INTERVAL` | 后台检查 token 过期时间并同步共享缓存的间隔秒数；`0` 表示关闭 | `60` |
 | `GENAI_MAX_RETRIES` | GenAI 聊天、模型列表和计费请求遇到临时网络故障、HTTP 408/425/429/500/502/503/504、无效响应或意外断流时的最大重试次数；`0` 表示关闭 | `10` |
 | `GENAI_RETRY_BACKOFF` | 首次重试等待秒数，后续每次翻倍并封顶 5 秒；`0` 表示立即重试 | `0.5` |
+| `GENAI_TOKENIZER_CACHE` | 经 SHA-256 校验的官方 tokenizer/template 缓存目录 | `~/.cache/genai2openai/tokenizers` |
 | `APP_PORT` | 容器内和映射到宿主机的监听端口 | `5000` |
 | `HOST_PORT` | 宿主机暴露端口 | `5000` |
 | `PROXY_API_KEY` | 代理自身的客户端认证密钥，会传给应用的 `API_KEY` 环境变量 | 空 |
@@ -209,6 +210,8 @@ DeepSeek 同厂不同版本不会共用同一个 adapter：`deepseek-chat` 使�
 GLM-5.2 和 DeepSeek V4 的推理等级统一为 `high`、`max`：`high` 保持为 `high`，`max` 保持为 `max`，`none`、`minimal`、`low`、`medium`、`xhigh` 等其他已支持输入统一映射到 `max`。DeepSeek V4 的 `max` 会把官方 `REASONING_EFFORT_MAX` 文本放在首条消息最前面；`high` 不添加该前缀。未传推理等级时，GLM-5.2 保持现有的 `max` 默认值，DeepSeek V4 不额外添加等级前缀。
 
 GenAI 网页通道 `/htk/chat/start/chat` 目前不暴露可靠的原生 `tools/tool_choice` 通道，因此代理不会向上游请求体拼接 `tools` 或 `tool_choice` 字段，而是把工具定义写入模型专用的隐藏提示词。返回时统一解析成 OpenAI 或 Claude Messages API 的结构化工具调用响应，不把模型生成的 `<tool_call>`、`<minimax:tool_call>`、DSML 或 Claude Code transcript 片段直接透传给客户端。
+
+DeepSeek V4 Pro/Flash、GLM-5.2 和完整 `Qwen/Qwen3.5-397B-A17B` 使用固定 revision 的 Hugging Face `tokenizer.json` 与官方消息模板精确计数。首次使用会下载并校验资源，之后复用本地缓存；只依赖轻量的 `tokenizers`，不需要 `transformers` 或 PyTorch。OpenAI `POST /v1/responses/input_tokens` 与 Anthropic `POST /v1/messages/count_tokens` 会走同一套模型解析、工具提示注入和官方模板。
 
 针对 Claude Code 常见的 `Bash`、`Glob`、`Read`、`Edit`、`Write` 等工具，代理会优先保留请求里的精确工具名，并兼容模型偶发输出的 `Bash<arg_key>`、`<arg_value>`、`Bash\nIN\n...`、`Globpattern: ...`、DSML、MiniMax XML 和 JSON-ish 工具块。工具结果后的多轮会话会继续保留工具定义，允许模型按需继续调用工具；显式 `tool_choice: "none"` 时才禁止工具调用。
 
