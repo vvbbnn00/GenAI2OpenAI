@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from genai_proxy.errors import ProxyError
+from genai_proxy.optimizations.registry import KIMI_K3_ADAPTER, select_tool_adapter
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,10 +47,20 @@ def convert_responses_to_openai_request(
     if isinstance(instructions, str) and instructions:
         messages.append({"role": "system", "content": instructions})
 
-    messages.extend(_convert_response_input_items(input_items, tool_map))
+    model = req_data.get("model", "GPT-4.1")
+    messages.extend(
+        _convert_response_input_items(
+            input_items,
+            tool_map,
+            preserve_images=(
+                isinstance(model, str)
+                and select_tool_adapter(model) == KIMI_K3_ADAPTER
+            ),
+        )
+    )
 
     openai_request = {
-        "model": req_data.get("model", "GPT-4.1"),
+        "model": model,
         "messages": messages,
         "stream": bool(req_data.get("stream", False)),
     }
@@ -325,6 +336,8 @@ def _input_has_tool_output(input_items: list) -> bool:
 def _convert_response_input_items(
     input_items: list,
     tool_map: dict[str, ResponseToolMapping],
+    *,
+    preserve_images: bool = False,
 ) -> list[dict]:
     messages = []
     for item in input_items:
@@ -335,7 +348,11 @@ def _convert_response_input_items(
             continue
         if _is_response_message_item(item):
             role = _response_role_to_chat_role(item.get("role"))
-            content = _content_to_text(item.get("content"))
+            content = (
+                _content_to_chat_content(item.get("content"))
+                if preserve_images
+                else _content_to_text(item.get("content"))
+            )
             if content:
                 messages.append({"role": role, "content": content})
         elif item_type == "function_call":
@@ -431,6 +448,49 @@ def _content_to_text(content) -> str:
             if image_url:
                 parts.append(f"[image: {image_url}]")
     return "\n".join(part for part in parts if part)
+
+
+def _content_to_chat_content(content):
+    if isinstance(content, str) or not isinstance(content, list):
+        return content
+
+    text_parts = []
+    chat_parts = []
+    has_image = False
+    for item in content:
+        if isinstance(item, str):
+            text_parts.append(item)
+            chat_parts.append({"type": "text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in {"input_text", "output_text", "text"}:
+            text = str(item.get("text") or "")
+            text_parts.append(text)
+            chat_parts.append({"type": "text", "text": text})
+        elif item_type == "input_image":
+            image_url = item.get("image_url")
+            if not image_url:
+                raise ProxyError(
+                    "Kimi K3 Responses image inputs require 'image_url'"
+                )
+            if isinstance(image_url, str):
+                image_url = {"url": image_url}
+            elif isinstance(image_url, dict):
+                image_url = dict(image_url)
+            else:
+                raise ProxyError("'input_image.image_url' must be a string or object")
+            if not isinstance(image_url.get("url"), str) or not image_url["url"]:
+                raise ProxyError("'input_image.image_url' must contain a URL")
+            if item.get("detail") is not None:
+                image_url.setdefault("detail", item["detail"])
+            chat_parts.append({"type": "image_url", "image_url": image_url})
+            has_image = True
+
+    if has_image:
+        return chat_parts
+    return "\n".join(part for part in text_parts if part)
 
 
 def _output_to_text(output) -> str:

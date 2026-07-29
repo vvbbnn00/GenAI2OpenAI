@@ -7,16 +7,18 @@ from flask import jsonify
 
 from genai_proxy.optimizations import (
     GLM_ADAPTERS,
+    KIMI_K3_ADAPTER,
     MINIMAX_ADAPTER,
     extract_deepseek_tool_calls,
+    extract_kimi_tool_calls,
     inject_deepseek_tool_prompt,
     inject_glm_tool_prompt,
+    inject_kimi_tool_prompt,
     inject_minimax_tool_prompt,
     is_deepseek_adapter,
     is_deepseek_model,
     select_tool_adapter,
 )
-
 
 TOOL_SYSTEM_PROMPT = """\
 You have access to the following tools:
@@ -122,6 +124,8 @@ def inject_tool_prompt(
             tools,
             tool_choice,
         )
+    if resolved_adapter == KIMI_K3_ADAPTER:
+        return inject_kimi_tool_prompt(messages, tools, tool_choice)
     if resolved_adapter in GLM_ADAPTERS:
         return inject_glm_tool_prompt(
             messages,
@@ -320,6 +324,14 @@ def extract_tool_calls(content, logger=None, tools=None, model=None, adapter=Non
     )
 
     resolved_adapter = adapter or (select_tool_adapter(model) if model else None)
+    if resolved_adapter == KIMI_K3_ADAPTER:
+        kimi_tool_calls, kimi_remaining = extract_kimi_tool_calls(
+            cleaned,
+            tools=tools,
+            logger=logger,
+        )
+        if kimi_tool_calls:
+            return kimi_tool_calls, kimi_remaining
     if is_deepseek_adapter(resolved_adapter) or (resolved_adapter is None and is_deepseek_model(model)):
         repaired_tool_calls, repaired_remaining = extract_deepseek_tool_calls(
             cleaned,

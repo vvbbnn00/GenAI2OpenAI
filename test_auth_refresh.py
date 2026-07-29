@@ -145,6 +145,19 @@ class AuthRefreshTests(unittest.TestCase):
             )
         )
 
+    def test_model_resolution_matches_upstream_ids_case_insensitively(self):
+        manager = ModelManager(self.logger, FakeTokenManager())
+        record = {
+            "aiType": "Kimi-k3",
+            "aiName": "Kimi-K3",
+            "rootAiType": "xinference",
+        }
+        manager._models_cache = [record]
+        manager._models_cache_at = time.time()
+
+        self.assertEqual(manager.resolve_model("kimi-k3"), "Kimi-k3")
+        self.assertIs(manager.get_model_record("KIMI-K3"), record)
+
     def test_model_list_refreshes_once_when_cached_token_is_rejected(self):
         token_manager = FakeTokenManager()
         manager = ModelManager(self.logger, token_manager)
@@ -175,6 +188,45 @@ class AuthRefreshTests(unittest.TestCase):
         self.assertEqual(models[0]["aiType"], "deepseek-chat")
         self.assertEqual(mocked_get.call_args_list[0].kwargs["headers"]["X-Access-Token"], "stale-token")
         self.assertEqual(mocked_get.call_args_list[1].kwargs["headers"]["X-Access-Token"], "fresh-token")
+
+    def test_chat_preserves_structured_upstream_error_details(self):
+        service = GenAIService(
+            self.logger,
+            FakeTokenManager(),
+            FakeModelManager(),
+            max_retries=0,
+        )
+        response = FakeStreamingResponse(
+            [
+                json.dumps(
+                    {
+                        "error": {
+                            "message": "message content cannot be empty",
+                            "type": "invalid_request_error",
+                            "code": 400,
+                        }
+                    }
+                ).encode()
+            ]
+        )
+
+        with patch(
+            "genai_proxy.services.genai.requests.post",
+            return_value=response,
+        ):
+            with self.assertRaises(ProxyError) as raised:
+                list(
+                    service.stream_openai_completion(
+                        {
+                            "model": "chatglm",
+                            "messages": [{"role": "user", "content": "Hello"}],
+                        }
+                    )
+                )
+
+        self.assertEqual(raised.exception.message, "message content cannot be empty")
+        self.assertEqual(raised.exception.error_type, "invalid_request_error")
+        self.assertEqual(raised.exception.status, 400)
 
     def test_service_auth_retry_passes_rejected_token_to_refresh(self):
         token_manager = FakeTokenManager()

@@ -11,7 +11,6 @@ from genai_proxy.token_usage import (
     estimate_token_by_model,
 )
 
-
 ROLE_ASSISTANT = "assistant"
 ROLE_SYSTEM = "system"
 ROLE_TOOL = "tool"
@@ -498,6 +497,22 @@ def _convert_claude_user_message(content):
                             "url": f"data:{source['media_type']};base64,{source['data']}"
                         },
                     }
+                )
+            elif (
+                isinstance(source, dict)
+                and source.get("type") == "url"
+                and isinstance(source.get("url"), str)
+                and source["url"]
+            ):
+                openai_content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": source["url"]},
+                    }
+                )
+            else:
+                raise ProxyError(
+                    "Claude image blocks require a valid base64 or URL source"
                 )
         elif block_type == CONTENT_TOOL_RESULT:
             tool_messages.append(

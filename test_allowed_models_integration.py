@@ -1,13 +1,22 @@
 import argparse
+import base64
+import io
 import json
 import sys
+
+from PIL import Image
 
 from genai_proxy.app import create_app
 from genai_proxy.config import AppConfig
 from genai_proxy.logging_utils import setup_logging
 
-
-ALLOWED_MODELS = ("deepseek-chat", "deepseek-pro", "MiniMax-M1", "chatglm")
+ALLOWED_MODELS = (
+    "deepseek-chat",
+    "deepseek-pro",
+    "MiniMax-M1",
+    "chatglm",
+    "kimi-k3",
+)
 CITIES = (
     "Shanghai",
     "Beijing",
@@ -100,11 +109,19 @@ def main():
     parser.add_argument("--keystore", default="docker-deploy.keystore")
     parser.add_argument("--models", nargs="+", default=list(ALLOWED_MODELS))
     parser.add_argument("--repeat", type=int, default=20)
+    parser.add_argument(
+        "--kimi-repeat",
+        type=int,
+        default=1,
+        help="Kimi-K3 repetitions; kept separate to limit live test traffic",
+    )
     args = parser.parse_args()
 
     disallowed = [model for model in args.models if model not in ALLOWED_MODELS]
     if disallowed:
         raise SystemExit(f"Refusing to test disallowed model(s): {', '.join(disallowed)}")
+    if args.repeat < 1 or args.kimi_repeat < 1:
+        raise SystemExit("Repeat counts must be positive")
 
     logger = setup_logging(False)
     app = create_app(
@@ -126,20 +143,43 @@ def main():
     try:
         with app.test_client() as client:
             for model in args.models:
-                for name, fn in (
-                    ("openai_tool_call", test_openai_tool_call),
-                    ("openai_stream_tool_call", test_openai_stream_tool_call),
-                    ("openai_bash_tool_call", test_openai_bash_tool_call),
-                    ("openai_stream_bash_tool_call", test_openai_stream_bash_tool_call),
-                    ("openai_tool_result_turn", test_openai_tool_result_turn),
-                    ("openai_no_tool_needed", test_openai_no_tool_needed),
-                    ("claude_tool_use", test_claude_tool_use),
-                    ("claude_stream_tool_use", test_claude_stream_tool_use),
-                    ("claude_bash_tool_use", test_claude_bash_tool_use),
-                    ("claude_stream_bash_tool_use", test_claude_stream_bash_tool_use),
-                    ("claude_tool_result_turn", test_claude_tool_result_turn),
-                ):
-                    for iteration in range(args.repeat):
+                if model.casefold() == "kimi-k3":
+                    tests = [
+                        ("openai_text", test_openai_text),
+                        ("openai_stream_text", test_openai_stream_text),
+                        ("openai_tool_call", test_openai_tool_call),
+                        ("openai_vision", test_openai_vision),
+                        ("responses_vision", test_responses_vision),
+                        ("claude_text", test_claude_text),
+                        ("claude_vision", test_claude_vision),
+                    ]
+                else:
+                    tests = [
+                        ("openai_tool_call", test_openai_tool_call),
+                        ("openai_stream_tool_call", test_openai_stream_tool_call),
+                        ("openai_bash_tool_call", test_openai_bash_tool_call),
+                        (
+                            "openai_stream_bash_tool_call",
+                            test_openai_stream_bash_tool_call,
+                        ),
+                        ("openai_tool_result_turn", test_openai_tool_result_turn),
+                        ("openai_no_tool_needed", test_openai_no_tool_needed),
+                        ("claude_tool_use", test_claude_tool_use),
+                        ("claude_stream_tool_use", test_claude_stream_tool_use),
+                        ("claude_bash_tool_use", test_claude_bash_tool_use),
+                        (
+                            "claude_stream_bash_tool_use",
+                            test_claude_stream_bash_tool_use,
+                        ),
+                        ("claude_tool_result_turn", test_claude_tool_result_turn),
+                    ]
+                repeat = (
+                    args.kimi_repeat
+                    if model.casefold() == "kimi-k3"
+                    else args.repeat
+                )
+                for name, fn in tests:
+                    for iteration in range(repeat):
                         label = f"{model}:{name}:run{iteration + 1:02d}"
                         try:
                             fn(client, model, iteration)
@@ -197,7 +237,10 @@ def test_openai_stream_tool_call(client, model, iteration):
         for choice in event.get("choices", [])
         for tc in choice.get("delta", {}).get("tool_calls", []) or []
     ]
-    assert tool_chunks, "stream did not contain tool_calls"
+    assert tool_chunks, (
+        "stream did not contain tool_calls: "
+        + json.dumps(events, ensure_ascii=False)[:800]
+    )
     assert any(
         choice.get("finish_reason") == "tool_calls"
         for event in events
@@ -240,7 +283,10 @@ def test_openai_stream_bash_tool_call(client, model, iteration):
         for choice in event.get("choices", [])
         for tc in choice.get("delta", {}).get("tool_calls", []) or []
     ]
-    assert tool_chunks, "stream did not contain Bash tool_calls"
+    assert tool_chunks, (
+        "stream did not contain Bash tool_calls: "
+        + json.dumps(events, ensure_ascii=False)[:800]
+    )
     assert any(
         choice.get("finish_reason") == "tool_calls"
         for event in events
@@ -314,6 +360,183 @@ def test_openai_no_tool_needed(client, model, iteration):
     assert "paris" in (message.get("content") or "").lower()
 
 
+def test_openai_text(client, model, iteration):
+    marker = f"K3_OPENAI_TEXT_{iteration}"
+    data = post_json(
+        client,
+        "/v1/chat/completions",
+        {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": f"Reply with exactly {marker}"}
+            ],
+            "max_tokens": 128,
+        },
+    )
+
+    assert (data["choices"][0]["message"].get("content") or "").strip() == marker
+    assert (data.get("usage") or {}).get("prompt_tokens", 0) > 0
+
+
+def test_openai_stream_text(client, model, iteration):
+    marker = f"K3_OPENAI_STREAM_{iteration}"
+    events = post_stream(
+        client,
+        "/v1/chat/completions",
+        {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": f"Reply with exactly {marker}"}
+            ],
+            "stream": True,
+            "max_tokens": 128,
+        },
+    )
+    content = "".join(
+        str(choice.get("delta", {}).get("content") or "")
+        for event in events
+        for choice in event.get("choices", [])
+    )
+
+    assert content.strip() == marker
+
+
+def test_openai_vision(client, model, iteration):
+    image_url = red_image_url()
+    data = post_json(
+        client,
+        "/v1/chat/completions",
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Vision run {iteration}: what is the dominant color? "
+                                "Answer with one English color word."
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_url},
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": 128,
+        },
+    )
+
+    message = data["choices"][0]["message"]
+    assert "red" in (message.get("content") or "").lower()
+    usage = data.get("usage") or {}
+    assert usage.get("prompt_tokens", 0) > 0
+    assert usage.get("completion_tokens", 0) > 0
+
+
+def test_responses_vision(client, model, iteration):
+    data = post_json(
+        client,
+        "/v1/responses",
+        {
+            "model": model,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                f"Responses vision run {iteration}: what is the "
+                                "dominant color? Answer with one English color word."
+                            ),
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": red_image_url(),
+                        },
+                    ],
+                }
+            ],
+            "max_output_tokens": 128,
+        },
+    )
+
+    assert "red" in (data.get("output_text") or "").lower()
+    assert (data.get("usage") or {}).get("input_tokens", 0) > 0
+    assert (data.get("usage") or {}).get("output_tokens", 0) > 0
+
+
+def test_claude_vision(client, model, iteration):
+    image_url = red_image_url()
+    data = post_json(
+        client,
+        "/v1/messages",
+        {
+            "model": model,
+            "max_tokens": 128,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Claude vision run {iteration}: what is the "
+                                "dominant color? Answer with one English color word."
+                            ),
+                        },
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": image_url.partition(",")[2],
+                            },
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+
+    text = "".join(
+        block.get("text", "")
+        for block in data.get("content", [])
+        if block.get("type") == "text"
+    )
+    assert "red" in text.lower()
+    assert (data.get("usage") or {}).get("input_tokens", 0) > 0
+    assert (data.get("usage") or {}).get("output_tokens", 0) > 0
+
+
+def test_claude_text(client, model, iteration):
+    marker = f"K3_CLAUDE_TEXT_{iteration}"
+    data = post_json(
+        client,
+        "/v1/messages",
+        {
+            "model": model,
+            "max_tokens": 128,
+            "messages": [
+                {"role": "user", "content": f"Reply with exactly {marker}"}
+            ],
+        },
+    )
+    text = "".join(
+        block.get("text", "")
+        for block in data.get("content", [])
+        if block.get("type") == "text"
+    )
+
+    assert text.strip() == marker
+    assert (data.get("usage") or {}).get("input_tokens", 0) > 0
+
+
 def test_claude_tool_use(client, model, iteration):
     city = city_for(iteration + 3)
     data = post_json(client, "/v1/messages", claude_tool_request(model, f"Use get_weather for {city}."))
@@ -339,7 +562,10 @@ def test_claude_stream_tool_use(client, model, iteration):
         if event["event"] == "content_block_start"
         and event["data"].get("content_block", {}).get("type") == "tool_use"
     ]
-    assert tool_starts, "Claude stream did not start a tool_use block"
+    assert tool_starts, (
+        "Claude stream did not start a tool_use block: "
+        + json.dumps(events, ensure_ascii=False)[:800]
+    )
     assert any(
         event["event"] == "message_delta"
         and event["data"].get("delta", {}).get("stop_reason") == "tool_use"
@@ -369,7 +595,10 @@ def test_claude_stream_bash_tool_use(client, model, iteration):
         if event["event"] == "content_block_start"
         and event["data"].get("content_block", {}).get("type") == "tool_use"
     ]
-    assert tool_starts, "Claude stream did not start a Bash tool_use block"
+    assert tool_starts, (
+        "Claude stream did not start a Bash tool_use block: "
+        + json.dumps(events, ensure_ascii=False)[:800]
+    )
     assert any(block.get("name") == "Bash" for block in tool_starts)
     assert any(
         event["event"] == "message_delta"
@@ -443,6 +672,15 @@ def bash_prompt(iteration):
         f"Run {iteration}: use the Bash tool for this Claude Code style request. "
         f"Target project path is f:/onedrive-vercel/app. Task: {task}. "
         "Return a tool call only."
+    )
+
+
+def red_image_url():
+    buffer = io.BytesIO()
+    Image.new("RGB", (56, 28), (255, 0, 0)).save(buffer, format="PNG")
+    return (
+        "data:image/png;base64,"
+        + base64.b64encode(buffer.getvalue()).decode("ascii")
     )
 
 

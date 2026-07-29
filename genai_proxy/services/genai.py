@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import threading
@@ -33,8 +34,11 @@ from genai_proxy.errors import ProxyError
 from genai_proxy.optimizations import (
     DEEPSEEK_V4_ADAPTERS,
     GLM_5_2_ADAPTER,
+    KIMI_K3_ADAPTER,
+    KIMI_TOOL_TRANSPORT_ERROR,
     inject_deepseek_reasoning_prompt,
     inject_glm_reasoning_prompt,
+    inject_kimi_tool_prompt,
     select_tool_adapter,
     tool_start_tags,
 )
@@ -56,9 +60,9 @@ from genai_proxy.token_usage import (
     count_openai_completion_tokens,
     count_openai_reasoning_tokens,
     count_openai_request_tokens,
+    kimi_image_sizes_for_messages,
     tokenizer_family_for_model,
 )
-
 
 GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"
 GENAI_BASE_HEADERS = {
@@ -82,7 +86,18 @@ GENAI_BASE_HEADERS = {
 
 GENAI_USER_INFO_URL = "https://genai.shanghaitech.edu.cn/htk/ai-user-info/list"
 GENAI_CURRENT_USER_URL = "https://genai.shanghaitech.edu.cn/htk/user/info/{token}"
+GENAI_HISTORY_LIST_URL = (
+    "https://genai.shanghaitech.edu.cn/htk/ai/history/listByContentGroup"
+)
+GENAI_HISTORY_DELETE_URL = (
+    "https://genai.shanghaitech.edu.cn/htk/ai/history/delete/groupId"
+)
 GENAI_STREAM_TIMEOUT = (10, 600)
+GENAI_HISTORY_TIMEOUT = (5, 15)
+KIMI_EMPTY_CURRENT_INPUT = "\u200b"
+KIMI_HISTORY_PAGE_SIZE = 30
+KIMI_HISTORY_POLL_ATTEMPTS = 20
+KIMI_HISTORY_POLL_INTERVAL = 0.25
 
 
 @dataclass(slots=True)
@@ -99,7 +114,15 @@ class PreparedChatRequest:
     include_usage: bool
     prompt_tokens: int | None
     token_reasoning_config: dict | None
+    image_sizes: tuple[tuple[int, int], ...] | None
     generated_usage: dict | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _KimiHistoryCleanup:
+    question: str
+    user_id: str
+    existing_group_ids: frozenset[str]
 
 
 class GenAIService:
@@ -111,14 +134,18 @@ class GenAIService:
         *,
         max_retries: int = DEFAULT_MAX_RETRIES,
         retry_backoff: float = DEFAULT_RETRY_BACKOFF,
+        cleanup_kimi_history: bool = False,
     ):
         self._logger = logger
         self._token_manager = token_manager
         self._model_manager = model_manager
         self._max_retries = max(0, int(max_retries))
         self._retry_backoff = max(0.0, float(retry_backoff))
+        self._cleanup_kimi_history = bool(cleanup_kimi_history)
         self._billing_user_id = getattr(token_manager, "billing_user_id", None)
         self._billing_user_id_lock = threading.Lock()
+        self._kimi_history_locks = {}
+        self._kimi_history_locks_guard = threading.Lock()
 
     def build_openai_completion(self, req_data):
         prepared = self._prepare_chat_request(req_data)
@@ -528,6 +555,11 @@ class GenAIService:
                 adapter=tool_adapter,
                 reasoning_config=reasoning_config,
             )
+        elif tool_adapter == KIMI_K3_ADAPTER and any(
+            message.get("role") == "tool" or message.get("tool_calls")
+            for message in messages
+        ):
+            messages = inject_kimi_tool_prompt(messages, [], tool_choice="none")
         elif tool_adapter == GLM_5_2_ADAPTER:
             messages = inject_glm_reasoning_prompt(messages, reasoning_config)
         elif tool_adapter in DEEPSEEK_V4_ADAPTERS:
@@ -536,6 +568,9 @@ class GenAIService:
                 reasoning_config,
                 adapter=tool_adapter,
             )
+
+        if tool_adapter == KIMI_K3_ADAPTER:
+            messages = _normalize_kimi_messages_for_transport(messages)
 
         if not self._extract_last_user_message(messages):
             raise ProxyError("No user message found in 'messages'")
@@ -553,6 +588,10 @@ class GenAIService:
             and req_data["stream_options"].get("include_usage")
         )
         prompt_tokens = None
+        image_sizes = None
+        family = tokenizer_family_for_model(model, model_record, tool_adapter)
+        if family == "kimi_k3":
+            image_sizes = kimi_image_sizes_for_messages(messages)
         if count_usage or include_usage:
             prompt_tokens = count_openai_request_tokens(
                 messages,
@@ -560,6 +599,7 @@ class GenAIService:
                 model_record=model_record,
                 tool_adapter=tool_adapter,
                 reasoning_config=token_reasoning_config,
+                image_sizes=image_sizes,
             )
 
         return PreparedChatRequest(
@@ -575,6 +615,7 @@ class GenAIService:
             include_usage=include_usage,
             prompt_tokens=prompt_tokens,
             token_reasoning_config=token_reasoning_config,
+            image_sizes=image_sizes,
         )
 
     def _completion_tokens(
@@ -592,6 +633,7 @@ class GenAIService:
             prompt_messages=prepared.messages,
             reasoning_config=prepared.token_reasoning_config,
             finish_reason=finish_reason,
+            image_sizes=prepared.image_sizes,
         )
 
     def _usage(
@@ -615,6 +657,7 @@ class GenAIService:
             tool_adapter=prepared.tool_adapter,
             prompt_messages=prepared.messages,
             reasoning_config=prepared.token_reasoning_config,
+            image_sizes=prepared.image_sizes,
         )
         return {
             "prompt_tokens": prepared.prompt_tokens,
@@ -948,11 +991,78 @@ class GenAIService:
         *,
         buffer_until_complete=False,
     ):
+        if (
+            prepared.tool_adapter != KIMI_K3_ADAPTER
+            or not self._cleanup_kimi_history
+        ):
+            return self._stream_genai_response_raw(
+                prepared,
+                messages=messages,
+                buffer_until_complete=buffer_until_complete,
+            )
+        return self._stream_kimi_response_with_history_cleanup(
+            prepared,
+            messages=messages,
+            buffer_until_complete=buffer_until_complete,
+        )
+
+    def _stream_kimi_response_with_history_cleanup(
+        self,
+        prepared: PreparedChatRequest,
+        messages: list | None = None,
+        *,
+        buffer_until_complete=False,
+    ):
+        messages = messages if messages is not None else prepared.messages
+        _, chat_info, _ = _genai_transport_input(
+            messages,
+            prepared.tool_adapter,
+            prepared.image_sizes,
+        )
+        lock_key, history_lock = self._acquire_kimi_history_lock(chat_info)
+        upstream = None
+        try:
+            cleanup = self._prepare_kimi_history_cleanup(chat_info)
+            upstream = self._stream_genai_response_raw(
+                prepared,
+                messages=messages,
+                buffer_until_complete=buffer_until_complete,
+            )
+            cleanup_attempted = False
+            for payload in upstream:
+                if (
+                    cleanup is not None
+                    and not cleanup_attempted
+                    and _has_successful_finish_reason(payload)
+                ):
+                    cleanup_attempted = True
+                    self._delete_completed_kimi_history(cleanup)
+                yield payload
+        finally:
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except Exception as exc:
+                    self._logger.debug("Failed to close Kimi K3 stream: %s", exc)
+            self._release_kimi_history_lock(lock_key, history_lock)
+
+    def _stream_genai_response_raw(
+        self,
+        prepared: PreparedChatRequest,
+        messages: list | None = None,
+        *,
+        buffer_until_complete=False,
+    ):
         root_ai_type = self._model_manager.root_ai_type_for(prepared.model)
         messages = messages if messages is not None else prepared.messages
+        transport_messages, chat_info, image_fields = _genai_transport_input(
+            messages,
+            prepared.tool_adapter,
+            prepared.image_sizes,
+        )
         genai_data = {
-            "chatInfo": "",
-            "messages": messages,
+            "chatInfo": chat_info,
+            "messages": transport_messages,
             "type": "3",
             "stream": True,
             "aiType": prepared.model,
@@ -961,6 +1071,7 @@ class GenAIService:
             "rootAiType": root_ai_type,
             "maxToken": prepared.max_tokens or 30000,
         }
+        genai_data.update(image_fields)
         if prepared.root_model_name:
             genai_data["rootModelName"] = prepared.root_model_name
 
@@ -972,8 +1083,8 @@ class GenAIService:
             prepared.root_model_name,
             prepared.has_tools,
         )
-        self._logger.debug("Messages count: %d", len(messages))
-        for index, message in enumerate(messages):
+        self._logger.debug("Messages count: %d", len(transport_messages))
+        for index, message in enumerate(transport_messages):
             role = message.get("role", "?")
             content = message.get("content", "")
             preview = (
@@ -1105,11 +1216,29 @@ class GenAIService:
                         )
                         return
 
+                    structured_error = _structured_upstream_error(genai_json)
+                    if structured_error is not None:
+                        err_msg, error_type, error_code, error_status = structured_error
+                        self._logger.warning("GenAI structured error: %s", err_msg)
+                        yield _error_chunk_or_raise(
+                            sent_any_chunk,
+                            err_msg,
+                            prepared.model,
+                            error_type=error_type,
+                            code=error_code,
+                            status=error_status,
+                        )
+                        return
+
                     if (
                         isinstance(genai_json, dict)
                         and genai_json.get("code", 200) >= 400
                     ):
-                        err_msg = genai_json.get("message", "Unknown upstream error")
+                        err_msg = (
+                            genai_json.get("message")
+                            or genai_json.get("errMsg")
+                            or "Unknown upstream error"
+                        )
                         err_code = genai_json.get("code", 500)
                         self._logger.warning(
                             "GenAI business error (code=%s): %s",
@@ -1298,6 +1427,203 @@ class GenAIService:
             reason=reason,
         )
 
+    def _acquire_kimi_history_lock(self, question: str):
+        key = hashlib.sha256(question.encode("utf-8")).digest()
+        with self._kimi_history_locks_guard:
+            entry = self._kimi_history_locks.get(key)
+            if entry is None:
+                entry = [threading.Lock(), 0]
+                self._kimi_history_locks[key] = entry
+            entry[1] += 1
+            lock = entry[0]
+        lock.acquire()
+        return key, lock
+
+    def _release_kimi_history_lock(self, key: bytes, lock) -> None:
+        lock.release()
+        with self._kimi_history_locks_guard:
+            entry = self._kimi_history_locks.get(key)
+            if entry is None or entry[0] is not lock:
+                return
+            entry[1] -= 1
+            if entry[1] == 0:
+                del self._kimi_history_locks[key]
+
+    def _prepare_kimi_history_cleanup(
+        self,
+        question: str,
+    ) -> _KimiHistoryCleanup | None:
+        try:
+            def fetch(token):
+                user_id = self._get_billing_user_id(token)
+                records = self._fetch_kimi_history_records(token, user_id)
+                return user_id, records
+
+            user_id, records = self._with_token_auth_retry(
+                "Kimi K3 history snapshot",
+                fetch,
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "Kimi K3 history cleanup disabled for this request: %s",
+                exc,
+            )
+            return None
+
+        return _KimiHistoryCleanup(
+            question=question,
+            user_id=user_id,
+            existing_group_ids=frozenset(_history_group_ids(records)),
+        )
+
+    def _delete_completed_kimi_history(
+        self,
+        cleanup: _KimiHistoryCleanup,
+    ) -> None:
+        try:
+            candidates = []
+            for attempt in range(KIMI_HISTORY_POLL_ATTEMPTS):
+                records = self._with_token_auth_retry(
+                    "Kimi K3 history lookup",
+                    lambda token: self._fetch_kimi_history_records(
+                        token,
+                        cleanup.user_id,
+                    ),
+                )
+                candidates = [
+                    record
+                    for record in records
+                    if isinstance(record, dict)
+                    and record.get("question") == cleanup.question
+                    and str(record.get("chatGroupId") or "")
+                    not in cleanup.existing_group_ids
+                    and record.get("chatGroupId")
+                ]
+                if candidates or attempt == KIMI_HISTORY_POLL_ATTEMPTS - 1:
+                    break
+                time.sleep(KIMI_HISTORY_POLL_INTERVAL)
+
+            if not candidates:
+                self._logger.warning(
+                    "Kimi K3 completed, but its history record was not found"
+                )
+                return
+            if len(candidates) != 1:
+                self._logger.warning(
+                    "Kimi K3 history cleanup found %d new matching records; "
+                    "skipping ambiguous deletion",
+                    len(candidates),
+                )
+                return
+
+            group_id = str(candidates[0]["chatGroupId"])
+            self._with_token_auth_retry(
+                "Kimi K3 history deletion",
+                lambda token: self._delete_kimi_history_group(token, group_id),
+            )
+            self._logger.debug("Deleted completed Kimi K3 history record")
+        except Exception as exc:
+            self._logger.warning("Failed to delete Kimi K3 history record: %s", exc)
+
+    def _fetch_kimi_history_records(
+        self,
+        token: str,
+        user_id: str,
+    ) -> list[dict]:
+        try:
+            response = requests.get(
+                GENAI_HISTORY_LIST_URL,
+                params={
+                    "_t": int(time.time() * 1000),
+                    "pageNo": 1,
+                    "pageSize": KIMI_HISTORY_PAGE_SIZE,
+                    "userId": user_id,
+                    "question": "",
+                },
+                headers=self._get_user_genai_headers(token),
+                timeout=GENAI_HISTORY_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            raise transient_upstream_error(
+                "Failed to fetch Kimi K3 history"
+            ) from exc
+
+        payload = self._decode_kimi_history_response(
+            response,
+            "fetch Kimi K3 history",
+        )
+        result = payload.get("result")
+        records = result.get("records") if isinstance(result, dict) else []
+        return records if isinstance(records, list) else []
+
+    def _delete_kimi_history_group(self, token: str, group_id: str) -> None:
+        try:
+            response = requests.get(
+                GENAI_HISTORY_DELETE_URL,
+                params={
+                    "_t": int(time.time() * 1000),
+                    "id": group_id,
+                },
+                headers=self._get_user_genai_headers(token),
+                timeout=GENAI_HISTORY_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            raise transient_upstream_error(
+                "Failed to delete Kimi K3 history"
+            ) from exc
+
+        self._decode_kimi_history_response(
+            response,
+            "delete Kimi K3 history",
+        )
+
+    def _decode_kimi_history_response(self, response, operation: str) -> dict:
+        if response.status_code in (401, 403):
+            raise ProxyError(
+                "Upstream GenAI token is invalid or expired",
+                error_type="authentication_error",
+                code="upstream_auth_failed",
+                status=502,
+            )
+        if response.status_code != 200:
+            if is_retryable_status(response.status_code):
+                raise transient_upstream_error(f"Failed to {operation}")
+            raise ProxyError(
+                f"Failed to {operation}",
+                error_type="upstream_error",
+                status=502,
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise transient_upstream_error(f"Failed to {operation}") from exc
+
+        if not isinstance(payload, dict):
+            raise transient_upstream_error(f"Failed to {operation}")
+        raw_code = payload.get("code", 200)
+        try:
+            status_code = int(raw_code) if raw_code is not None else 200
+        except (TypeError, ValueError) as exc:
+            raise transient_upstream_error(f"Failed to {operation}") from exc
+        if is_genai_auth_failure(payload) or status_code in (401, 403):
+            raise ProxyError(
+                "Upstream GenAI token is invalid or expired",
+                error_type="authentication_error",
+                code="upstream_auth_failed",
+                status=502,
+            )
+        if status_code >= 400 or payload.get("success") is False:
+            message = payload.get("message") or payload.get("errMsg") or ""
+            if is_retryable_business_error(status_code, message):
+                raise transient_upstream_error(f"Failed to {operation}")
+            raise ProxyError(
+                f"Failed to {operation}",
+                error_type="upstream_error",
+                status=502,
+            )
+        return payload
+
     def _stream_genai_response_with_tools(self, prepared: PreparedChatRequest):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(datetime.now().timestamp())
@@ -1372,10 +1698,34 @@ class GenAIService:
             tool_calls = tool_calls or []
 
         sent_role = False
+        reasoning_content = attempt.get("reasoning_content") or ""
+        if prepared.tool_adapter == KIMI_K3_ADAPTER and reasoning_content:
+            yield make_chunk(
+                {
+                    "role": "assistant",
+                    "reasoning_content": reasoning_content,
+                }
+            )
+            sent_role = True
         if tool_calls:
             clean_remaining = _strip_visible_tool_syntax(
                 remaining or "", open_tags
             ).strip()
+            if (
+                prepared.tool_adapter == KIMI_K3_ADAPTER
+                and "<|open|>tools<|sep|>" in content
+                and prepared.prompt_tokens is not None
+            ):
+                self._record_usage(
+                    prepared,
+                    {
+                        "role": "assistant",
+                        "reasoning_content": reasoning_content,
+                        "content": clean_remaining or None,
+                        "tool_calls": tool_calls,
+                    },
+                    finish_reason="tool_calls",
+                )
             if clean_remaining:
                 for chunk in emit_response_text(clean_remaining, sent_role):
                     if isinstance(chunk, bool):
@@ -1389,6 +1739,30 @@ class GenAIService:
             if prepared.include_usage:
                 yield self._make_usage_chunk(prepared)
             yield "data: [DONE]\n\n"
+            return
+
+        if prepared.tool_adapter == KIMI_K3_ADAPTER and any(
+            tag in content for tag in open_tags
+        ):
+            self._logger.warning(
+                "Tool adapter output contained unparseable tool syntax (%d chars)",
+                len(content),
+            )
+            yield make_error_chunk(
+                "Upstream returned an invalid tool call",
+                prepared.model,
+                completion_id,
+            )
+            return
+
+        if prepared.tool_adapter == KIMI_K3_ADAPTER and _tool_choice_requires_call(
+            prepared.tool_choice
+        ):
+            yield make_error_chunk(
+                "Upstream did not return the required tool call",
+                prepared.model,
+                completion_id,
+            )
             return
 
         clean_content = _strip_visible_tool_syntax(content, open_tags)
@@ -1412,6 +1786,7 @@ class GenAIService:
         messages: list,
     ) -> dict:
         complete_content = ""
+        complete_reasoning = ""
         collected_tool_calls = []
         stream = self._stream_genai_response(
             prepared,
@@ -1450,6 +1825,9 @@ class GenAIService:
                     content = delta.get("content") or ""
                     if content:
                         complete_content += content
+                    reasoning = delta.get("reasoning_content") or ""
+                    if reasoning:
+                        complete_reasoning += reasoning
                     for tool_call in delta.get("tool_calls", []) or []:
                         collected_tool_calls.append(
                             _normalize_stream_tool_call(tool_call)
@@ -1462,6 +1840,7 @@ class GenAIService:
 
         return {
             "content": complete_content,
+            "reasoning_content": complete_reasoning,
             "tool_calls": _merge_tool_call_deltas(collected_tool_calls)
             if collected_tool_calls
             else [],
@@ -1482,6 +1861,174 @@ class GenAIService:
             ],
         }
         return f"data: {json.dumps(response)}\n\n"
+
+
+def _normalize_kimi_messages_for_transport(messages: list[dict]) -> list[dict]:
+    if any(
+        message.get("role") not in {"system", "user", "assistant", "tool"}
+        for message in messages
+    ):
+        raise ProxyError("Kimi K3 received an unsupported message role")
+    for message in messages:
+        _validate_kimi_message_content(message)
+        if message.get("tools"):
+            raise ProxyError(
+                KIMI_TOOL_TRANSPORT_ERROR,
+                error_type="invalid_request_error",
+                code="unsupported_tool_transport",
+                status=400,
+            )
+        if message.get("role") == "tool" or message.get("tool_calls"):
+            raise ProxyError(
+                "Kimi K3 tool history cannot be forwarded through the "
+                "ShanghaiTech GenAI transport without changing Moonshot's "
+                "official XTML encoding",
+                error_type="invalid_request_error",
+                code="unsupported_tool_transport",
+                status=400,
+            )
+    messages = [
+        {**message, "content": ""}
+        if message.get("content") is None
+        else message
+        for message in messages
+    ]
+    if not messages or not any(message.get("role") == "user" for message in messages):
+        return messages
+    if messages[-1].get("role") != "user":
+        return [
+            *messages,
+            {"role": "user", "content": KIMI_EMPTY_CURRENT_INPUT},
+        ]
+
+    content = messages[-1].get("content")
+    if isinstance(content, str):
+        if content:
+            return [
+                *messages[:-1],
+                _kimi_current_user_message(content),
+            ]
+        return [
+            *messages[:-1],
+            _kimi_current_user_message(
+                KIMI_EMPTY_CURRENT_INPUT,
+            ),
+        ]
+    if not isinstance(content, list):
+        raise ProxyError(
+            "Kimi K3 message content must be a string or a list of content parts"
+        )
+
+    text_parts = []
+    image_parts = []
+    for part in content:
+        if part.get("type") in {"image", "image_url"}:
+            image_parts.append(part)
+            continue
+        text = part.get("text")
+        if not isinstance(text, str):
+            raise ProxyError(
+                "Kimi K3 message content supports only text and image parts"
+            )
+        text_parts.append(text)
+
+    text = "".join(text_parts)
+    if not image_parts:
+        normalized_content = text or KIMI_EMPTY_CURRENT_INPUT
+    else:
+        normalized_content = []
+        normalized_content.append(
+            {
+                "type": "text",
+                "text": text or KIMI_EMPTY_CURRENT_INPUT,
+            }
+        )
+        normalized_content.extend(image_parts)
+
+    normalized_message = _kimi_current_user_message(
+        normalized_content,
+    )
+    return [*messages[:-1], normalized_message]
+
+
+def _validate_kimi_message_content(message: dict) -> None:
+    role = message.get("role")
+    content = message.get("content")
+    if role == "tool" or content is None or isinstance(content, str):
+        return
+    if not isinstance(content, list):
+        raise ProxyError(
+            "Kimi K3 message content must be a string or a list of content parts"
+        )
+    for part in content:
+        part_type = part.get("type")
+        if part_type in {"image", "image_url"}:
+            if role != "user":
+                raise ProxyError("Kimi K3 accepts image content only in user messages")
+            continue
+        if part_type != "text" or not isinstance(part.get("text"), str):
+            raise ProxyError(
+                "Kimi K3 message content supports only text and image parts"
+            )
+
+
+def _kimi_current_user_message(content) -> dict:
+    return {
+        "role": "user",
+        "content": content,
+    }
+
+
+def _genai_transport_input(
+    messages: list[dict],
+    tool_adapter: str,
+    image_sizes: tuple[tuple[int, int], ...] | None,
+):
+    if tool_adapter != KIMI_K3_ADAPTER:
+        return messages, "", {}
+
+    current = messages[-1]
+    if current.get("role") != "user":
+        raise RuntimeError("Kimi K3 transport requires a final user message")
+
+    content = current.get("content")
+    image_urls = []
+    if isinstance(content, str):
+        chat_info = content
+    else:
+        text_parts = []
+        for part in content or []:
+            if part.get("type") in {"image", "image_url"}:
+                image_urls.append(_kimi_image_url(part))
+            else:
+                text_parts.append(str(part.get("text") or ""))
+        chat_info = "".join(text_parts) or KIMI_EMPTY_CURRENT_INPUT
+
+    image_fields = {}
+    if image_urls:
+        current_sizes = (image_sizes or ())[-len(image_urls) :]
+        if len(current_sizes) != len(image_urls):
+            raise RuntimeError("Kimi K3 image dimensions were not prepared")
+        width, height = current_sizes[0]
+        image_fields = {
+            "imageUrl": image_urls[0],
+            "imageUrls": image_urls,
+            "width": width,
+            "height": height,
+        }
+
+    return messages[:-1], chat_info, image_fields
+
+
+def _kimi_image_url(part: dict) -> str:
+    source = part.get(part.get("type"))
+    if source is None and part.get("type") == "image":
+        source = part.get("url")
+    if isinstance(source, dict):
+        source = source.get("url", source.get("data"))
+    if not isinstance(source, str) or not source:
+        raise ProxyError("Kimi K3 image content is missing its URL")
+    return source
 
 
 def _validate_openai_message_shapes(messages: list[dict]) -> None:
@@ -1512,7 +2059,7 @@ def _normalize_messages_for_model_template(
     tool_adapter: str,
 ) -> list[dict]:
     family = tokenizer_family_for_model(model, model_record, tool_adapter)
-    if family not in {"glm_5_2", "qwen_3_5"}:
+    if family not in {"glm_5_2", "qwen_3_5", "kimi_k3"}:
         return messages
 
     normalized = [
@@ -1582,6 +2129,34 @@ def _upstream_auth_error() -> ProxyError:
     )
 
 
+def _structured_upstream_error(payload):
+    if not isinstance(payload, dict) or not payload.get("error"):
+        return None
+
+    error = payload["error"]
+    if isinstance(error, dict):
+        message = (
+            error.get("message")
+            or payload.get("message")
+            or payload.get("errMsg")
+            or "Unknown upstream error"
+        )
+        error_type = error.get("type") or "upstream_error"
+        raw_code = error.get("code")
+    else:
+        message = str(error)
+        error_type = "upstream_error"
+        raw_code = None
+
+    status = (
+        raw_code
+        if isinstance(raw_code, int) and 400 <= raw_code < 500
+        else 502
+    )
+    code = raw_code if isinstance(raw_code, str) else None
+    return str(message), str(error_type), code, status
+
+
 def _error_chunk_or_raise(
     sent_any_chunk: bool,
     message: str,
@@ -1604,6 +2179,32 @@ def _iter_sse_lines(payload: str):
     for line in str(payload).splitlines():
         if line.startswith("data: "):
             yield line
+
+
+def _has_successful_finish_reason(payload) -> bool:
+    for line in _iter_sse_lines(payload):
+        data_str = line[6:].strip()
+        if not data_str or data_str == "[DONE]":
+            continue
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        choices = data.get("choices") or []
+        if not choices:
+            continue
+        finish_reason = choices[0].get("finish_reason")
+        if finish_reason is not None:
+            return finish_reason != "error"
+    return False
+
+
+def _history_group_ids(records: list[dict]) -> set[str]:
+    return {
+        str(record["chatGroupId"])
+        for record in records
+        if isinstance(record, dict) and record.get("chatGroupId")
+    }
 
 
 def _tool_start_tags_for_request(adapter: str, tools: list | None) -> tuple[str, ...]:
@@ -1642,6 +2243,12 @@ def _request_tool_specs(tools: list | None) -> dict[str, list[str]]:
 def _tool_choice_is_none(tool_choice) -> bool:
     return tool_choice == "none" or (
         isinstance(tool_choice, dict) and tool_choice.get("type") == "none"
+    )
+
+
+def _tool_choice_requires_call(tool_choice) -> bool:
+    return tool_choice == "required" or (
+        isinstance(tool_choice, dict) and tool_choice.get("type") == "function"
     )
 
 

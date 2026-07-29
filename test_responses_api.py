@@ -7,7 +7,6 @@ from genai_proxy.app import create_app
 from genai_proxy.compat.responses import convert_responses_to_openai_request
 from genai_proxy.services.genai import GenAIService
 
-
 RESPONSES_WEATHER_TOOL = {
     "type": "function",
     "name": "get_weather",
@@ -218,6 +217,68 @@ def test_responses_input_accepts_easy_message_without_type():
 
     assert completed_event(events)["end_turn"] is True
     assert captured[0]["messages"][-1] == {"role": "user", "content": "hi"}
+
+
+def test_responses_input_image_is_preserved_as_openai_vision_content():
+    image_url = "https://example.test/image.png"
+    context = convert_responses_to_openai_request(
+        {
+            "model": "kimi-k3",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Describe this image."},
+                        {
+                            "type": "input_image",
+                            "image_url": image_url,
+                            "detail": "high",
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert context.openai_request["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this image."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url, "detail": "high"},
+                },
+            ],
+        }
+    ]
+
+
+def test_responses_image_preservation_is_scoped_to_kimi_k3():
+    context = convert_responses_to_openai_request(
+        {
+            "model": "GPT-4.1",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.test/image.png",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert context.openai_request["messages"] == [
+        {
+            "role": "user",
+            "content": "[image: https://example.test/image.png]",
+        }
+    ]
 
 
 def test_responses_local_shell_call_preserves_command_argv():
