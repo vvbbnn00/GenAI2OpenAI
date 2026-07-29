@@ -486,7 +486,10 @@ class GenAIService:
         buffer_until_complete=False,
     ):
         if prepared.has_tools:
-            return self._stream_genai_response_with_tools(prepared)
+            return self._stream_genai_response_with_tools(
+                prepared,
+                stream_reasoning=not buffer_until_complete,
+            )
         return self._stream_genai_response(
             prepared,
             buffer_until_complete=buffer_until_complete,
@@ -990,6 +993,7 @@ class GenAIService:
         messages: list | None = None,
         *,
         buffer_until_complete=False,
+        stream_reasoning=False,
     ):
         if (
             prepared.tool_adapter != KIMI_K3_ADAPTER
@@ -999,11 +1003,13 @@ class GenAIService:
                 prepared,
                 messages=messages,
                 buffer_until_complete=buffer_until_complete,
+                stream_reasoning=stream_reasoning,
             )
         return self._stream_kimi_response_with_history_cleanup(
             prepared,
             messages=messages,
             buffer_until_complete=buffer_until_complete,
+            stream_reasoning=stream_reasoning,
         )
 
     def _stream_kimi_response_with_history_cleanup(
@@ -1012,6 +1018,7 @@ class GenAIService:
         messages: list | None = None,
         *,
         buffer_until_complete=False,
+        stream_reasoning=False,
     ):
         messages = messages if messages is not None else prepared.messages
         _, chat_info, _ = _genai_transport_input(
@@ -1027,6 +1034,7 @@ class GenAIService:
                 prepared,
                 messages=messages,
                 buffer_until_complete=buffer_until_complete,
+                stream_reasoning=stream_reasoning,
             )
             cleanup_attempted = False
             for payload in upstream:
@@ -1052,7 +1060,10 @@ class GenAIService:
         messages: list | None = None,
         *,
         buffer_until_complete=False,
+        stream_reasoning=False,
     ):
+        if stream_reasoning and not buffer_until_complete:
+            raise ValueError("stream_reasoning requires buffered completion content")
         root_ai_type = self._model_manager.root_ai_type_for(prepared.model)
         messages = messages if messages is not None else prepared.messages
         transport_messages, chat_info, image_fields = _genai_transport_input(
@@ -1134,7 +1145,8 @@ class GenAIService:
                         continue
                     if response.status_code in (401, 403):
                         if (
-                            not auth_retry_used
+                            not sent_any_chunk
+                            and not auth_retry_used
                             and self._token_manager.refresh_after_auth_failure(
                                 "chat request",
                                 rejected_token=request_token,
@@ -1200,7 +1212,8 @@ class GenAIService:
                             "GenAI authentication business error: %s", err_msg
                         )
                         if (
-                            not auth_retry_used
+                            not sent_any_chunk
+                            and not auth_retry_used
                             and self._token_manager.refresh_after_auth_failure(
                                 "chat stream",
                                 rejected_token=request_token,
@@ -1301,12 +1314,33 @@ class GenAIService:
 
                     if delta:
                         received_any_chunk = True
-                        chunk = self._make_chunk(prepared.model, delta)
                         if buffer_until_complete:
-                            attempt_chunks.append(chunk)
+                            if stream_reasoning:
+                                buffered_delta = {}
+                                if content:
+                                    buffered_delta["content"] = content
+                                if tool_calls:
+                                    buffered_delta["tool_calls"] = tool_calls
+                                if reasoning:
+                                    sent_any_chunk = True
+                                    yield self._make_chunk(
+                                        prepared.model,
+                                        {"reasoning_content": reasoning},
+                                    )
+                                if buffered_delta:
+                                    attempt_chunks.append(
+                                        self._make_chunk(
+                                            prepared.model,
+                                            buffered_delta,
+                                        )
+                                    )
+                            else:
+                                attempt_chunks.append(
+                                    self._make_chunk(prepared.model, delta)
+                                )
                         else:
                             sent_any_chunk = True
-                            yield chunk
+                            yield self._make_chunk(prepared.model, delta)
 
                     if finish_reason is not None:
                         finished = True
@@ -1370,7 +1404,7 @@ class GenAIService:
                         prepared.model,
                     )
                 elif buffer_until_complete:
-                    sent_any_chunk = bool(attempt_chunks)
+                    sent_any_chunk = sent_any_chunk or bool(attempt_chunks)
                     yield from attempt_chunks
                 return
             except (requests.RequestException, OSError, EOFError) as exc:
@@ -1624,7 +1658,12 @@ class GenAIService:
             )
         return payload
 
-    def _stream_genai_response_with_tools(self, prepared: PreparedChatRequest):
+    def _stream_genai_response_with_tools(
+        self,
+        prepared: PreparedChatRequest,
+        *,
+        stream_reasoning: bool,
+    ):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(datetime.now().timestamp())
         open_tags = _tool_start_tags_for_request(prepared.tool_adapter, prepared.tools)
@@ -1679,10 +1718,34 @@ class GenAIService:
                     }
                 )
 
-        attempt = self._collect_tool_attempt(
-            prepared,
-            prepared.messages,
-        )
+        sent_role = False
+        attempt = None
+        try:
+            for event_type, value in self._iter_tool_attempt_events(
+                prepared,
+                prepared.messages,
+                stream_reasoning=stream_reasoning,
+            ):
+                if event_type == "reasoning":
+                    delta = {"reasoning_content": value}
+                    if not sent_role:
+                        delta["role"] = "assistant"
+                        sent_role = True
+                    yield make_chunk(delta)
+                else:
+                    attempt = value
+        except ProxyError as exc:
+            if not sent_role:
+                raise
+            yield make_error_chunk(
+                exc.message,
+                prepared.model,
+                completion_id,
+            )
+            return
+
+        if attempt is None:
+            raise RuntimeError("Tool stream ended without a completed attempt")
 
         tool_calls = attempt.get("tool_calls") or []
         content = attempt.get("content") or ""
@@ -1697,16 +1760,7 @@ class GenAIService:
             )
             tool_calls = tool_calls or []
 
-        sent_role = False
         reasoning_content = attempt.get("reasoning_content") or ""
-        if prepared.tool_adapter == KIMI_K3_ADAPTER and reasoning_content:
-            yield make_chunk(
-                {
-                    "role": "assistant",
-                    "reasoning_content": reasoning_content,
-                }
-            )
-            sent_role = True
         if tool_calls:
             clean_remaining = _strip_visible_tool_syntax(
                 remaining or "", open_tags
@@ -1780,11 +1834,13 @@ class GenAIService:
             yield self._make_usage_chunk(prepared)
         yield "data: [DONE]\n\n"
 
-    def _collect_tool_attempt(
+    def _iter_tool_attempt_events(
         self,
         prepared: PreparedChatRequest,
         messages: list,
-    ) -> dict:
+        *,
+        stream_reasoning: bool,
+    ):
         complete_content = ""
         complete_reasoning = ""
         collected_tool_calls = []
@@ -1792,6 +1848,7 @@ class GenAIService:
             prepared,
             messages=messages,
             buffer_until_complete=True,
+            stream_reasoning=stream_reasoning,
         )
         try:
             for payload in stream:
@@ -1828,6 +1885,7 @@ class GenAIService:
                     reasoning = delta.get("reasoning_content") or ""
                     if reasoning:
                         complete_reasoning += reasoning
+                        yield "reasoning", reasoning
                     for tool_call in delta.get("tool_calls", []) or []:
                         collected_tool_calls.append(
                             _normalize_stream_tool_call(tool_call)
@@ -1838,13 +1896,16 @@ class GenAIService:
             if close:
                 close()
 
-        return {
-            "content": complete_content,
-            "reasoning_content": complete_reasoning,
-            "tool_calls": _merge_tool_call_deltas(collected_tool_calls)
-            if collected_tool_calls
-            else [],
-        }
+        yield (
+            "complete",
+            {
+                "content": complete_content,
+                "reasoning_content": complete_reasoning,
+                "tool_calls": _merge_tool_call_deltas(collected_tool_calls)
+                if collected_tool_calls
+                else [],
+            },
+        )
 
     def _make_chunk(self, model, delta, finish_reason=None):
         response = {

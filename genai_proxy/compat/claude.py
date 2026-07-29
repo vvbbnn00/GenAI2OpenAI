@@ -19,11 +19,14 @@ TOOL_FUNCTION = "function"
 
 CONTENT_IMAGE = "image"
 CONTENT_TEXT = "text"
+CONTENT_THINKING = "thinking"
 CONTENT_TOOL_RESULT = "tool_result"
 CONTENT_TOOL_USE = "tool_use"
 
 DELTA_INPUT_JSON = "input_json_delta"
+DELTA_SIGNATURE = "signature_delta"
 DELTA_TEXT = "text_delta"
+DELTA_THINKING = "thinking_delta"
 
 EVENT_CONTENT_BLOCK_DELTA = "content_block_delta"
 EVENT_CONTENT_BLOCK_START = "content_block_start"
@@ -167,6 +170,16 @@ def convert_openai_to_claude_response(openai_response, original_request):
     message = choice.get("message", {})
     content_blocks = []
 
+    reasoning_content = message.get("reasoning_content")
+    if reasoning_content:
+        content_blocks.append(
+            {
+                "type": CONTENT_THINKING,
+                "thinking": reasoning_content,
+                "signature": "",
+            }
+        )
+
     text_content = message.get("content")
     if text_content is not None:
         content_blocks.append({"type": CONTENT_TEXT, "text": text_content})
@@ -214,7 +227,7 @@ def convert_openai_to_claude_response(openai_response, original_request):
         )
     output_tokens = usage.get("completion_tokens")
     if output_tokens is None:
-        output_text = text_content or ""
+        output_text = (reasoning_content or "") + (text_content or "")
         for block in content_blocks:
             if block.get("type") == CONTENT_TOOL_USE:
                 output_text += block.get("name", "")
@@ -279,20 +292,50 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
             },
         },
     )
-    yield _claude_event(
-        EVENT_CONTENT_BLOCK_START,
-        {
-            "type": EVENT_CONTENT_BLOCK_START,
-            "index": 0,
-            "content_block": {"type": CONTENT_TEXT, "text": ""},
-        },
-    )
     yield _claude_event(EVENT_PING, {"type": EVENT_PING})
 
-    text_block_index = 0
-    tool_block_counter = 0
+    next_block_index = 0
+    active_block_type = None
+    active_block_index = None
+    emitted_content_block = False
     current_tool_calls = {}
     final_stop_reason = STOP_END_TURN
+
+    def close_active_block():
+        nonlocal active_block_index, active_block_type
+        if active_block_index is None:
+            return
+        if active_block_type == CONTENT_THINKING:
+            yield _claude_event(
+                EVENT_CONTENT_BLOCK_DELTA,
+                {
+                    "type": EVENT_CONTENT_BLOCK_DELTA,
+                    "index": active_block_index,
+                    "delta": {"type": DELTA_SIGNATURE, "signature": ""},
+                },
+            )
+        yield _claude_event(
+            EVENT_CONTENT_BLOCK_STOP,
+            {"type": EVENT_CONTENT_BLOCK_STOP, "index": active_block_index},
+        )
+        active_block_type = None
+        active_block_index = None
+
+    def start_content_block(block_type, content_block):
+        nonlocal active_block_index, active_block_type
+        nonlocal emitted_content_block, next_block_index
+        active_block_index = next_block_index
+        active_block_type = block_type
+        next_block_index += 1
+        emitted_content_block = True
+        yield _claude_event(
+            EVENT_CONTENT_BLOCK_START,
+            {
+                "type": EVENT_CONTENT_BLOCK_START,
+                "index": active_block_index,
+                "content_block": content_block,
+            },
+        )
 
     try:
         for payload in openai_payloads:
@@ -333,14 +376,46 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
                     )
                     return
 
-                if delta.get("content") is not None:
-                    output_text_parts.append(delta["content"])
+                reasoning = delta.get("reasoning_content") or ""
+                if reasoning:
+                    if active_block_type != CONTENT_THINKING:
+                        yield from close_active_block()
+                        yield from start_content_block(
+                            CONTENT_THINKING,
+                            {
+                                "type": CONTENT_THINKING,
+                                "thinking": "",
+                                "signature": "",
+                            },
+                        )
+                    output_text_parts.append(reasoning)
                     yield _claude_event(
                         EVENT_CONTENT_BLOCK_DELTA,
                         {
                             "type": EVENT_CONTENT_BLOCK_DELTA,
-                            "index": text_block_index,
-                            "delta": {"type": DELTA_TEXT, "text": delta["content"]},
+                            "index": active_block_index,
+                            "delta": {
+                                "type": DELTA_THINKING,
+                                "thinking": reasoning,
+                            },
+                        },
+                    )
+
+                content = delta.get("content") or ""
+                if content:
+                    if active_block_type != CONTENT_TEXT:
+                        yield from close_active_block()
+                        yield from start_content_block(
+                            CONTENT_TEXT,
+                            {"type": CONTENT_TEXT, "text": ""},
+                        )
+                    output_text_parts.append(content)
+                    yield _claude_event(
+                        EVENT_CONTENT_BLOCK_DELTA,
+                        {
+                            "type": EVENT_CONTENT_BLOCK_DELTA,
+                            "index": active_block_index,
+                            "delta": {"type": DELTA_TEXT, "text": content},
                         },
                     )
 
@@ -352,9 +427,6 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
                             "id": None,
                             "name": None,
                             "args_buffer": "",
-                            "json_sent": False,
-                            "claude_index": None,
-                            "started": False,
                         },
                     )
 
@@ -364,57 +436,8 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
                     function_data = tc_delta.get(TOOL_FUNCTION, {})
                     if function_data.get("name"):
                         tool_call["name"] = function_data["name"]
-                        output_text_parts.append(function_data["name"])
-
-                    if (
-                        tool_call["id"]
-                        and tool_call["name"]
-                        and not tool_call["started"]
-                    ):
-                        tool_block_counter += 1
-                        tool_call["claude_index"] = (
-                            text_block_index + tool_block_counter
-                        )
-                        tool_call["started"] = True
-                        yield _claude_event(
-                            EVENT_CONTENT_BLOCK_START,
-                            {
-                                "type": EVENT_CONTENT_BLOCK_START,
-                                "index": tool_call["claude_index"],
-                                "content_block": {
-                                    "type": CONTENT_TOOL_USE,
-                                    "id": tool_call["id"],
-                                    "name": tool_call["name"],
-                                    "input": {},
-                                },
-                            },
-                        )
-
-                    if (
-                        "arguments" in function_data
-                        and tool_call["started"]
-                        and function_data["arguments"] is not None
-                    ):
-                        tool_call["args_buffer"] += function_data["arguments"]
-                        output_text_parts.append(function_data["arguments"])
-                        try:
-                            json.loads(tool_call["args_buffer"])
-                        except json.JSONDecodeError:
-                            pass
-                        else:
-                            if not tool_call["json_sent"]:
-                                yield _claude_event(
-                                    EVENT_CONTENT_BLOCK_DELTA,
-                                    {
-                                        "type": EVENT_CONTENT_BLOCK_DELTA,
-                                        "index": tool_call["claude_index"],
-                                        "delta": {
-                                            "type": DELTA_INPUT_JSON,
-                                            "partial_json": tool_call["args_buffer"],
-                                        },
-                                    },
-                                )
-                                tool_call["json_sent"] = True
+                    if function_data.get("arguments") is not None:
+                        tool_call["args_buffer"] += str(function_data["arguments"])
 
                 if finish_reason:
                     final_stop_reason = {
@@ -435,20 +458,49 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
         )
         return
 
-    yield _claude_event(
-        EVENT_CONTENT_BLOCK_STOP,
-        {"type": EVENT_CONTENT_BLOCK_STOP, "index": text_block_index},
-    )
+    yield from close_active_block()
 
     for tool_data in current_tool_calls.values():
-        if tool_data.get("started") and tool_data.get("claude_index") is not None:
-            yield _claude_event(
-                EVENT_CONTENT_BLOCK_STOP,
-                {
-                    "type": EVENT_CONTENT_BLOCK_STOP,
-                    "index": tool_data["claude_index"],
-                },
+        name = tool_data.get("name")
+        if not name:
+            continue
+        raw_arguments = tool_data.get("args_buffer") or "{}"
+        try:
+            json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            raw_arguments = json.dumps(
+                {"raw_arguments": raw_arguments},
+                ensure_ascii=False,
             )
+        output_text_parts.extend((name, raw_arguments))
+        yield from start_content_block(
+            CONTENT_TOOL_USE,
+            {
+                "type": CONTENT_TOOL_USE,
+                "id": tool_data.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                "name": name,
+                "input": {},
+            },
+        )
+        yield _claude_event(
+            EVENT_CONTENT_BLOCK_DELTA,
+            {
+                "type": EVENT_CONTENT_BLOCK_DELTA,
+                "index": active_block_index,
+                "delta": {
+                    "type": DELTA_INPUT_JSON,
+                    "partial_json": raw_arguments,
+                },
+            },
+        )
+        yield from close_active_block()
+
+    if not emitted_content_block:
+        yield from start_content_block(
+            CONTENT_TEXT,
+            {"type": CONTENT_TEXT, "text": ""},
+        )
+        yield from close_active_block()
 
     yield _claude_event(
         EVENT_MESSAGE_DELTA,
@@ -536,11 +588,14 @@ def _convert_claude_assistant_message(content):
     if isinstance(content, str):
         return {"role": ROLE_ASSISTANT, "content": content}
 
+    reasoning_parts = []
     text_parts = []
     tool_calls = []
     for block in content:
         block_type = block.get("type")
-        if block_type == CONTENT_TEXT:
+        if block_type == CONTENT_THINKING:
+            reasoning_parts.append(block.get("thinking", ""))
+        elif block_type == CONTENT_TEXT:
             text_parts.append(block.get("text", ""))
         elif block_type == CONTENT_TOOL_USE:
             tool_calls.append(
@@ -557,6 +612,8 @@ def _convert_claude_assistant_message(content):
             )
 
     message = {"role": ROLE_ASSISTANT, "content": "".join(text_parts) or None}
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
     if tool_calls:
         message["tool_calls"] = tool_calls
     return message

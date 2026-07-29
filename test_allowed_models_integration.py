@@ -148,9 +148,11 @@ def main():
                         ("openai_text", test_openai_text),
                         ("openai_stream_text", test_openai_stream_text),
                         ("openai_tool_call", test_openai_tool_call),
+                        ("openai_stream_tool_call", test_openai_stream_tool_call),
                         ("openai_vision", test_openai_vision),
                         ("responses_vision", test_responses_vision),
                         ("claude_text", test_claude_text),
+                        ("claude_stream_tool_use", test_claude_stream_tool_use),
                         ("claude_vision", test_claude_vision),
                     ]
                 else:

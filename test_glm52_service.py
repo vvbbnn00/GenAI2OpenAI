@@ -13,7 +13,6 @@ from genai_proxy.optimizations.deepseek import DEEPSEEK_V4_REASONING_EFFORT_MAX
 from genai_proxy.routes.claude import map_claude_model_alias
 from genai_proxy.services.genai import GenAIService
 
-
 OPENAI_WEATHER_TOOL = {
     "type": "function",
     "function": {
@@ -554,10 +553,70 @@ def test_glm52_openai_stream_reasoning_content_passes_through_without_tools():
     )
 
 
+def test_tool_stream_forwards_reasoning_before_tool_output_is_consumed():
+    steps = []
+
+    class IncrementalResponse(FakeResponse):
+        def iter_lines(self):
+            steps.append("reasoning")
+            yield sse_line({"reasoning_content": "checking"}).encode("utf-8")
+            steps.append("tool")
+            yield sse_line(
+                {
+                    "content": (
+                        "<tool_call>get_weather"
+                        "<arg_key>location</arg_key>"
+                        "<arg_value>Shanghai</arg_value>"
+                        "</tool_call>"
+                    )
+                }
+            ).encode("utf-8")
+            steps.append("finish")
+            yield sse_line({}, "stop").encode("utf-8")
+
+    service, _captured, _fake_post = make_service([])
+    request = {
+        "model": "chatglm",
+        "messages": [{"role": "user", "content": "Use weather."}],
+        "tools": [OPENAI_WEATHER_TOOL],
+        "stream": True,
+    }
+
+    with patch(
+        "genai_proxy.services.genai.requests.post",
+        return_value=IncrementalResponse([]),
+    ):
+        chunks = service.stream_openai_completion(request)
+        first_chunk = next(chunks)
+        first_events = parse_openai_events([first_chunk])
+
+        assert steps == ["reasoning"]
+        assert first_events[0]["choices"][0]["delta"] == {
+            "role": "assistant",
+            "reasoning_content": "checking",
+        }
+
+        remaining_events = parse_openai_events(chunks)
+
+    events = [*first_events, *remaining_events]
+    assert steps == ["reasoning", "tool", "finish"]
+    assert any(
+        choice.get("delta", {}).get("tool_calls")
+        for event in events
+        for choice in event["choices"]
+    )
+    assert not any(
+        "<tool_call>" in str(choice.get("delta", {}).get("content") or "")
+        for event in events
+        for choice in event["choices"]
+    )
+
+
 def test_claude_output_config_effort_maps_to_glm52_openai_reasoning_and_tool_use():
     model_manager = FakeModelManager()
     service, _captured, fake_post = make_service(
         [
+            sse_line({"reasoning_content": "I should use weather."}),
             sse_line(
                 {
                     "content": (
@@ -591,6 +650,12 @@ def test_claude_output_config_effort_maps_to_glm52_openai_reasoning_and_tool_use
     tool_blocks = [
         block for block in response["content"] if block.get("type") == "tool_use"
     ]
+    thinking_blocks = [
+        block for block in response["content"] if block.get("type") == "thinking"
+    ]
+    assert thinking_blocks
+    assert thinking_blocks[0]["thinking"] == "I should use weather."
+    assert thinking_blocks[0]["signature"] == ""
     assert tool_blocks
     assert tool_blocks[0]["name"] == "get_weather"
     assert tool_blocks[0]["input"] == {"location": "Shanghai"}
@@ -601,6 +666,7 @@ def test_claude_streaming_tool_use_survives_glm52_reasoning_effort():
     model_manager = FakeModelManager()
     service, _captured, fake_post = make_service(
         [
+            sse_line({"reasoning_content": "I should use weather."}),
             sse_line(
                 {
                     "content": (
@@ -634,14 +700,49 @@ def test_claude_streaming_tool_use_survives_glm52_reasoning_effort():
             )
         )
 
+    thinking_starts = [
+        event
+        for event in events
+        if event["event"] == "content_block_start"
+        and event["data"].get("content_block", {}).get("type") == "thinking"
+    ]
+    thinking_deltas = [
+        event
+        for event in events
+        if event["event"] == "content_block_delta"
+        and event["data"].get("delta", {}).get("type") == "thinking_delta"
+    ]
+    signature_deltas = [
+        event
+        for event in events
+        if event["event"] == "content_block_delta"
+        and event["data"].get("delta", {}).get("type") == "signature_delta"
+    ]
     tool_starts = [
-        event["data"]["content_block"]
+        event
         for event in events
         if event["event"] == "content_block_start"
         and event["data"].get("content_block", {}).get("type") == "tool_use"
     ]
+    assert thinking_starts
+    assert thinking_deltas
+    assert thinking_deltas[0]["data"]["delta"]["thinking"] == "I should use weather."
+    assert signature_deltas
+    thinking_index = thinking_starts[0]["data"]["index"]
+    thinking_stop = next(
+        event
+        for event in events
+        if event["event"] == "content_block_stop"
+        and event["data"]["index"] == thinking_index
+    )
     assert tool_starts
-    assert tool_starts[0]["name"] == "get_weather"
+    assert tool_starts[0]["data"]["content_block"]["name"] == "get_weather"
+    assert (
+        events.index(thinking_deltas[0])
+        < events.index(signature_deltas[0])
+        < events.index(thinking_stop)
+        < events.index(tool_starts[0])
+    )
     assert any(
         event["event"] == "message_delta"
         and event["data"].get("delta", {}).get("stop_reason") == "tool_use"
@@ -689,6 +790,53 @@ def test_claude_streaming_bare_required_tool_name_is_forwarded_as_tool_use():
         and event["data"].get("delta", {}).get("stop_reason") == "tool_use"
         for event in events
     )
+
+
+def test_claude_thinking_block_is_preserved_across_tool_result_turn():
+    claude_request = {
+        "model": "chatglm",
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "I should use weather.",
+                        "signature": "",
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_weather",
+                        "name": "get_weather",
+                        "input": {"location": "Shanghai"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_weather",
+                        "content": "Sunny",
+                    }
+                ],
+            },
+        ],
+    }
+
+    openai_request = convert_claude_to_openai(claude_request, FakeModelManager())
+
+    assert openai_request["messages"][0]["reasoning_content"] == (
+        "I should use weather."
+    )
+    assert openai_request["messages"][0]["tool_calls"][0]["id"] == "toolu_weather"
+    assert openai_request["messages"][1] == {
+        "role": "tool",
+        "tool_call_id": "toolu_weather",
+        "content": "Sunny",
+    }
 
 
 def test_claude_non_stream_bash_tool_preserves_shell_string_arguments():
@@ -953,9 +1101,11 @@ if __name__ == "__main__":
     test_glm52_tool_result_turn_returns_final_text()
     test_glm52_native_upstream_tool_call_deltas_are_preserved()
     test_glm52_openai_stream_reasoning_content_passes_through_without_tools()
+    test_tool_stream_forwards_reasoning_before_tool_output_is_consumed()
     test_claude_output_config_effort_maps_to_glm52_openai_reasoning_and_tool_use()
     test_claude_streaming_tool_use_survives_glm52_reasoning_effort()
     test_claude_streaming_bare_required_tool_name_is_forwarded_as_tool_use()
+    test_claude_thinking_block_is_preserved_across_tool_result_turn()
     test_claude_non_stream_bash_tool_preserves_shell_string_arguments()
     test_claude_streaming_bash_tool_preserves_heredoc_input_json_delta()
     test_claude_messages_accepts_system_role_message_from_harness()

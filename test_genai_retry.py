@@ -297,6 +297,51 @@ class GenAIRetryTests(unittest.TestCase):
         self.assertIn("complete", rendered)
         self.assertNotIn("discarded partial", rendered)
 
+    def test_tool_stream_does_not_retry_after_reasoning_reaches_client(self):
+        service = make_service()
+
+        class InterruptedResponse(FakeResponse):
+            def iter_lines(self):
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "choices": [
+                                {"delta": {"reasoning_content": "visible reasoning"}}
+                            ]
+                        }
+                    )
+                ).encode()
+                raise requests.ConnectionError("stream closed")
+
+        request = {
+            **make_request(),
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        }
+
+        with patch(
+            "genai_proxy.services.genai.requests.post",
+            return_value=InterruptedResponse(),
+        ) as post:
+            chunks = list(service.stream_openai_completion(request))
+
+        rendered = "".join(chunks)
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(rendered.count("visible reasoning"), 1)
+        self.assertIn("Failed to connect to upstream GenAI", rendered)
+
     def test_non_chat_upstream_operation_uses_same_retry_budget(self):
         service = make_service(max_retries=2)
         calls = []

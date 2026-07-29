@@ -371,6 +371,7 @@ def test_responses_local_shell_call_preserves_command_argv():
 def test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item():
     service, captured, fake_post = make_service(
         [
+            genai_sse({"reasoning_content": "I should call weather."}),
             genai_sse(
                 {
                     "content": (
@@ -404,11 +405,23 @@ def test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item()
     function_items = [
         item for item in output_items(events) if item["type"] == "function_call"
     ]
+    reasoning_events = [
+        event for event in events if event["event"] == "response.reasoning_text.delta"
+    ]
+    assert reasoning_events
+    assert reasoning_events[0]["data"]["delta"] == "I should call weather."
     assert function_items
     assert function_items[0]["name"] == "get_weather"
     assert json.loads(function_items[0]["arguments"]) == {"location": "Shanghai"}
     assert function_items[0]["call_id"].startswith("call_")
     assert completed_event(events)["end_turn"] is False
+    function_done_index = next(
+        index
+        for index, event in enumerate(events)
+        if event["event"] == "response.output_item.done"
+        and event["data"]["item"].get("type") == "function_call"
+    )
+    assert events.index(reasoning_events[0]) < function_done_index
     prompt = captured[0]["messages"][0]["content"]
     assert prompt.startswith("Reasoning Effort: High\n\n# Tools\n\n")
     assert '"name": "get_weather"' in prompt
