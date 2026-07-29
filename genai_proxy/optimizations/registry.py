@@ -1,6 +1,5 @@
 import re
 
-
 DEEPSEEK_LEGACY_ADAPTER = "deepseek_legacy"
 DEEPSEEK_V4_FLASH_ADAPTER = "deepseek_v4_flash"
 DEEPSEEK_V4_PRO_ADAPTER = "deepseek_v4_pro"
@@ -12,6 +11,7 @@ GLM_5_1_ADAPTER = "glm_5_1"
 GLM_5_2_ADAPTER = "glm_5_2"
 GLM_ADAPTER = GLM_5_1_ADAPTER
 GLM_ADAPTERS = (GLM_5_1_ADAPTER, GLM_5_2_ADAPTER)
+KIMI_K3_ADAPTER = "kimi_k3"
 MINIMAX_ADAPTER = "minimax"
 
 
@@ -22,6 +22,8 @@ def select_tool_adapter(model: str | None, record: dict | None = None) -> str:
     if _has_non_xinference_root(record):
         return GENERIC_ADAPTER
 
+    if _has_kimi_k3_version(text):
+        return KIMI_K3_ADAPTER
     if "minimax" in text or "mini max" in text or "m2.7" in text or "m27" in text:
         return MINIMAX_ADAPTER
     if "chatglm" in text or "glm" in text:
@@ -45,6 +47,8 @@ def select_tool_adapter(model: str | None, record: dict | None = None) -> str:
 
 
 def tool_start_tags(adapter: str) -> tuple[str, ...]:
+    if adapter == KIMI_K3_ADAPTER:
+        return ("<|open|>tools<|sep|>", "<k3_action>")
     if adapter in DEEPSEEK_V4_ADAPTERS:
         return ("<｜DSML｜tool_calls>", "<tool_call>", "<arg_key>")
     if adapter == DEEPSEEK_LEGACY_ADAPTER:
@@ -103,3 +107,7 @@ def _has_glm_version(text: str, version: str) -> bool:
             text,
         )
     )
+
+
+def _has_kimi_k3_version(text: str) -> bool:
+    return bool(re.search(r"(?<![\w])kimi[\s_.-]*k?3(?![\s_.-]*\d)", text))

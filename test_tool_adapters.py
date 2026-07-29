@@ -1,14 +1,16 @@
 import json
 
 from genai_proxy.compat.openai import extract_tool_calls, tag_prefix_len
+from genai_proxy.errors import ProxyError
 from genai_proxy.optimizations import (
     DEEPSEEK_LEGACY_ADAPTER,
     DEEPSEEK_V4_FLASH_ADAPTER,
     DEEPSEEK_V4_PRO_ADAPTER,
     GENERIC_ADAPTER,
-    GLM_ADAPTER,
     GLM_5_1_ADAPTER,
     GLM_5_2_ADAPTER,
+    GLM_ADAPTER,
+    KIMI_K3_ADAPTER,
     MINIMAX_ADAPTER,
     select_tool_adapter,
 )
@@ -18,9 +20,10 @@ from genai_proxy.optimizations.deepseek import (
     inject_deepseek_tool_prompt,
 )
 from genai_proxy.optimizations.glm import inject_glm_tool_prompt
+from genai_proxy.optimizations.kimi import inject_kimi_tool_prompt
 from genai_proxy.optimizations.minimax import inject_minimax_tool_prompt
+from genai_proxy.reasoning import normalize_reasoning_for_adapter
 from genai_proxy.services.genai import _tool_start_tags_for_request
-
 
 WEATHER_TOOL = {
     "type": "function",
@@ -264,7 +267,366 @@ def test_genai_model_record_mapping():
         )
         == GENERIC_ADAPTER
     )
+    assert (
+        select_tool_adapter(
+            "kimi-k3",
+            {"aiName": "Kimi-K3", "rootModelName": "Xinference"},
+        )
+        == KIMI_K3_ADAPTER
+    )
+    assert (
+        select_tool_adapter(
+            "kimi-k3",
+            {"aiName": "Kimi-K3", "rootModelName": "Azure"},
+        )
+        == GENERIC_ADAPTER
+    )
+    assert select_tool_adapter("kimi-k3.1") == GENERIC_ADAPTER
     assert GLM_ADAPTER == GLM_5_1_ADAPTER
+
+
+def test_kimi_official_xtml_tool_call_is_recovered():
+    content = (
+        "Searching now."
+        "<|open|>tools<|sep|>"
+        '<|open|>call tool="SEARCH" index="1"<|sep|>'
+        '<|open|>argument key="query" type="string"<|sep|>'
+        "Kimi K3"
+        "<|close|>argument<|sep|>"
+        '<|open|>argument key="num_results" type="integer"<|sep|>'
+        "3"
+        "<|close|>argument<|sep|>"
+        "<|close|>call<|sep|>"
+        "<|close|>tools<|sep|>"
+    )
+
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[SEARCH_TOOL],
+        model="kimi-k3",
+        adapter=KIMI_K3_ADAPTER,
+    )
+
+    assert remaining == "Searching now."
+    assert tool_calls[0]["function"]["name"] == "search"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "query": "Kimi K3",
+        "num_results": 3,
+    }
+
+
+def test_kimi_official_xtml_rejects_partial_or_mistyped_calls():
+    valid_call = (
+        '<|open|>call tool="search" index="1"<|sep|>'
+        '<|open|>argument key="query" type="string"<|sep|>'
+        "Kimi K3"
+        "<|close|>argument<|sep|>"
+        "<|close|>call<|sep|>"
+    )
+    invalid_calls = [
+        (
+            '<|open|>call tool="search" index="2"<|sep|>'
+            '<|open|>json type="object"<|sep|>{"query":'
+            "<|close|>json<|sep|>"
+            "<|close|>call<|sep|>"
+        ),
+        (
+            '<|open|>call tool="search" index="2"<|sep|>'
+            '<|open|>argument key="num_results" type="number"<|sep|>'
+            "three"
+            "<|close|>argument<|sep|>"
+            "<|close|>call<|sep|>"
+        ),
+    ]
+
+    for invalid_call in invalid_calls:
+        content = (
+            "<|open|>tools<|sep|>"
+            f"{valid_call}{invalid_call}"
+            "<|close|>tools<|sep|>"
+        )
+        tool_calls, remaining = extract_tool_calls(
+            content,
+            tools=[SEARCH_TOOL],
+            model="kimi-k3",
+            adapter=KIMI_K3_ADAPTER,
+        )
+        assert tool_calls is None
+        assert remaining == content
+
+    content = (
+        "<|open|>tools<|sep|>"
+        f"{valid_call}"
+        "<|close|>tools<|sep|>"
+        "<|open|>tools<|sep|>"
+    )
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[SEARCH_TOOL],
+        model="kimi-k3",
+        adapter=KIMI_K3_ADAPTER,
+    )
+    assert tool_calls is None
+    assert remaining == content
+
+
+def test_kimi_nonofficial_function_expression_is_not_recovered():
+    content = 'search(query="Kimi K3")'
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[SEARCH_TOOL],
+        model="kimi-k3",
+        adapter=KIMI_K3_ADAPTER,
+    )
+
+    assert tool_calls is None
+    assert remaining == content
+
+
+def test_kimi_active_tools_use_external_operation_bridge():
+    messages = [
+        {"role": "user", "content": "Search for Kimi K3."}
+    ]
+
+    bridged = inject_kimi_tool_prompt(
+        messages, [SEARCH_TOOL], tool_choice="required"
+    )
+
+    assert bridged[-1] == messages[-1]
+    prompt = bridged[0]["content"]
+    assert bridged[0]["role"] == "system"
+    assert prompt.startswith("# External operation request")
+    assert "<k3_operations>" in prompt
+    assert "<k3_action>" in prompt
+    assert '"name":"search"' in prompt
+    assert "at least one operation request is mandatory" in prompt
+    assert "Call-expression schemas" not in prompt
+    assert "User request:" not in prompt
+    assert "<|open|>" not in prompt
+
+
+def test_kimi_non_function_tools_are_rejected_before_transport():
+    cases = [
+        [{"type": "custom", "name": "runner"}],
+        [SEARCH_TOOL, {"type": "custom", "name": "runner"}],
+    ]
+    for tools in cases:
+        try:
+            inject_kimi_tool_prompt(
+                [{"role": "user", "content": "Run the tool."}],
+                tools,
+            )
+        except ProxyError as exc:
+            assert exc.code == "unsupported_tool_type"
+        else:
+            raise AssertionError("Kimi K3 non-function tool was not rejected")
+
+
+def test_kimi_tool_choice_none_does_not_inject_or_reject():
+    messages = [{"role": "user", "content": "Answer directly."}]
+
+    assert (
+        inject_kimi_tool_prompt(messages, [SEARCH_TOOL], tool_choice="none")
+        == messages
+    )
+
+
+def test_kimi_named_tool_choice_must_match_supplied_tool():
+    try:
+        inject_kimi_tool_prompt(
+            [{"role": "user", "content": "Search."}],
+            [SEARCH_TOOL],
+            tool_choice={
+                "type": "function",
+                "function": {"name": "missing"},
+            },
+        )
+    except ProxyError as exc:
+        assert exc.code == "invalid_tool_choice"
+    else:
+        raise AssertionError("Kimi K3 accepted an unknown named tool choice")
+
+
+def test_kimi_external_operation_bridge_output_is_recovered():
+    cases = [
+        (
+            (
+                "Checking.\n"
+                '<k3_action>{"name":"search","arguments":'
+                '{"query":"Kimi K3","num_results":3}}</k3_action>'
+            ),
+            "Checking.",
+        ),
+        (
+            (
+                '{"name":"search","arguments":'
+                '{"query":"Kimi K3","num_results":3}}'
+            ),
+            None,
+        ),
+        (
+            (
+                "```json\n"
+                '{"name":"search","arguments":'
+                '{"query":"Kimi K3","num_results":3}}\n'
+                "```"
+            ),
+            None,
+        ),
+    ]
+
+    for content, expected_remaining in cases:
+        tool_calls, remaining = extract_tool_calls(
+            content,
+            tools=[SEARCH_TOOL],
+            model="kimi-k3",
+            adapter=KIMI_K3_ADAPTER,
+        )
+
+        assert remaining == expected_remaining
+        assert tool_calls[0]["function"]["name"] == "search"
+        assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+            "query": "Kimi K3",
+            "num_results": 3,
+        }
+
+
+def test_kimi_external_operation_bridge_rejects_unknown_or_invalid_calls():
+    cases = [
+        '<k3_action>{"name":"unknown","arguments":{}}</k3_action>',
+        '<k3_action>{"name":"search","arguments":[]}</k3_action>',
+        '<k3_action>{"name":"search","arguments":bad}</k3_action>',
+        (
+            '<k3_action>{"name":"search","arguments":{},'
+            '"extra":true}</k3_action>'
+        ),
+        (
+            '<k3_action>{"name":"search","arguments":{"query":"ok"}}</k3_action>'
+            '<k3_action>{"name":"search","arguments":[]}</k3_action>'
+        ),
+        (
+            '<k3_action>{"name":"search","arguments":{"query":"ok"}}</k3_action>'
+            '<k3_action>{"name":"search","arguments":'
+        ),
+    ]
+
+    for content in cases:
+        tool_calls, remaining = extract_tool_calls(
+            content,
+            tools=[SEARCH_TOOL],
+            model="kimi-k3",
+            adapter=KIMI_K3_ADAPTER,
+        )
+        assert tool_calls is None
+        assert remaining == content
+
+
+def test_kimi_external_operation_bridge_handles_close_tag_inside_argument():
+    content = (
+        '<k3_action>{"name":"search","arguments":'
+        '{"query":"literal </k3_action> text"}}</k3_action>'
+    )
+
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[SEARCH_TOOL],
+        model="kimi-k3",
+        adapter=KIMI_K3_ADAPTER,
+    )
+
+    assert remaining is None
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "query": "literal </k3_action> text"
+    }
+
+
+def test_kimi_tool_history_is_serialized_outside_native_tool_fields():
+    messages = [
+        {"role": "user", "content": "Search for Kimi K3."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "arguments": '{"query":"Kimi K3","num_results":3}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_search",
+            "content": '{"results":["Kimi-K3"]}',
+        },
+    ]
+
+    bridged = inject_kimi_tool_prompt(messages, [SEARCH_TOOL])
+
+    assert all(message.get("role") != "tool" for message in bridged)
+    assert all(not message.get("tool_calls") for message in bridged)
+    assistant = next(
+        message for message in bridged if message.get("role") == "assistant"
+    )
+    result = bridged[-1]
+    assert "<k3_action>" in assistant["content"]
+    assert '"name":"search"' in assistant["content"]
+    assert result["role"] == "system"
+    assert result["content"].startswith("<k3_result>")
+    assert '"id":"call_search"' in result["content"]
+    assert '"name":"search"' in result["content"]
+
+
+def test_kimi_tool_choice_none_history_omits_operation_schemas():
+    messages = [
+        {"role": "user", "content": "Search."},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "arguments": '{"query":"Kimi K3"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_search",
+            "content": "Done.",
+        },
+    ]
+
+    bridged = inject_kimi_tool_prompt(
+        messages,
+        [SEARCH_TOOL],
+        tool_choice="none",
+    )
+    prompt = next(
+        message["content"]
+        for message in bridged
+        if str(message.get("content", "")).startswith(
+            "# External operation results"
+        )
+    )
+
+    assert "<k3_operations>" not in prompt
+    assert '"name":"search"' not in prompt
+    assert "Do not output <k3_action>" in prompt
+
+
+def test_kimi_reasoning_effort_uses_upstream_default_max():
+    for effort in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
+        assert normalize_reasoning_for_adapter(
+            KIMI_K3_ADAPTER,
+            {"effort": effort},
+        ) == {"effort": "max"}
 
 
 def test_glm_malformed_tool_call_close_tag():
@@ -1418,6 +1780,19 @@ def test_required_tool_choice_still_allows_additional_tool_calls():
 
 if __name__ == "__main__":
     test_genai_model_record_mapping()
+    test_kimi_official_xtml_tool_call_is_recovered()
+    test_kimi_official_xtml_rejects_partial_or_mistyped_calls()
+    test_kimi_nonofficial_function_expression_is_not_recovered()
+    test_kimi_active_tools_use_external_operation_bridge()
+    test_kimi_non_function_tools_are_rejected_before_transport()
+    test_kimi_tool_choice_none_does_not_inject_or_reject()
+    test_kimi_named_tool_choice_must_match_supplied_tool()
+    test_kimi_external_operation_bridge_output_is_recovered()
+    test_kimi_external_operation_bridge_rejects_unknown_or_invalid_calls()
+    test_kimi_external_operation_bridge_handles_close_tag_inside_argument()
+    test_kimi_tool_history_is_serialized_outside_native_tool_fields()
+    test_kimi_tool_choice_none_history_omits_operation_schemas()
+    test_kimi_reasoning_effort_uses_upstream_default_max()
     test_glm_malformed_tool_call_close_tag()
     test_minimax_think_block_is_not_returned_as_content()
     test_claude_code_arg_key_tool_call_body_is_recovered()

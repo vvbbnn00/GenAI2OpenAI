@@ -1,6 +1,9 @@
 from genai_proxy.errors import ProxyError
-from genai_proxy.optimizations.registry import DEEPSEEK_V4_ADAPTERS, GLM_5_2_ADAPTER
-
+from genai_proxy.optimizations.registry import (
+    DEEPSEEK_V4_ADAPTERS,
+    GLM_5_2_ADAPTER,
+    KIMI_K3_ADAPTER,
+)
 
 OPENAI_REASONING_EFFORTS = (
     "none",
@@ -56,6 +59,8 @@ def normalize_reasoning_for_adapter(
 
     if adapter in TWO_LEVEL_REASONING_ADAPTERS:
         return {"effort": "high" if effort == "high" else "max"}
+    if adapter == KIMI_K3_ADAPTER:
+        return {"effort": "max"}
 
     return reasoning_config
 

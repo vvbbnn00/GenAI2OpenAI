@@ -16,7 +16,6 @@ from genai_proxy.retry import (
 )
 from genai_proxy.services.token_manager import is_genai_auth_failure
 
-
 GENAI_MODEL_LIST_URL = (
     "https://genai.shanghaitech.edu.cn/htk/ai/aiModel/list"
     "?_t={timestamp}&pageNo=1&pageSize=999&showStatusList=2,3"
@@ -44,7 +43,13 @@ class ModelManager:
         self._models_cache_lock = threading.Lock()
 
     def resolve_model(self, model: str) -> str:
-        return model or DEFAULT_MODEL
+        requested = model or DEFAULT_MODEL
+        requested_key = requested.casefold()
+        for record in self.list_genai_models():
+            ai_type = record.get("aiType")
+            if isinstance(ai_type, str) and ai_type.casefold() == requested_key:
+                return ai_type
+        return requested
 
     def root_ai_type_for(self, model: str) -> str:
         record = self.get_model_record(model)
@@ -57,8 +62,10 @@ class ModelManager:
         return "xinference"
 
     def get_model_record(self, model: str):
+        model_key = (model or "").casefold()
         for record in self.list_genai_models():
-            if record.get("aiType") == model:
+            ai_type = record.get("aiType")
+            if isinstance(ai_type, str) and ai_type.casefold() == model_key:
                 return record
         return None
 

@@ -41,8 +41,11 @@ RUN python -m pip install \
     itsdangerous==2.2.0 \
     jinja2==3.1.6 \
     markupsafe==3.0.3 \
+    pillow==12.3.0 \
     pycparser==3.0 \
+    regex==2026.7.19 \
     requests==2.32.5 \
+    tiktoken==0.12.0 \
     tokenizers==0.22.2 \
     urllib3==2.5.0 \
     werkzeug==3.1.3 \
