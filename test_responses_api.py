@@ -490,6 +490,61 @@ def test_responses_function_call_output_turn_returns_final_message():
     assert "Return the final answer only" not in captured[0]["messages"][-1]["content"]
 
 
+def test_responses_kimi_function_output_keeps_tools_available_by_default():
+    request = {
+        "model": "kimi-k3",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Inspect the project."}],
+            },
+            {
+                "type": "function_call",
+                "name": "get_weather",
+                "arguments": '{"location":"Shanghai"}',
+                "call_id": "call_weather",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_weather",
+                "output": "Continue with another check.",
+            },
+        ],
+        "tools": [RESPONSES_WEATHER_TOOL],
+    }
+
+    context = convert_responses_to_openai_request(request)
+
+    assert context.openai_request["tool_choice"] == "auto"
+    service, _captured, _fake_post = make_service([])
+    prepared = service._prepare_chat_request(
+        context.openai_request,
+        count_usage=False,
+    )
+    assert prepared.has_tools
+    assert prepared.tool_choice == "auto"
+    assert prepared.messages[-2]["content"].startswith(
+        "# Client response protocol\n"
+    )
+    assert prepared.messages[-1]["role"] == "user"
+    assert prepared.messages[-1]["content"].startswith(
+        "Completed client action result: "
+    )
+    assert "Continue the current user task" not in prepared.messages[-1]["content"]
+    assert not any(
+        message.get("role") == "system"
+        and str(message.get("content", "")).startswith(
+            "Completed client action result: "
+        )
+        for message in prepared.messages
+    )
+
+    request["tool_choice"] = "none"
+    explicit_none = convert_responses_to_openai_request(request)
+    assert explicit_none.openai_request["tool_choice"] == "none"
+
+
 def test_responses_custom_apply_patch_tool_becomes_custom_tool_call_with_input_delta():
     service, _captured, fake_post = make_service(
         [
@@ -694,6 +749,7 @@ if __name__ == "__main__":
     test_responses_local_shell_call_preserves_command_argv()
     test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item()
     test_responses_function_call_output_turn_returns_final_message()
+    test_responses_kimi_function_output_keeps_tools_available_by_default()
     test_responses_custom_apply_patch_tool_becomes_custom_tool_call_with_input_delta()
     test_responses_namespace_tool_flattens_for_model_and_restores_namespace()
     test_responses_route_streams_sse()

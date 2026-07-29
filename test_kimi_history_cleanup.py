@@ -74,12 +74,15 @@ class FakeJsonResponse:
         return self.payload
 
 
-def history_response(records):
+def history_response(records, *, pages=None):
+    result = {"records": records}
+    if pages is not None:
+        result["pages"] = pages
     return FakeJsonResponse(
         {
             "success": True,
             "code": 200,
-            "result": {"records": records},
+            "result": result,
         }
     )
 
@@ -287,6 +290,44 @@ def test_kimi_waits_for_delayed_history_visibility():
     assert calls[-1][1]["params"]["id"] == "new-group"
 
 
+def test_kimi_scans_all_history_pages_before_deleting_new_group():
+    old_first = {"chatGroupId": "old-first", "question": "same question"}
+    old_second = {"chatGroupId": "old-second", "question": "same question"}
+    new_record = {"chatGroupId": "new-group", "question": "same question"}
+    history_reads = iter(
+        [
+            history_response([old_first], pages=2),
+            history_response([old_second], pages=2),
+            history_response([new_record, old_first], pages=2),
+            history_response([old_second], pages=2),
+        ]
+    )
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        if url == GENAI_HISTORY_LIST_URL:
+            return next(history_reads)
+        assert url == GENAI_HISTORY_DELETE_URL
+        return delete_response()
+
+    with (
+        patch(
+            "genai_proxy.services.genai.requests.post",
+            return_value=FakeStreamResponse(completion_events()),
+        ),
+        patch("genai_proxy.services.genai.requests.get", side_effect=fake_get),
+    ):
+        chunks = list(service().stream_openai_completion(request()))
+
+    assert any('"finish_reason": "stop"' in chunk for chunk in chunks)
+    list_calls = [kwargs for url, kwargs in calls if url == GENAI_HISTORY_LIST_URL]
+    assert [call["params"]["pageNo"] for call in list_calls] == [1, 2, 1, 2]
+    assert all(call["params"]["pageSize"] == 200 for call in list_calls)
+    assert calls[-1][0] == GENAI_HISTORY_DELETE_URL
+    assert calls[-1][1]["params"]["id"] == "new-group"
+
+
 def test_kimi_skips_ambiguous_history_deletion():
     records = [
         {"chatGroupId": "new-1", "question": "same question"},
@@ -364,6 +405,38 @@ def test_kimi_snapshot_failure_does_not_attempt_unsafe_deletion():
     assert any('"finish_reason": "stop"' in chunk for chunk in chunks)
     assert get.call_count == 1
     assert get.call_args.args[0] == GENAI_HISTORY_LIST_URL
+
+
+def test_kimi_malformed_snapshot_records_never_delete_an_old_matching_group():
+    old_record = {
+        "chatGroupId": "old-group",
+        "question": "same question",
+    }
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        if url == GENAI_HISTORY_LIST_URL:
+            return FakeJsonResponse(
+                {
+                    "success": True,
+                    "code": 200,
+                    "result": {"records": {"old": old_record}},
+                }
+            )
+        raise AssertionError("history deletion must stay disabled")
+
+    with (
+        patch(
+            "genai_proxy.services.genai.requests.post",
+            return_value=FakeStreamResponse(completion_events()),
+        ),
+        patch("genai_proxy.services.genai.requests.get", side_effect=fake_get),
+    ):
+        chunks = list(service().stream_openai_completion(request()))
+
+    assert any('"finish_reason": "stop"' in chunk for chunk in chunks)
+    assert [url for url, _ in calls] == [GENAI_HISTORY_LIST_URL]
 
 
 def test_kimi_ignores_malformed_history_entries_and_response_codes():

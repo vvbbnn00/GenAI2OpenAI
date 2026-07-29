@@ -20,7 +20,11 @@ from genai_proxy.optimizations.deepseek import (
     inject_deepseek_tool_prompt,
 )
 from genai_proxy.optimizations.glm import inject_glm_tool_prompt
-from genai_proxy.optimizations.kimi import inject_kimi_tool_prompt
+from genai_proxy.optimizations.kimi import (
+    extract_kimi_final_response,
+    inject_kimi_tool_prompt,
+    kimi_tool_retry_messages,
+)
 from genai_proxy.optimizations.minimax import inject_minimax_tool_prompt
 from genai_proxy.reasoning import normalize_reasoning_for_adapter
 from genai_proxy.services.genai import _tool_start_tags_for_request
@@ -383,26 +387,331 @@ def test_kimi_nonofficial_function_expression_is_not_recovered():
     assert remaining == content
 
 
-def test_kimi_active_tools_use_external_operation_bridge():
-    messages = [
-        {"role": "user", "content": "Search for Kimi K3."}
-    ]
+def test_kimi_active_tools_use_plain_response_action_bridge():
+    messages = [{"role": "user", "content": "Search for Kimi K3."}]
 
     bridged = inject_kimi_tool_prompt(
         messages, [SEARCH_TOOL], tool_choice="required"
     )
 
     assert bridged[-1] == messages[-1]
-    prompt = bridged[0]["content"]
-    assert bridged[0]["role"] == "system"
-    assert prompt.startswith("# External operation request")
-    assert "<k3_operations>" in prompt
+    prompt = bridged[-2]["content"]
+    assert bridged[-2]["role"] == "system"
+    assert prompt.startswith("# Client response protocol")
+    assert "<k3_actions>" in prompt
     assert "<k3_action>" in prompt
+    assert "<k3_final>" in prompt
     assert '"name":"search"' in prompt
-    assert "at least one operation request is mandatory" in prompt
+    assert "client data channel" in prompt
+    assert "not native model tool use" in prompt
+    assert "must contain at least one complete action block" in prompt
+    assert "must not contain <k3_final>" in prompt
+    assert "deterministic JSON request compiler" not in prompt
+    assert "`tool_choice=none`" not in prompt
     assert "Call-expression schemas" not in prompt
     assert "User request:" not in prompt
     assert "<|open|>" not in prompt
+    assert '{"arguments":{...}}' not in prompt
+    assert len(bridged) == 2
+
+
+def test_kimi_tool_protocol_stays_near_current_turn_in_long_history():
+    messages = [
+        {
+            "role": "system",
+            "content": "Inspect evidence and keep using tools until done.",
+        },
+        {"role": "user", "content": "Inspect the project."},
+    ]
+    for index in range(12):
+        call_id = f"call_{index}"
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "reasoning_content": (
+                        f"STATE_{index}: keep following the existing project "
+                        "inspection plan."
+                    ),
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "search",
+                                "arguments": json.dumps(
+                                    {"query": f"project check {index}"}
+                                ),
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": f"result {index}",
+                },
+                {"role": "user", "content": "Continue."},
+            ]
+        )
+
+    bridged = inject_kimi_tool_prompt(messages, [SEARCH_TOOL])
+    system_messages = [
+        message for message in bridged if message.get("role") == "system"
+    ]
+
+    assert bridged[0] == messages[0]
+    assert bridged[-2]["content"].startswith("# Client response protocol\n")
+    assert bridged[-1] == messages[-1]
+    assert len(system_messages) == 3
+    assert sum(
+        str(message.get("content", "")).startswith(
+            "Completed client action result: "
+        )
+        for message in bridged
+    ) == 12
+    assistant_messages = [
+        message for message in bridged if message.get("role") == "assistant"
+    ]
+    assert assistant_messages == []
+    assistant_text = "\n".join(
+        str(message.get("content", ""))
+        for message in assistant_messages
+    )
+    assert "<k3_call>" not in assistant_text
+    assert not any("reasoning_content" in message for message in assistant_messages)
+    state_messages = [
+        message
+        for message in system_messages
+        if str(message.get("content", "")).startswith(
+            "# Prior continuation state\n"
+        )
+    ]
+    assert len(state_messages) == 1
+    assert "<k3_state>" in state_messages[0]["content"]
+    assert "STATE_11:" in state_messages[0]["content"]
+    assert "STATE_0:" not in state_messages[0]["content"]
+    assert '"id":"call_11"' in "\n".join(
+        str(message.get("content", ""))
+        for message in bridged
+        if message.get("role") == "user"
+    )
+    assert "single prior continuation state" in bridged[-2]["content"]
+
+
+def test_kimi_large_parallel_tool_history_keeps_one_continuation_state():
+    messages = [{"role": "user", "content": "Inspect a large project."}]
+    for round_index in range(64):
+        calls = []
+        for call_index in range(2):
+            call_id = f"call_{round_index}_{call_index}"
+            calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "arguments": json.dumps(
+                            {"query": f"round {round_index} item {call_index}"}
+                        ),
+                    },
+                }
+            )
+        messages.append(
+            {
+                "role": "assistant",
+                "reasoning_content": (
+                    f"STATE_{round_index}: continue the established plan. "
+                    + ("x" * 2000)
+                ),
+                "tool_calls": calls,
+            }
+        )
+        for call_index in range(2):
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{round_index}_{call_index}",
+                    "content": f"result {round_index} {call_index}",
+                }
+            )
+
+    bridged = inject_kimi_tool_prompt(messages, [SEARCH_TOOL])
+    assistant_messages = [
+        message for message in bridged if message.get("role") == "assistant"
+    ]
+    assert assistant_messages == []
+    assistant_text = "\n".join(
+        str(message.get("content", ""))
+        for message in assistant_messages
+    )
+    user_text = "\n".join(
+        str(message.get("content", ""))
+        for message in bridged
+        if message.get("role") == "user"
+    )
+
+    assert "<k3_call>" not in assistant_text
+    assert user_text.count("Completed client action result: ") == 128
+    assert not any("reasoning_content" in message for message in assistant_messages)
+    state_messages = [
+        message
+        for message in bridged
+        if str(message.get("content", "")).startswith(
+            "# Prior continuation state\n"
+        )
+    ]
+    assert len(state_messages) == 1
+    assert "STATE_63:" in state_messages[0]["content"]
+    assert "STATE_0:" not in state_messages[0]["content"]
+    assert "<k3_state>" in state_messages[0]["content"]
+    assert '"id":"call_63_0"' in user_text
+    assert '"id":"call_63_1"' in user_text
+    assert bridged[-2]["content"].startswith("# Client response protocol")
+    assert bridged[-1]["content"].startswith(
+        "Completed client action result: "
+    )
+
+
+def test_kimi_blank_turn_preserves_result_and_uses_generic_bridge():
+    messages = [
+        {"role": "user", "content": "Inspect in two stages."},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "arguments": '{"query":"stage one"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_search",
+            "content": "Stage one complete.",
+        },
+        {"role": "user", "content": "\u200b"},
+    ]
+
+    bridged = inject_kimi_tool_prompt(messages, [SEARCH_TOOL])
+
+    assert bridged[-1]["role"] == "user"
+    assert bridged[-1]["content"] == "\u200b"
+    assert bridged[-2]["role"] == "system"
+    assert bridged[-2]["content"].startswith("# Client response protocol")
+    assert bridged[-3]["content"] == (
+        'Completed client action result: {"id":"call_search","name":"search",'
+        '"arguments":{"query":"stage one"},"content":"Stage one complete."}'
+    )
+    assert sum(
+        str(message.get("content", "")).startswith(
+            "Completed client action result: "
+        )
+        for message in bridged
+        if message.get("role") == "user"
+    ) == 1
+
+
+def test_kimi_bridge_drops_all_historical_reasoning_and_empty_assistant_turns():
+    messages = [
+        {"role": "user", "content": "Inspect the project."},
+        {
+            "role": "assistant",
+            "reasoning_content": "OLD_PRIVATE_REASONING",
+            "content": "I will inspect it in stages.",
+        },
+        {"role": "user", "content": "Continue."},
+        {
+            "role": "assistant",
+            "reasoning_content": "CURRENT_PRIVATE_REASONING",
+            "tool_calls": [
+                {
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "arguments": '{"query":"project"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_search",
+            "content": "Search complete.",
+        },
+    ]
+
+    bridged = inject_kimi_tool_prompt(messages, [SEARCH_TOOL])
+
+    assistant_messages = [
+        message for message in bridged if message.get("role") == "assistant"
+    ]
+    assert assistant_messages == [
+        {"role": "assistant", "content": "I will inspect it in stages."}
+    ]
+    assert not any(
+        "reasoning_content" in message or "reasoning" in message
+        for message in bridged
+    )
+    encoded = json.dumps(bridged, ensure_ascii=False)
+    assert "OLD_PRIVATE_REASONING" not in encoded
+    assert encoded.count("CURRENT_PRIVATE_REASONING") == 1
+
+
+def test_kimi_retry_is_structural_and_task_agnostic():
+    messages = [
+        {"role": "system", "content": "# Client response protocol"},
+        {"role": "user", "content": "任意长会话中的当前请求"},
+    ]
+
+    retried = kimi_tool_retry_messages(
+        messages,
+        tool_choice={
+            "type": "function",
+            "function": {"name": "search"},
+        },
+    )
+
+    assert retried[0] == messages[0]
+    assert retried[-1] == messages[-1]
+    retry_prompt = retried[-2]["content"]
+    assert "complete valid client response envelope" in retry_prompt
+    assert 'named "search"' in retry_prompt
+    assert "plain response data for the client" in retry_prompt
+    assert "not native model tool calls" in retry_prompt
+    assert "任意长会话" not in retry_prompt
+    assert "still need" not in retry_prompt
+    assert "pending" not in retry_prompt
+
+
+def test_kimi_structure_detection_does_not_use_tool_name_text_heuristics():
+    tags = _tool_start_tags_for_request(KIMI_K3_ADAPTER, [SEARCH_TOOL])
+
+    assert tags == ("<|open|>tools<|sep|>", "<k3_action>")
+    assert not any("search" in tag for tag in tags)
+
+
+def test_kimi_final_response_requires_one_exact_envelope():
+    valid, content = extract_kimi_final_response(
+        " \n<k3_final>Completed normally.</k3_final>\n "
+    )
+    assert valid
+    assert content == "Completed normally."
+
+    for malformed in (
+        "Completed normally.",
+        "<k3_final>Missing close",
+        "prefix<k3_final>answer</k3_final>",
+        "<k3_final>one</k3_final><k3_final>two</k3_final>",
+    ):
+        valid, content = extract_kimi_final_response(malformed)
+        assert not valid
+        assert content == malformed
 
 
 def test_kimi_non_function_tools_are_rejected_before_transport():
@@ -448,15 +757,28 @@ def test_kimi_named_tool_choice_must_match_supplied_tool():
 
 
 def test_kimi_external_operation_bridge_output_is_recovered():
+    content = (
+        "Checking.\n"
+        '<k3_action>{"name":"search","arguments":'
+        '{"query":"Kimi K3","num_results":3}}</k3_action>'
+    )
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[SEARCH_TOOL],
+        model="kimi-k3",
+        adapter=KIMI_K3_ADAPTER,
+    )
+
+    assert remaining == "Checking."
+    assert tool_calls[0]["function"]["name"] == "search"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {
+        "query": "Kimi K3",
+        "num_results": 3,
+    }
+
+
+def test_kimi_required_action_recovers_exact_bare_json():
     cases = [
-        (
-            (
-                "Checking.\n"
-                '<k3_action>{"name":"search","arguments":'
-                '{"query":"Kimi K3","num_results":3}}</k3_action>'
-            ),
-            "Checking.",
-        ),
         (
             (
                 '{"name":"search","arguments":'
@@ -481,6 +803,7 @@ def test_kimi_external_operation_bridge_output_is_recovered():
             tools=[SEARCH_TOOL],
             model="kimi-k3",
             adapter=KIMI_K3_ADAPTER,
+            tool_choice="required",
         )
 
         assert remaining == expected_remaining
@@ -489,6 +812,24 @@ def test_kimi_external_operation_bridge_output_is_recovered():
             "query": "Kimi K3",
             "num_results": 3,
         }
+
+
+def test_kimi_auto_does_not_treat_plain_json_answer_as_an_action():
+    content = (
+        '{"name":"search","arguments":'
+        '{"query":"Kimi K3","num_results":3}}'
+    )
+
+    tool_calls, remaining = extract_tool_calls(
+        content,
+        tools=[SEARCH_TOOL],
+        model="kimi-k3",
+        adapter=KIMI_K3_ADAPTER,
+        tool_choice="auto",
+    )
+
+    assert tool_calls is None
+    assert remaining == content
 
 
 def test_kimi_external_operation_bridge_rejects_unknown_or_invalid_calls():
@@ -546,6 +887,7 @@ def test_kimi_tool_history_is_serialized_outside_native_tool_fields():
         {
             "role": "assistant",
             "content": None,
+            "reasoning_content": "Search first, then inspect the selected result.",
             "tool_calls": [
                 {
                     "id": "call_search",
@@ -568,16 +910,24 @@ def test_kimi_tool_history_is_serialized_outside_native_tool_fields():
 
     assert all(message.get("role") != "tool" for message in bridged)
     assert all(not message.get("tool_calls") for message in bridged)
-    assistant = next(
-        message for message in bridged if message.get("role") == "assistant"
+    assert not any(
+        message.get("role") == "assistant" for message in bridged
     )
     result = bridged[-1]
-    assert "<k3_action>" in assistant["content"]
-    assert '"name":"search"' in assistant["content"]
-    assert result["role"] == "system"
-    assert result["content"].startswith("<k3_result>")
+    state = next(
+        message
+        for message in bridged
+        if str(message.get("content", "")).startswith(
+            "# Prior continuation state\n"
+        )
+    )
+    assert "Search first, then inspect the selected result." in state["content"]
+    assert "<k3_state>" in state["content"]
+    assert result["role"] == "user"
+    assert result["content"].startswith("Completed client action result: ")
     assert '"id":"call_search"' in result["content"]
     assert '"name":"search"' in result["content"]
+    assert '"arguments":{"query":"Kimi K3","num_results":3}' in result["content"]
 
 
 def test_kimi_tool_choice_none_history_omits_operation_schemas():
@@ -585,6 +935,7 @@ def test_kimi_tool_choice_none_history_omits_operation_schemas():
         {"role": "user", "content": "Search."},
         {
             "role": "assistant",
+            "reasoning_content": "The search is complete; summarize its result.",
             "tool_calls": [
                 {
                     "id": "call_search",
@@ -608,17 +959,33 @@ def test_kimi_tool_choice_none_history_omits_operation_schemas():
         [SEARCH_TOOL],
         tool_choice="none",
     )
-    prompt = next(
-        message["content"]
+    assert not any(
+        str(message.get("content", "")).startswith("# Client response protocol")
+        for message in bridged
+    )
+    assert all(
+        "<k3_action>" not in str(message.get("content", ""))
+        for message in bridged
+    )
+    assert all(
+        "<k3_result>" not in str(message.get("content", ""))
+        for message in bridged
+    )
+    assert not any(
+        message.get("role") == "assistant" for message in bridged
+    )
+    state = next(
+        message
         for message in bridged
         if str(message.get("content", "")).startswith(
-            "# External operation results"
+            "# Prior continuation state\n"
         )
     )
-
-    assert "<k3_operations>" not in prompt
-    assert '"name":"search"' not in prompt
-    assert "Do not output <k3_action>" in prompt
+    assert "The search is complete; summarize its result." in state["content"]
+    assert bridged[-1]["role"] == "user"
+    assert bridged[-1]["content"].startswith(
+        "Completed client action result: "
+    )
 
 
 def test_kimi_reasoning_effort_uses_upstream_default_max():
@@ -1783,11 +2150,19 @@ if __name__ == "__main__":
     test_kimi_official_xtml_tool_call_is_recovered()
     test_kimi_official_xtml_rejects_partial_or_mistyped_calls()
     test_kimi_nonofficial_function_expression_is_not_recovered()
-    test_kimi_active_tools_use_external_operation_bridge()
+    test_kimi_active_tools_use_plain_response_action_bridge()
+    test_kimi_tool_protocol_stays_near_current_turn_in_long_history()
+    test_kimi_large_parallel_tool_history_keeps_one_continuation_state()
+    test_kimi_blank_turn_preserves_result_and_uses_generic_bridge()
+    test_kimi_retry_is_structural_and_task_agnostic()
+    test_kimi_structure_detection_does_not_use_tool_name_text_heuristics()
+    test_kimi_final_response_requires_one_exact_envelope()
     test_kimi_non_function_tools_are_rejected_before_transport()
     test_kimi_tool_choice_none_does_not_inject_or_reject()
     test_kimi_named_tool_choice_must_match_supplied_tool()
     test_kimi_external_operation_bridge_output_is_recovered()
+    test_kimi_required_action_recovers_exact_bare_json()
+    test_kimi_auto_does_not_treat_plain_json_answer_as_an_action()
     test_kimi_external_operation_bridge_rejects_unknown_or_invalid_calls()
     test_kimi_external_operation_bridge_handles_close_tag_inside_argument()
     test_kimi_tool_history_is_serialized_outside_native_tool_fields()

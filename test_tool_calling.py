@@ -12,16 +12,15 @@ Tool Calling 测试脚本
 
 import argparse
 import json
-import requests
 import sys
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--base-url', default='http://localhost:5000')
-parser.add_argument('--model', default='GPT-4.1')
-args = parser.parse_args()
+import requests
 
-BASE_URL = args.base_url
-MODEL = args.model
+# This is an opt-in live smoke script, not an offline pytest module.
+__test__ = False
+
+BASE_URL = "http://localhost:5000"
+MODEL = "GPT-4.1"
 
 # 定义测试用的 tools
 WEATHER_TOOL = {
@@ -320,10 +319,10 @@ def test_stream_tool_call():
         print(f"\n[PASS] Stream tool calls detected: {len(tool_calls_found)}")
         return True
     elif full_content and '<tool_call>' in full_content:
-        print(f"\n[WARN] Tool call in raw text but not parsed")
+        print("\n[WARN] Tool call in raw text but not parsed")
         return False
     else:
-        print(f"\n[FAIL] No tool calls in stream")
+        print("\n[FAIL] No tool calls in stream")
         print(f"  Content: {full_content[:200]}")
         return False
 
@@ -359,7 +358,6 @@ def test_stream_no_tool_needed():
         try:
             chunk = json.loads(data_str)
             delta = chunk.get("choices", [{}])[0].get("delta", {})
-            finish = chunk.get("choices", [{}])[0].get("finish_reason")
 
             if delta.get("content"):
                 if first_chunk_time is None:
@@ -382,10 +380,10 @@ def test_stream_no_tool_needed():
         print(f"\n[PASS] True streaming: {len(chunks)} chunks (not buffered into 1)")
         return True
     elif len(chunks) == 1 and full_content:
-        print(f"\n[WARN] Only 1 chunk — may be buffered")
+        print("\n[WARN] Only 1 chunk — may be buffered")
         return False
     else:
-        print(f"\n[FAIL] No content received")
+        print("\n[FAIL] No content received")
         return False
 
 
@@ -393,9 +391,6 @@ def test_tag_prefix_detection():
     """测试 7: _tag_prefix_len 单元测试（离线，不需要服务器）"""
     print_separator("Test 7: Tag Prefix Detection (Unit Test)")
 
-    # 导入被测函数
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("main", "main.py")
     # 跳过 argparse 的导入问题，直接测试函数逻辑
     # 内联实现同样的函数
     def _tag_prefix_len(text, tag):
@@ -438,11 +433,18 @@ def test_tag_prefix_detection():
     if all_pass:
         print(f"\n[PASS] All {len(cases)} cases passed")
     else:
-        print(f"\n[FAIL] Some cases failed")
+        print("\n[FAIL] Some cases failed")
     return all_pass
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--base-url', default=BASE_URL)
+    parser.add_argument('--model', default=MODEL)
+    args = parser.parse_args()
+    BASE_URL = args.base_url
+    MODEL = args.model
+
     print(f"Testing against: {BASE_URL}")
     print(f"Model: {MODEL}")
 

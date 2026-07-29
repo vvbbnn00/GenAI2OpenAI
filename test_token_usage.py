@@ -95,6 +95,26 @@ class FakeResponse:
         pass
 
 
+def fake_completion(content, *, reasoning=None):
+    delta = {"content": content}
+    if reasoning is not None:
+        delta["reasoning_content"] = reasoning
+    return FakeResponse(
+        [
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": delta,
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            ).encode()
+        ]
+    )
+
+
 def _app():
     logger = logging.getLogger("test_token_usage")
     model_manager = FakeModelManager()
@@ -121,6 +141,34 @@ def _png_data_url(width: int, height: int) -> str:
     Image.new("RGB", (width, height)).save(buffer, format="PNG")
     payload = base64.b64encode(buffer.getvalue()).decode()
     return f"data:image/png;base64,{payload}"
+
+
+def _official_kimi_completion(message: dict) -> str:
+    encoder = _load_python_encoder(KIMI_K3_SPEC)
+    common = {
+        "tools": None,
+        "thinking": True,
+        "image_prompts": None,
+        "thinking_effort": "max",
+    }
+    start = "".join(
+        segment.text
+        for segment in encoder["build_chat_segments"](
+            [],
+            add_generation_prompt=True,
+            **common,
+        )
+    )
+    completed = "".join(
+        segment.text
+        for segment in encoder["build_chat_segments"](
+            [message],
+            add_generation_prompt=False,
+            **common,
+        )
+    )
+    assert completed.startswith(start)
+    return completed[len(start) :]
 
 
 def test_qwen_uses_full_model_as_revision_authority():
@@ -168,6 +216,37 @@ def test_kimi_official_encoder_uses_structural_tool_declaration():
     assert '"name":"search"' in prompt
     assert "Call-expression schemas" not in prompt
     assert "User request:" not in prompt
+
+
+def test_kimi_genai_prompt_matches_official_no_tool_encoding():
+    messages = [{"role": "user", "content": "Hello"}]
+    encoder = _load_python_encoder(KIMI_K3_SPEC)
+    expected = "".join(
+        segment.text
+        for segment in encoder["build_chat_segments"](
+            messages,
+            tools=None,
+            add_generation_prompt=True,
+            thinking=True,
+            image_prompts=None,
+            thinking_effort="max",
+            tool_choice="none",
+        )
+    )
+
+    actual = render_chat_prompt(
+        messages,
+        "kimi_k3",
+        add_generation_prompt=True,
+    )
+
+    assert actual == expected
+    assert (
+        '<|open|>message role="system" type="tool-choice"<|sep|>'
+        "The system is invoked with `tool_choice=none`.\n"
+        "You MUST NOT call any tools in the next message."
+        "<|close|>message<|sep|><|end_of_msg|>"
+    ) in actual
 
 
 def test_supported_model_families_are_resolved_from_alias_and_record():
@@ -258,7 +337,7 @@ def test_official_prompt_templates_have_stable_reference_counts():
             "kimi-k3",
             "kimi_k3",
             "kimi_k3",
-            92,
+            130,
             '<|open|>message role="system" type="thinking-effort"<|sep|>',
         ),
     ]
@@ -321,8 +400,24 @@ def test_kimi_visual_prompt_and_patch_tokens_match_official_rules():
             "kimi-k3",
             image_sizes=((56, 28),),
         )
-        == 98
+        == 136
     )
+
+
+def test_kimi_visual_token_count_matches_official_resize_boundaries():
+    cases = {
+        (1, 1): 1,
+        (27, 28): 1,
+        (28, 28): 1,
+        (29, 28): 2,
+        (7168, 7168): 16384,
+        (100000, 10): 256,
+        (8000, 4000): 16562,
+        (4000, 8000): 16562,
+    }
+
+    for dimensions, expected in cases.items():
+        assert _kimi_image_token_count(*dimensions) == expected
 
 
 def test_kimi_service_preserves_visual_blocks_and_counts_data_url():
@@ -347,7 +442,7 @@ def test_kimi_service_preserves_visual_blocks_and_counts_data_url():
         messages[0]["content"][0],
     ]
     assert prepared.image_sizes == ((56, 28),)
-    assert prepared.prompt_tokens == 99
+    assert prepared.prompt_tokens == 137
 
 
 def test_kimi_service_reads_remote_image_dimensions_once():
@@ -400,7 +495,7 @@ def test_kimi_service_reads_remote_image_dimensions_once():
     assert remote.closed is True
     assert pool.closed is True
     assert prepared.image_sizes == ((56, 28),)
-    assert prepared.prompt_tokens == 99
+    assert prepared.prompt_tokens == 137
 
 
 def test_kimi_remote_image_rejects_private_network_targets():
@@ -547,6 +642,45 @@ def test_kimi_transport_splits_current_visual_input_for_genai():
     assert request["messages"][0]["content"][0]["type"] == "image_url"
 
 
+def test_kimi_transport_preserves_multiple_current_images_in_order():
+    first = _png_data_url(56, 28)
+    second = _png_data_url(29, 28)
+    request = {
+        "model": "kimi-k3",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Compare these images."},
+                    {"type": "image_url", "image_url": {"url": first}},
+                    {"type": "image_url", "image_url": {"url": second}},
+                ],
+            }
+        ],
+        "stream": True,
+    }
+    upstream = fake_completion("Compared.")
+    app = _app()
+    prepared = app.extensions["genai_service"]._prepare_chat_request(request)
+
+    assert prepared.image_sizes == ((56, 28), (29, 28))
+
+    with patch(
+        "genai_proxy.services.genai.requests.post",
+        return_value=upstream,
+    ) as post:
+        chunks = list(
+            app.extensions["genai_service"].stream_openai_completion(request)
+        )
+
+    payload = post.call_args.kwargs["json"]
+    assert payload["chatInfo"] == "Compare these images."
+    assert payload["imageUrl"] == first
+    assert payload["imageUrls"] == [first, second]
+    assert (payload["width"], payload["height"]) == (56, 28)
+    assert any('"content": "Compared."' in chunk for chunk in chunks)
+
+
 def test_kimi_empty_current_user_gets_nonempty_transport_trigger():
     prepared = _app().extensions["genai_service"]._prepare_chat_request(
         {
@@ -607,7 +741,7 @@ def test_kimi_responses_input_tokens_counts_visual_content():
     assert response.status_code == 200
     assert response.get_json() == {
         "object": "response.input_tokens",
-        "input_tokens": 99,
+        "input_tokens": 137,
     }
 
 
@@ -668,7 +802,7 @@ def test_kimi_anthropic_count_tokens_counts_base64_image():
     )
 
     assert response.status_code == 200
-    assert response.get_json() == {"input_tokens": 99}
+    assert response.get_json() == {"input_tokens": 137}
 
 
 def test_kimi_claude_url_image_is_preserved_for_vision_transport():
@@ -774,9 +908,13 @@ def test_kimi_active_tools_use_validated_bridge_without_chat_group_id():
         not message.get("tools") and not message.get("tool_calls")
         for message in upstream_payload["messages"]
     )
-    bridge_prompt = upstream_payload["messages"][0]["content"]
-    assert bridge_prompt.startswith("# External operation request")
+    bridge_prompt = upstream_payload["messages"][-1]["content"]
+    assert bridge_prompt.startswith("# Client response protocol\n")
+    assert "<k3_actions>" in bridge_prompt
+    assert "<k3_final>" in bridge_prompt
     assert '"name":"get_weather"' in bridge_prompt
+    assert "client data channel" in bridge_prompt
+    assert "not native model tool use" in bridge_prompt
     assert "Weather in Shanghai?" not in bridge_prompt
 
     prepared = app.extensions["genai_service"]._prepare_chat_request(request)
@@ -788,6 +926,103 @@ def test_kimi_active_tools_use_validated_bridge_without_chat_group_id():
         prompt_messages=prepared.messages,
     )
     assert payload["usage"]["completion_tokens"] == expected
+
+
+def test_kimi_auto_never_executes_a_plain_json_answer():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    upstream = FakeResponse(
+        [
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "content": (
+                                    '{"name":"get_weather","arguments":{}}'
+                                )
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            ).encode()
+        ]
+    )
+
+    with patch(
+        "genai_proxy.services.genai.requests.post", return_value=upstream
+    ) as post:
+        response = _app().test_client().post(
+            "/v1/chat/completions",
+            json={
+                "model": "kimi-k3",
+                "messages": [{"role": "user", "content": "Answer directly."}],
+                "tools": tools,
+            },
+        )
+
+    assert response.status_code == 502
+    assert "neither a valid client action nor a final response" in (
+        response.get_json()["error"]["message"]
+    )
+    assert post.call_count == 3
+
+
+def test_kimi_auto_retries_unwrapped_response_as_required_action():
+    first = fake_completion(
+        "I cannot invoke a native tool in this response.",
+        reasoning="The requested check still needs external evidence. ",
+    )
+    second = fake_completion(
+        '<k3_action>{"name":"get_weather",'
+        '"arguments":{"city":"Shanghai"}}</k3_action>',
+        reasoning="I will encode the client action as response data.",
+    )
+    request = {
+        "model": "kimi-k3",
+        "messages": [{"role": "user", "content": "Check Shanghai weather."}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ],
+    }
+
+    with patch(
+        "genai_proxy.services.genai.requests.post",
+        side_effect=[first, second],
+    ) as post:
+        response = _app().test_client().post(
+            "/v1/chat/completions",
+            json=request,
+        )
+
+    assert response.status_code == 200
+    choice = response.get_json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert post.call_count == 2
+    retry_prompt = post.call_args_list[1].kwargs["json"]["messages"][-1]["content"]
+    assert "Return at least one complete action block and no other text." in (
+        retry_prompt
+    )
+    assert "<k3_final>" not in retry_prompt
 
 
 def test_kimi_bridge_stream_waits_for_complete_action_then_emits_tool_chunks():
@@ -966,6 +1201,235 @@ def test_kimi_bridge_enforces_required_tool_choice():
     )
 
 
+def test_kimi_bridge_retries_required_tool_choice_twice():
+    first_failure = fake_completion(
+        "I cannot invoke a native tool in this response.",
+        reasoning="First attempt. ",
+    )
+    second_failure = fake_completion(
+        '{"name":"get_weather","arguments":',
+        reasoning="Second attempt. ",
+    )
+    success = fake_completion(
+        (
+            '<k3_action>{"name":"get_weather",'
+            '"arguments":{"city":"Shanghai"}}</k3_action>'
+        ),
+        reasoning="Third attempt.",
+    )
+    request = {
+        "model": "kimi-k3",
+        "messages": [{"role": "user", "content": "Check Shanghai."}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                        },
+                        "required": ["city"],
+                    },
+                },
+            }
+        ],
+        "tool_choice": "required",
+    }
+    app = _app()
+
+    with patch(
+        "genai_proxy.services.genai.requests.post",
+        side_effect=[first_failure, second_failure, success],
+    ) as post:
+        response = app.test_client().post(
+            "/v1/chat/completions",
+            json=request,
+        )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    message = payload["choices"][0]["message"]
+    tool_call = message["tool_calls"][0]
+    assert tool_call["function"]["name"] == "get_weather"
+    assert message["reasoning_content"] == (
+        "First attempt. Second attempt. Third attempt."
+    )
+    prepared = app.extensions["genai_service"]._prepare_chat_request(request)
+    expected_tokens = count_openai_completion_tokens(
+        {
+            "role": "assistant",
+            "reasoning_content": message["reasoning_content"],
+            "content": (
+                '<k3_action>{"name":"get_weather",'
+                '"arguments":{"city":"Shanghai"}}</k3_action>'
+            ),
+        },
+        "kimi-k3",
+        model_record=FakeModelManager.records["kimi-k3"],
+        tool_adapter="kimi_k3",
+        prompt_messages=prepared.messages,
+    )
+    assert payload["usage"]["completion_tokens"] == expected_tokens
+    assert post.call_count == 3
+
+
+def test_kimi_auto_accepts_explicit_final_after_tool_result():
+    upstream = fake_completion(
+        "<k3_final>Inspection returned beta; the task is complete.</k3_final>",
+        reasoning="The available evidence is sufficient for this response.",
+    )
+    request = {
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "user", "content": "Inspect the project."},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_inspect",
+                        "type": "function",
+                        "function": {
+                            "name": "inspect",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_inspect",
+                "content": "Inspection returned beta.",
+            },
+            {"role": "user", "content": "\u200b"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "inspect",
+                    "parameters": {"type": "object"},
+                },
+            },
+        ],
+    }
+
+    with patch(
+        "genai_proxy.services.genai.requests.post",
+        return_value=upstream,
+    ) as post:
+        response = _app().test_client().post(
+            "/v1/chat/completions",
+            json=request,
+        )
+
+    assert response.status_code == 200
+    message = response.get_json()["choices"][0]["message"]
+    assert message["content"] == "Inspection returned beta; the task is complete."
+    assert "tool_calls" not in message
+    assert post.call_count == 1
+    assert "chatGroupId" not in post.call_args.kwargs["json"]
+
+
+def test_kimi_auto_accepts_normal_text_that_mentions_tool_and_argument_names():
+    upstream = fake_completion(
+        (
+            "<k3_final>The inspect_source path: changed.py was already "
+            "checked.</k3_final>"
+        ),
+    )
+    request = {
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "user", "content": "Summarize the completed check."},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "inspect_source",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            },
+        ],
+    }
+
+    with patch(
+        "genai_proxy.services.genai.requests.post",
+        return_value=upstream,
+    ) as post:
+        response = _app().test_client().post(
+            "/v1/chat/completions",
+            json=request,
+        )
+
+    assert response.status_code == 200
+    message = response.get_json()["choices"][0]["message"]
+    assert message["content"] == (
+        "The inspect_source path: changed.py was already checked."
+    )
+    assert "tool_calls" not in message
+    assert post.call_count == 1
+
+
+def test_kimi_malformed_action_retries_with_structural_prompt():
+    first = fake_completion(
+        '<k3_action>{"name":"inspect_source","arguments":',
+    )
+    second = fake_completion(
+        '<k3_action>{"name":"inspect_source",'
+        '"arguments":{"path":"changed.py"}}</k3_action>'
+    )
+    request = {
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "user", "content": "Inspect changed.py."},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "inspect_source",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            },
+        ],
+    }
+
+    with patch(
+        "genai_proxy.services.genai.requests.post",
+        side_effect=[first, second],
+    ) as post:
+        response = _app().test_client().post(
+            "/v1/chat/completions",
+            json=request,
+        )
+
+    assert response.status_code == 200
+    message = response.get_json()["choices"][0]["message"]
+    assert message["tool_calls"][0]["function"]["name"] == "inspect_source"
+    assert post.call_count == 2
+    retry_payload = post.call_args_list[1].kwargs["json"]
+    assert retry_payload["chatInfo"] == "Inspect changed.py."
+    assert retry_payload["messages"][-1]["content"].startswith(
+        "The previous response did not use a complete valid client response "
+        "envelope"
+    )
+    assert "plain response data for the client" in (
+        retry_payload["messages"][-1]["content"]
+    )
+    assert "chatGroupId" not in retry_payload
+
+
 def test_kimi_tool_bridge_counting_is_consistent_across_compatibility_routes():
     client = _app().test_client()
     responses_tool = {
@@ -1103,12 +1567,14 @@ def test_kimi_tool_bridge_generation_is_consistent_across_compatibility_routes()
         assert "chatGroupId" not in upstream_payload
         assert upstream_payload["chatInfo"] == "Weather in Shanghai?"
         assert any(
-            "<k3_operations>" in str(message.get("content"))
+            str(message.get("content", "")).startswith(
+                "# Client response protocol\n"
+            )
             for message in upstream_payload["messages"]
         )
 
 
-def test_kimi_tool_history_is_bridged_and_result_stays_out_of_chat_info():
+def test_kimi_tool_history_result_becomes_nonempty_current_input():
     app = _app()
     upstream = FakeResponse(
         [
@@ -1162,17 +1628,160 @@ def test_kimi_tool_history_is_bridged_and_result_stays_out_of_chat_info():
         == "Shanghai is sunny."
     )
     upstream_payload = post.call_args.kwargs["json"]
-    assert upstream_payload["chatInfo"] == "\u200b"
+    assert upstream_payload["chatInfo"].startswith(
+        "Completed client action result: "
+    )
+    assert '"name":"get_weather"' in upstream_payload["chatInfo"]
+    assert '"arguments":{"city":"Shanghai"}' in upstream_payload["chatInfo"]
+    assert '"content":"Sunny."' in upstream_payload["chatInfo"]
     assert "chatGroupId" not in upstream_payload
     assert all(message.get("role") != "tool" for message in upstream_payload["messages"])
     assert all(
         not message.get("tool_calls") for message in upstream_payload["messages"]
     )
-    assert any(
-        "<k3_result>" in str(message.get("content"))
-        and "Sunny." in str(message.get("content"))
+    assert not any(
+        message.get("role") == "system"
+        and "tool result" in str(message.get("content", "")).lower()
         for message in upstream_payload["messages"]
     )
+
+
+def test_kimi_tool_history_sends_only_latest_reasoning_as_continuation_state():
+    request = {
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "user", "content": "Inspect the project in several steps."},
+            {
+                "role": "assistant",
+                "reasoning_content": "STALE_PLAN: inspect the project root.",
+                "tool_calls": [
+                    {
+                        "id": "call_root",
+                        "type": "function",
+                        "function": {
+                            "name": "inspect",
+                            "arguments": '{"path":"."}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_root",
+                "content": "Found src and tests.",
+            },
+            {
+                "role": "assistant",
+                "name": "project-agent",
+                "reasoning_content": (
+                    "CURRENT_PLAN: inspect src and tests in parallel, then compare "
+                    "their evidence and summarize without replanning."
+                ),
+                "tool_calls": [
+                    {
+                        "id": "call_src",
+                        "type": "function",
+                        "function": {
+                            "name": "inspect",
+                            "arguments": '{"path":"src"}',
+                        },
+                    },
+                    {
+                        "id": "call_tests",
+                        "type": "function",
+                        "function": {
+                            "name": "inspect",
+                            "arguments": '{"path":"tests"}',
+                        },
+                    },
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_src",
+                "content": "Source evidence.",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_tests",
+                "content": "Test evidence.",
+            },
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "inspect",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }
+        ],
+    }
+
+    with patch(
+        "genai_proxy.services.genai.requests.post",
+        return_value=fake_completion(
+            "<k3_final>Inspection complete.</k3_final>"
+        ),
+    ) as post:
+        response = _app().test_client().post(
+            "/v1/chat/completions",
+            json=request,
+        )
+
+    assert response.status_code == 200
+    upstream_payload = post.call_args.kwargs["json"]
+    reasoning_messages = [
+        message
+        for message in upstream_payload["messages"]
+        if message.get("reasoning_content")
+    ]
+    assert reasoning_messages == []
+    assert not any(
+        message.get("role") == "assistant"
+        for message in upstream_payload["messages"]
+    )
+    state_messages = [
+        message
+        for message in upstream_payload["messages"]
+        if str(message.get("content", "")).startswith(
+            "# Prior continuation state\n"
+        )
+    ]
+    assert len(state_messages) == 1
+    assert (
+        "CURRENT_PLAN: inspect src and tests in parallel, then compare "
+        "their evidence and summarize without replanning."
+        in state_messages[0]["content"]
+    )
+    assert "<k3_state>" in state_messages[0]["content"]
+    assert "STALE_PLAN" not in json.dumps(
+        upstream_payload["messages"],
+        ensure_ascii=False,
+    )
+    assert upstream_payload["chatInfo"].startswith(
+        "Completed client action result: "
+    )
+    assert '"id":"call_tests"' in upstream_payload["chatInfo"]
+    assert '"arguments":{"path":"tests"}' in upstream_payload["chatInfo"]
+    assert "chatGroupId" not in upstream_payload
+
+    encoded_prompt = render_chat_prompt(
+        [
+            *upstream_payload["messages"],
+            {"role": "user", "content": upstream_payload["chatInfo"]},
+        ],
+        "kimi_k3",
+        add_generation_prompt=True,
+    )
+    assert "CURRENT_PLAN" in encoded_prompt
+    assert "STALE_PLAN" not in encoded_prompt
+    assert encoded_prompt.count("<k3_state>") == 1
+    assert "<|open|>think<|sep|>" in encoded_prompt
 
 
 def test_kimi_message_level_tools_are_rejected_before_counting_or_transport():
@@ -1391,7 +2000,7 @@ def test_kimi_reasoning_effort_count_matches_upstream_default_max():
     )
 
     assert prepared.token_reasoning_config == {"effort": "max"}
-    assert prepared.prompt_tokens == 89
+    assert prepared.prompt_tokens == 127
 
 
 def test_openai_input_token_route_covers_all_supported_model_families():
@@ -1401,7 +2010,7 @@ def test_openai_input_token_route_covers_all_supported_model_families():
         "deepseek-pro": 5,
         "deepseek-chat": 5,
         "qwen3.5": 11,
-        "kimi-k3": 89,
+        "kimi-k3": 127,
     }
     for model, input_tokens in expected.items():
         response = client.post(
@@ -1438,6 +2047,11 @@ def test_completion_serialization_matches_official_templates():
         completed_prompt = render_chat_prompt(
             [user, assistant], family, add_generation_prompt=False
         )
+        if family == "kimi_k3":
+            assert _serialized_completion(
+                assistant, family
+            ) == _official_kimi_completion(assistant)
+            continue
         assert completed_prompt == generation_prompt + _serialized_completion(
             assistant, family
         )
@@ -1467,6 +2081,11 @@ def test_completion_serialization_matches_official_templates_for_sparse_outputs(
             completed_prompt = render_chat_prompt(
                 [user, assistant], family, add_generation_prompt=False
             )
+            if family == "kimi_k3":
+                assert _serialized_completion(
+                    assistant, family
+                ) == _official_kimi_completion(assistant)
+                continue
             assert completed_prompt == generation_prompt + _serialized_completion(
                 assistant, family
             )
@@ -1591,7 +2210,7 @@ def test_anthropic_count_token_route_covers_all_supported_model_families():
         "deepseek-pro": 5,
         "deepseek-chat": 5,
         "qwen3.5": 11,
-        "kimi-k3": 89,
+        "kimi-k3": 127,
     }
     for model, input_tokens in expected.items():
         response = client.post(
@@ -1611,7 +2230,7 @@ def test_nonstream_usage_covers_all_supported_model_families():
         "deepseek-pro": (5, 3),
         "deepseek-chat": (5, 3),
         "qwen3.5": (11, 5),
-        "kimi-k3": (89, 14),
+        "kimi-k3": (127, 14),
     }
     for model, (prompt_tokens, completion_tokens) in expected.items():
         service = _app().extensions["genai_service"]

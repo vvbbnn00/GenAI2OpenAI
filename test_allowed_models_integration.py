@@ -10,6 +10,9 @@ from genai_proxy.app import create_app
 from genai_proxy.config import AppConfig
 from genai_proxy.logging_utils import setup_logging
 
+# This is an opt-in keystore-backed integration runner, not an offline pytest module.
+__test__ = False
+
 ALLOWED_MODELS = (
     "deepseek-chat",
     "deepseek-pro",
@@ -103,6 +106,39 @@ CLAUDE_BASH_TOOL = {
     },
 }
 
+RESPONSES_STAGE_TOOLS = [
+    {
+        "type": "function",
+        "name": "get_stage_one",
+        "description": "Run the mandatory first stage of the current task.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "marker": {
+                    "type": "string",
+                    "description": "The exact run marker from the user request",
+                }
+            },
+            "required": ["marker"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_stage_two",
+        "description": "Run the second stage after stage one returns its value.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": "string",
+                    "description": "The value returned by stage one",
+                }
+            },
+            "required": ["value"],
+        },
+    },
+]
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -151,6 +187,10 @@ def main():
                         ("openai_stream_tool_call", test_openai_stream_tool_call),
                         ("openai_vision", test_openai_vision),
                         ("responses_vision", test_responses_vision),
+                        (
+                            "responses_multiturn_tool_call",
+                            test_responses_multiturn_tool_call,
+                        ),
                         ("claude_text", test_claude_text),
                         ("claude_stream_tool_use", test_claude_stream_tool_use),
                         ("claude_vision", test_claude_vision),
@@ -473,6 +513,141 @@ def test_responses_vision(client, model, iteration):
     assert (data.get("usage") or {}).get("output_tokens", 0) > 0
 
 
+def test_responses_multiturn_tool_call(client, model, iteration):
+    marker = f"K3_MULTITURN_DONE_{iteration}"
+    history = []
+    for index in range(8):
+        history.extend(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"Earlier project note {index}.",
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": f"Recorded note {index}.",
+                        }
+                    ],
+                },
+            ]
+        )
+    task = {
+        "type": "message",
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": (
+                    "Complete both mandatory stages of this sequential task "
+                    f"using the available operations. Start with marker {marker}; "
+                    "pass the first stage's returned value into the second stage. "
+                    f"After both results, reply with exactly {marker}."
+                ),
+            }
+        ],
+    }
+    initial_input = [*history, task]
+    common = {
+        "model": model,
+        "instructions": (
+            "You are a careful tool-using agent. Continue using available tools "
+            "after each result until the current task is complete."
+        ),
+        "tools": RESPONSES_STAGE_TOOLS,
+        "max_output_tokens": 512,
+    }
+
+    first_events = post_stream(
+        client,
+        "/v1/responses",
+        {
+            **common,
+            "input": initial_input,
+            "tool_choice": {"type": "function", "name": "get_stage_one"},
+            "stream": True,
+        },
+    )
+    first = completed_responses_stream(first_events)
+    assert any(
+        event.get("type") == "response.reasoning_text.delta"
+        for event in first_events
+    ), json.dumps(first_events, ensure_ascii=False)[:800]
+    first_call = first_responses_function_call(first)
+    assert first_call["name"] == "get_stage_one"
+
+    second_input = [
+        *initial_input,
+        first_call,
+        {
+            "type": "function_call_output",
+            "call_id": first_call["call_id"],
+            "output": "STAGE_ONE_OK. The returned value is beta.",
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "\u200b"}],
+        },
+    ]
+    second_events = post_stream(
+        client,
+        "/v1/responses",
+        {**common, "input": second_input, "stream": True},
+    )
+    second = completed_responses_stream(second_events)
+    assert any(
+        event.get("type") == "response.reasoning_text.delta"
+        for event in second_events
+    ), json.dumps(second_events, ensure_ascii=False)[:800]
+    second_call = first_responses_function_call(second)
+    assert second_call["name"] == "get_stage_two", json.dumps(
+        second, ensure_ascii=False
+    )[:800]
+    assert json.loads(second_call["arguments"]).get("value") == "beta", json.dumps(
+        second, ensure_ascii=False
+    )[:800]
+
+    third = post_json(
+        client,
+        "/v1/responses",
+        {
+            **common,
+            "input": [
+                *second_input,
+                second_call,
+                {
+                    "type": "function_call_output",
+                    "call_id": second_call["call_id"],
+                    "output": (
+                        "STAGE_TWO_OK. Both stages are complete. "
+                        f"Reply with exactly {marker}."
+                    ),
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "\u200b"}],
+                },
+            ],
+        },
+    )
+
+    assert not any(
+        item.get("type") == "function_call" for item in third.get("output", [])
+    ), json.dumps(third, ensure_ascii=False)[:800]
+    assert (third.get("output_text") or "").strip() == marker
+
+
 def test_claude_vision(client, model, iteration):
     image_url = red_image_url()
     data = post_json(
@@ -747,6 +922,30 @@ def first_openai_tool_call(data):
     tool_calls = message.get("tool_calls") or []
     assert tool_calls, f"no tool_calls in response: {json.dumps(data, ensure_ascii=False)[:500]}"
     return tool_calls[0]
+
+
+def first_responses_function_call(data):
+    for item in data.get("output", []):
+        if item.get("type") == "function_call":
+            return item
+    raise AssertionError(
+        "no function_call in response: "
+        + json.dumps(data, ensure_ascii=False)[:800]
+    )
+
+
+def completed_responses_stream(events):
+    failures = [
+        event for event in events if event.get("type") == "response.failed"
+    ]
+    assert not failures, json.dumps(failures, ensure_ascii=False)[:800]
+    for event in reversed(events):
+        if event.get("type") == "response.completed":
+            return event["response"]
+    raise AssertionError(
+        "no response.completed event: "
+        + json.dumps(events, ensure_ascii=False)[:800]
+    )
 
 
 def first_claude_tool_use(data):
