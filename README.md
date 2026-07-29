@@ -212,9 +212,9 @@ GLM-5.2 和 DeepSeek V4 的推理等级统一为 `high`、`max`：`high` 保持�
 
 Kimi-K3 始终启用 thinking。GenAI 网页通道没有独立的 thinking effort 字段，因此所有 OpenAI 推理等级都使用上游默认的 `max`，保证实际提示词与 token 计数一致。
 
-GenAI 网页通道 `/htk/chat/start/chat` 不会把 Kimi-K3 的顶层 `tools/tool_choice` 或消息内 `tools` 传给 Xinference，因此无法使用 Moonshot 官方 `type="tool-declare"` XTML 工具声明。代理在该限制下使用明确区分于原生 XTML 的外部操作桥接：把精简后的函数 schema 放入普通 system 消息，要求模型只输出 `<k3_action>{"name":"...","arguments":{...}}</k3_action>`，完整收齐并校验 JSON 与工具名后再转换为 OpenAI `tool_calls`、Responses `function_call` 或 Claude `tool_use`。schema 和桥接指令不会进入 `chatInfo`，也不会再生成 `Call-expression schemas`、`User request:` 或 `name(key=value)` 正文。工具结果会作为 `<k3_result>` 保留在 `messages`；如果结果回合末尾没有新的用户正文，传输层只用零宽字符触发 K3，不把结果写入历史问题。Moonshot 官方 XTML 返回解析仍然保留，便于上游以后提供原生透传时直接使用。
+GenAI 网页通道 `/htk/chat/start/chat` 不会把 Kimi-K3 的顶层 `tools/tool_choice`、消息内 `tools`、结构化工具历史或历史 `reasoning_content` 传给 Xinference，因此无法使用 Moonshot 官方 `type="tool-declare"` XTML 工具声明。代理在该限制下使用明确区分于原生 XTML 的客户端响应协议：把精简后的函数 schema 放在当前用户轮之前的一条普通 system 消息中，要求模型只返回两种正文信封之一。需要外部操作时返回含合法 JSON 的 `<k3_action>...</k3_action>`；任务确实完成时返回 `<k3_final>...</k3_final>`。代理完整收齐并校验信封、JSON 和工具名后，再转换为 OpenAI `tool_calls`、Responses `function_call` 或 Claude `tool_use`。`auto` 不会把普通 JSON 或无信封正文误执行为工具；无信封输出会触发有限次、强制动作的结构化重试。`required` 和指定函数在严格匹配已声明工具时仍可容错接收无信封 JSON。桥接消息不会进入 `chatInfo`，也不会生成 `Call-expression schemas`、`User request:` 或 `name(key=value)` 正文。Moonshot 官方 XTML 返回解析仍然保留，便于上游以后提供原生透传时直接使用。
 
-该桥接不是 Moonshot 原生工具协议。普通 system/user/assistant 消息仍由固定 revision 的官方 `encoding_k3.py` 编码，工具 schema 也按实际发送的普通 system 正文计数。流式请求会立即把上游独立的推理增量转换为 OpenAI `reasoning_content`、Responses `response.reasoning_text.delta` 或 Claude `thinking_delta`；工具正文仍会等到上游生成完成、JSON 闭合且解析成功后，再发送标准 `tool_calls`/`tool_use`。这样客户端可以及时看到推理进度，同时不会收到无法撤回的残缺工具 JSON。
+该客户端响应协议不是 Moonshot 原生工具协议。普通 system/user/assistant 消息仍由固定 revision 的官方 `encoding_k3.py` 编码，工具 schema、结果记录和 continuation state 也按实际发送的普通消息正文计数。每个已完成调用被压成一条 `Completed client action result:` 用户消息，记录 `id`、工具名、参数和结果；不再把历史调用写成与当前动作相似的标签，避免长链中模型模仿历史标签。由于 GenAI 会丢弃历史 `reasoning_content`，代理只把最近一轮工具调用前的 reasoning 复制一次到普通 system continuation state，旧 reasoning 全部丢弃。这样既能让下一轮延续已有计划，也让 reasoning 状态开销不会随调用轮数累积。Responses 工具结果回合不会自动降级为 `tool_choice: "none"`，只有调用方显式指定时才会禁用动作。代理不根据任务关键词、工具名或模型措辞猜测是否继续，只校验动作、完成信封及调用方的 `tool_choice`。流式请求会立即把上游推理增量转换为 OpenAI `reasoning_content`、Responses `response.reasoning_text.delta` 或 Claude `thinking_delta`；动作和完成正文仍会等信封闭合并解析成功后再发送，不会把半截 JSON 或协议标签泄露给客户端。
 
 Kimi-K3 还有一项 GenAI 通道限制：最后一条用户输入必须放在非空 `chatInfo`，否则上游会追加一个缺少 `content` 的用户消息并拒绝请求。GenAI 会把每个非空 `chatInfo` 写入历史记录，而其他模型可以把完整消息放在 `messages` 并保持 `chatInfo` 为空，所以该现象只在 Kimi-K3 上明显。代理从不在聊天请求中发送 `chatGroupId`；该分组 ID 由 GenAI 服务端生成。Kimi-K3 成功生成完整响应后，代理会在返回结束 chunk 前从历史接口精确找出本次新增的分组并删除。定位不到唯一记录、生成失败或删除接口异常时会安全跳过，不会误删其他记录，也不会破坏模型响应。工具 schema 和桥接指令只放在 `messages`，不会写入历史问题正文。
 
@@ -306,6 +306,7 @@ print(resp)
 基础离线检查：
 
 ```bash
+uv run --with pytest python -m pytest -q
 uv run python -m compileall genai_proxy test_tool_adapters.py test_allowed_models_integration.py
 uv run python test_tool_adapters.py
 ```
@@ -316,7 +317,7 @@ uv run python test_tool_adapters.py
 uv run python test_allowed_models_integration.py --repeat 20 --models deepseek-chat deepseek-pro MiniMax-M1 chatglm kimi-k3
 ```
 
-该集成测试只允许调用 `deepseek-chat`、`deepseek-pro`、`MiniMax-M1`、`chatglm`、`kimi-k3`。前四个模型覆盖 OpenAI 和 Claude Messages 两种调用风格下的非流式工具调用、流式工具调用、Claude Code 风格 `Bash` 工具、工具结果回合和无需工具的普通回答。Kimi-K3 覆盖 OpenAI/Claude 文本、OpenAI/Responses/Claude 视觉、token usage，以及外部操作桥接的 OpenAI 非流式和流式工具调用与 Claude 流式工具调用。为限制 Kimi-K3 实时测试流量，其默认只执行 1 轮，不跟随通用 `--repeat`；确需重复时显式传入 `--kimi-repeat N`。成功完成的 Kimi-K3 测试历史会自动清理。
+该集成测试只允许调用 `deepseek-chat`、`deepseek-pro`、`MiniMax-M1`、`chatglm`、`kimi-k3`。前四个模型覆盖 OpenAI 和 Claude Messages 两种调用风格下的非流式工具调用、流式工具调用、Claude Code 风格 `Bash` 工具、工具结果回合和无需工具的普通回答。Kimi-K3 覆盖 OpenAI/Claude 文本、OpenAI/Responses/Claude 视觉、token usage，以及外部操作桥接的 OpenAI 非流式和流式工具调用、Claude 流式工具调用和 Responses 长历史三轮工具链；三轮链路会验证空白续轮仍能流式调用下一项工具，最后再正常收敛。为限制 Kimi-K3 实时测试流量，其默认只执行 1 轮，不跟随通用 `--repeat`；确需重复时显式传入 `--kimi-repeat N`。成功完成的 Kimi-K3 测试历史会自动清理。
 
 ## 项目结构
 
