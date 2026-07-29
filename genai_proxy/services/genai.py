@@ -34,11 +34,15 @@ from genai_proxy.errors import ProxyError
 from genai_proxy.optimizations import (
     DEEPSEEK_V4_ADAPTERS,
     GLM_5_2_ADAPTER,
+    KIMI_FINAL_CLOSE,
+    KIMI_FINAL_OPEN,
     KIMI_K3_ADAPTER,
     KIMI_TOOL_TRANSPORT_ERROR,
+    extract_kimi_final_response,
     inject_deepseek_reasoning_prompt,
     inject_glm_reasoning_prompt,
     inject_kimi_tool_prompt,
+    kimi_tool_retry_messages,
     select_tool_adapter,
     tool_start_tags,
 )
@@ -95,9 +99,11 @@ GENAI_HISTORY_DELETE_URL = (
 GENAI_STREAM_TIMEOUT = (10, 600)
 GENAI_HISTORY_TIMEOUT = (5, 15)
 KIMI_EMPTY_CURRENT_INPUT = "\u200b"
-KIMI_HISTORY_PAGE_SIZE = 30
+KIMI_HISTORY_PAGE_SIZE = 200
+KIMI_HISTORY_MAX_PAGES = 50
 KIMI_HISTORY_POLL_ATTEMPTS = 20
 KIMI_HISTORY_POLL_INTERVAL = 0.25
+KIMI_TOOL_ATTEMPTS = 3
 
 
 @dataclass(slots=True)
@@ -442,6 +448,7 @@ class GenAIService:
                 tools=prepared.tools,
                 model=prepared.model,
                 adapter=prepared.tool_adapter,
+                tool_choice=prepared.tool_choice,
             )
             if tool_calls:
                 remaining_text = _strip_visible_tool_syntax(
@@ -1524,15 +1531,16 @@ class GenAIService:
                         cleanup.user_id,
                     ),
                 )
-                candidates = [
-                    record
+                candidates_by_id = {
+                    str(record["chatGroupId"]): record
                     for record in records
                     if isinstance(record, dict)
                     and record.get("question") == cleanup.question
                     and str(record.get("chatGroupId") or "")
                     not in cleanup.existing_group_ids
                     and record.get("chatGroupId")
-                ]
+                }
+                candidates = list(candidates_by_id.values())
                 if candidates or attempt == KIMI_HISTORY_POLL_ATTEMPTS - 1:
                     break
                 time.sleep(KIMI_HISTORY_POLL_INTERVAL)
@@ -1564,31 +1572,59 @@ class GenAIService:
         token: str,
         user_id: str,
     ) -> list[dict]:
-        try:
-            response = requests.get(
-                GENAI_HISTORY_LIST_URL,
-                params={
-                    "_t": int(time.time() * 1000),
-                    "pageNo": 1,
-                    "pageSize": KIMI_HISTORY_PAGE_SIZE,
-                    "userId": user_id,
-                    "question": "",
-                },
-                headers=self._get_user_genai_headers(token),
-                timeout=GENAI_HISTORY_TIMEOUT,
-            )
-        except requests.RequestException as exc:
-            raise transient_upstream_error(
-                "Failed to fetch Kimi K3 history"
-            ) from exc
+        records = []
+        page_number = 1
+        page_count = 1
+        while page_number <= page_count:
+            try:
+                response = requests.get(
+                    GENAI_HISTORY_LIST_URL,
+                    params={
+                        "_t": int(time.time() * 1000),
+                        "pageNo": page_number,
+                        "pageSize": KIMI_HISTORY_PAGE_SIZE,
+                        "userId": user_id,
+                        "question": "",
+                    },
+                    headers=self._get_user_genai_headers(token),
+                    timeout=GENAI_HISTORY_TIMEOUT,
+                )
+            except requests.RequestException as exc:
+                raise transient_upstream_error(
+                    "Failed to fetch Kimi K3 history"
+                ) from exc
 
-        payload = self._decode_kimi_history_response(
-            response,
-            "fetch Kimi K3 history",
-        )
-        result = payload.get("result")
-        records = result.get("records") if isinstance(result, dict) else []
-        return records if isinstance(records, list) else []
+            payload = self._decode_kimi_history_response(
+                response,
+                "fetch Kimi K3 history",
+            )
+            result = payload.get("result")
+            if not isinstance(result, dict) or not isinstance(
+                result.get("records"), list
+            ):
+                raise transient_upstream_error(
+                    "Failed to fetch Kimi K3 history"
+                )
+            page_records = result["records"]
+            records.extend(page_records)
+
+            raw_page_count = result.get("pages", 1)
+            try:
+                reported_page_count = max(int(raw_page_count), 1)
+            except (TypeError, ValueError) as exc:
+                raise transient_upstream_error(
+                    "Failed to fetch Kimi K3 history"
+                ) from exc
+            if reported_page_count > KIMI_HISTORY_MAX_PAGES:
+                raise ProxyError(
+                    "Kimi K3 history is too large for safe cleanup",
+                    error_type="upstream_error",
+                    status=502,
+                )
+            page_count = max(page_count, reported_page_count)
+            page_number += 1
+
+        return records
 
     def _delete_kimi_history_group(self, token: str, group_id: str) -> None:
         try:
@@ -1719,49 +1755,138 @@ class GenAIService:
                 )
 
         sent_role = False
-        attempt = None
-        try:
-            for event_type, value in self._iter_tool_attempt_events(
-                prepared,
-                prepared.messages,
-                stream_reasoning=stream_reasoning,
+        tool_calls = []
+        content = ""
+        remaining = ""
+        reasoning_content = ""
+        visible_reasoning = ""
+        choice_satisfied = False
+        final_response = False
+        invalid_syntax = False
+        max_attempts = (
+            KIMI_TOOL_ATTEMPTS if prepared.tool_adapter == KIMI_K3_ADAPTER else 1
+        )
+        attempt_messages = prepared.messages
+        for attempt_index in range(max_attempts):
+            attempt = None
+            try:
+                for event_type, value in self._iter_tool_attempt_events(
+                    prepared,
+                    attempt_messages,
+                    stream_reasoning=stream_reasoning,
+                ):
+                    if event_type == "reasoning":
+                        delta = {"reasoning_content": value}
+                        visible_reasoning += value
+                        if not sent_role:
+                            delta["role"] = "assistant"
+                            sent_role = True
+                        yield make_chunk(delta)
+                    else:
+                        attempt = value
+            except ProxyError as exc:
+                if not sent_role:
+                    raise
+                yield make_error_chunk(
+                    exc.message,
+                    prepared.model,
+                    completion_id,
+                )
+                return
+
+            if attempt is None:
+                raise RuntimeError("Tool stream ended without a completed attempt")
+
+            tool_calls = attempt.get("tool_calls") or []
+            content = attempt.get("content") or ""
+            remaining = content
+            final_response = False
+            if prepared.tool_adapter == KIMI_K3_ADAPTER and not tool_calls:
+                final_response, remaining = extract_kimi_final_response(content)
+                remaining = remaining or ""
+            if not tool_calls and not final_response:
+                tool_calls, remaining = extract_tool_calls(
+                    content,
+                    self._logger,
+                    tools=prepared.tools,
+                    model=prepared.model,
+                    adapter=prepared.tool_adapter,
+                    tool_choice=prepared.tool_choice,
+                )
+                tool_calls = tool_calls or []
+            reasoning_content = attempt.get("reasoning_content") or ""
+
+            final_marker = (
+                prepared.tool_adapter == KIMI_K3_ADAPTER
+                and (
+                    KIMI_FINAL_OPEN in content
+                    or KIMI_FINAL_CLOSE in content
+                )
+            )
+            invalid_syntax = (
+                any(tag in content for tag in open_tags) and not tool_calls
+            ) or (final_marker and not final_response)
+            choice_satisfied = bool(tool_calls) and (
+                prepared.tool_adapter != KIMI_K3_ADAPTER
+                or _tool_calls_satisfy_choice(
+                    tool_calls,
+                    prepared.tool_choice,
+                )
+            )
+            protocol_missing = (
+                prepared.tool_adapter == KIMI_K3_ADAPTER
+                and not tool_calls
+                and not final_response
+            )
+            should_retry = (
+                invalid_syntax
+                or (
+                    _tool_choice_requires_call(prepared.tool_choice)
+                    and not choice_satisfied
+                )
+                or protocol_missing
+            )
+            if (
+                choice_satisfied
+                or (
+                    final_response
+                    and not _tool_choice_requires_call(prepared.tool_choice)
+                )
+                or not should_retry
+                or attempt_index == max_attempts - 1
             ):
-                if event_type == "reasoning":
-                    delta = {"reasoning_content": value}
-                    if not sent_role:
-                        delta["role"] = "assistant"
-                        sent_role = True
-                    yield make_chunk(delta)
-                else:
-                    attempt = value
-        except ProxyError as exc:
-            if not sent_role:
-                raise
-            yield make_error_chunk(
-                exc.message,
-                prepared.model,
-                completion_id,
+                break
+            attempt_messages = kimi_tool_retry_messages(
+                prepared.messages,
+                tool_choice=prepared.tool_choice,
+                force_action=(
+                    _tool_choice_requires_call(prepared.tool_choice)
+                    or (protocol_missing and not invalid_syntax)
+                ),
             )
-            return
-
-        if attempt is None:
-            raise RuntimeError("Tool stream ended without a completed attempt")
-
-        tool_calls = attempt.get("tool_calls") or []
-        content = attempt.get("content") or ""
-        remaining = content
-        if not tool_calls:
-            tool_calls, remaining = extract_tool_calls(
-                content,
-                self._logger,
-                tools=prepared.tools,
-                model=prepared.model,
-                adapter=prepared.tool_adapter,
+            self._logger.warning(
+                "Kimi K3 did not produce a valid client response; retrying "
+                "(attempt %d/%d)",
+                attempt_index + 2,
+                max_attempts,
             )
-            tool_calls = tool_calls or []
 
-        reasoning_content = attempt.get("reasoning_content") or ""
-        if tool_calls:
+        if (
+            prepared.tool_adapter == KIMI_K3_ADAPTER
+            and visible_reasoning != reasoning_content
+            and prepared.prompt_tokens is not None
+        ):
+            self._record_usage(
+                prepared,
+                {
+                    "role": "assistant",
+                    "reasoning_content": visible_reasoning,
+                    "content": content,
+                },
+                finish_reason="tool_calls" if choice_satisfied else "stop",
+            )
+
+        if choice_satisfied:
             clean_remaining = _strip_visible_tool_syntax(
                 remaining or "", open_tags
             ).strip()
@@ -1774,7 +1899,7 @@ class GenAIService:
                     prepared,
                     {
                         "role": "assistant",
-                        "reasoning_content": reasoning_content,
+                        "reasoning_content": (visible_reasoning or reasoning_content),
                         "content": clean_remaining or None,
                         "tool_calls": tool_calls,
                     },
@@ -1795,9 +1920,7 @@ class GenAIService:
             yield "data: [DONE]\n\n"
             return
 
-        if prepared.tool_adapter == KIMI_K3_ADAPTER and any(
-            tag in content for tag in open_tags
-        ):
+        if prepared.tool_adapter == KIMI_K3_ADAPTER and invalid_syntax:
             self._logger.warning(
                 "Tool adapter output contained unparseable tool syntax (%d chars)",
                 len(content),
@@ -1819,7 +1942,22 @@ class GenAIService:
             )
             return
 
-        clean_content = _strip_visible_tool_syntax(content, open_tags)
+        if (
+            prepared.tool_adapter == KIMI_K3_ADAPTER
+            and not final_response
+        ):
+            yield make_error_chunk(
+                "Upstream returned neither a valid client action nor a final response",
+                prepared.model,
+                completion_id,
+            )
+            return
+
+        clean_content = (
+            remaining
+            if final_response
+            else _strip_visible_tool_syntax(content, open_tags)
+        )
         if clean_content.strip():
             for chunk in emit_response_text(clean_content, sent_role):
                 if isinstance(chunk, bool):
@@ -2270,6 +2408,8 @@ def _history_group_ids(records: list[dict]) -> set[str]:
 
 def _tool_start_tags_for_request(adapter: str, tools: list | None) -> tuple[str, ...]:
     tags = list(tool_start_tags(adapter))
+    if adapter == KIMI_K3_ADAPTER:
+        return tuple(tags)
     for name, argument_names in _request_tool_specs(tools).items():
         tags.append(f"{name}<arg_key>")
         tags.append(f"{name} <arg_key>")
@@ -2310,6 +2450,20 @@ def _tool_choice_is_none(tool_choice) -> bool:
 def _tool_choice_requires_call(tool_choice) -> bool:
     return tool_choice == "required" or (
         isinstance(tool_choice, dict) and tool_choice.get("type") == "function"
+    )
+
+
+def _tool_calls_satisfy_choice(tool_calls, tool_choice) -> bool:
+    if not tool_calls:
+        return False
+    if _tool_choice_is_none(tool_choice):
+        return False
+    if not (isinstance(tool_choice, dict) and tool_choice.get("type") == "function"):
+        return True
+    function = tool_choice.get("function")
+    name = function.get("name") if isinstance(function, dict) else None
+    return bool(name) and all(
+        tool_call.get("function", {}).get("name") == name for tool_call in tool_calls
     )
 
 

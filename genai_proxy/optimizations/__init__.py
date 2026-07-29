@@ -9,9 +9,13 @@ from genai_proxy.optimizations.glm import (
     inject_glm_tool_prompt,
 )
 from genai_proxy.optimizations.kimi import (
+    KIMI_FINAL_CLOSE,
+    KIMI_FINAL_OPEN,
     KIMI_TOOL_TRANSPORT_ERROR,
+    extract_kimi_final_response,
     extract_kimi_tool_calls,
     inject_kimi_tool_prompt,
+    kimi_tool_retry_messages,
 )
 from genai_proxy.optimizations.minimax import inject_minimax_tool_prompt
 from genai_proxy.optimizations.registry import (
@@ -47,10 +51,13 @@ __all__ = [
     "GLM_5_2_ADAPTER",
     "GLM_ADAPTER",
     "GLM_ADAPTERS",
+    "KIMI_FINAL_CLOSE",
+    "KIMI_FINAL_OPEN",
     "KIMI_K3_ADAPTER",
     "KIMI_TOOL_TRANSPORT_ERROR",
     "MINIMAX_ADAPTER",
     "extract_deepseek_tool_calls",
+    "extract_kimi_final_response",
     "extract_kimi_tool_calls",
     "inject_deepseek_reasoning_prompt",
     "inject_deepseek_tool_prompt",
@@ -62,6 +69,7 @@ __all__ = [
     "is_deepseek_model",
     "is_deepseek_v4_adapter",
     "is_glm_adapter",
+    "kimi_tool_retry_messages",
     "select_tool_adapter",
     "tool_start_tags",
 ]

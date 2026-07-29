@@ -314,7 +314,14 @@ def _repair_jsonish_tool_call(raw: str, tools=None):
     return {"name": name, "arguments": arguments}
 
 
-def extract_tool_calls(content, logger=None, tools=None, model=None, adapter=None):
+def extract_tool_calls(
+    content,
+    logger=None,
+    tools=None,
+    model=None,
+    adapter=None,
+    tool_choice=None,
+):
     cleaned = strip_think_blocks(content)
     cleaned = re.sub(
         r"```(?:xml|json|plaintext|text)?\s*\n?\s*(<tool_call>.*?</tool_call>)\s*\n?\s*```",
@@ -328,6 +335,7 @@ def extract_tool_calls(content, logger=None, tools=None, model=None, adapter=Non
         kimi_tool_calls, kimi_remaining = extract_kimi_tool_calls(
             cleaned,
             tools=tools,
+            tool_choice=tool_choice,
             logger=logger,
         )
         if kimi_tool_calls:

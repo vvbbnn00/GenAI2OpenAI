@@ -477,6 +477,10 @@ def _kimi_chat_segments(
         thinking=True,
         image_prompts=image_prompts,
         thinking_effort=effort,
+        # The GenAI web transport drops native tool declarations and invokes
+        # K3 with its no-tool default. The official encoder renders that
+        # upstream default as a final type="tool-choice" system message.
+        tool_choice="none",
     )
 
 
@@ -1063,17 +1067,28 @@ def _serialized_completion(
             return "".join(
                 segment.text for segment in _kimi_partial_completion_segments(message)
             )
-        generation_prompt = render_chat_prompt(
-            [],
-            family,
-            add_generation_prompt=True,
-            image_sizes=(),
+        encoder = _load_python_encoder(KIMI_K3_SPEC)
+        common = {
+            "tools": None,
+            "thinking": True,
+            "image_prompts": None,
+            "thinking_effort": "max",
+        }
+        generation_prompt = "".join(
+            segment.text
+            for segment in encoder["build_chat_segments"](
+                [],
+                add_generation_prompt=True,
+                **common,
+            )
         )
-        completed_prompt = render_chat_prompt(
-            [message],
-            family,
-            add_generation_prompt=False,
-            image_sizes=(),
+        completed_prompt = "".join(
+            segment.text
+            for segment in encoder["build_chat_segments"](
+                _normalize_messages([message], parse_tool_arguments=False),
+                add_generation_prompt=False,
+                **common,
+            )
         )
         if not completed_prompt.startswith(generation_prompt):
             raise _tokenizer_error(KIMI_K3_SPEC, "serialize completion")

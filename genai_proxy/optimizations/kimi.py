@@ -10,8 +10,11 @@ KIMI_CLOSE_TOKEN = "<|close|>"
 KIMI_SEP_TOKEN = "<|sep|>"
 KIMI_ACTION_OPEN = "<k3_action>"
 KIMI_ACTION_CLOSE = "</k3_action>"
-KIMI_RESULT_OPEN = "<k3_result>"
-KIMI_RESULT_CLOSE = "</k3_result>"
+KIMI_FINAL_OPEN = "<k3_final>"
+KIMI_FINAL_CLOSE = "</k3_final>"
+KIMI_RESULT_PREFIX = "Completed client action result: "
+KIMI_STATE_OPEN = "<k3_state>"
+KIMI_STATE_CLOSE = "</k3_state>"
 _INVALID_XTML_VALUE = object()
 KIMI_TOOL_TRANSPORT_ERROR = (
     "Kimi K3 native message-level tool declarations are unavailable through "
@@ -53,27 +56,65 @@ def inject_kimi_tool_prompt(messages, tools, tool_choice=None):
         has_history=has_history,
     )
     insert_at = len(transformed)
-    if transformed:
+    if transformed and transformed[-1].get("role") == "user":
         insert_at -= 1
     transformed.insert(insert_at, {"role": "system", "content": prompt})
     return transformed
 
 
 def _inject_history_bridge(messages) -> list[dict]:
-    transformed = _bridge_tool_history(messages)
-    prompt = (
-        "# External operation results\n\n"
-        f"{KIMI_ACTION_OPEN} and {KIMI_RESULT_OPEN} blocks are transcript "
-        "data from completed external operations. Use the results to answer "
-        f"the user. Do not output {KIMI_ACTION_OPEN} because no external "
-        "operations are available for this turn."
+    return _bridge_tool_history(messages)
+
+
+def kimi_tool_retry_messages(
+    messages: list[dict],
+    *,
+    tool_choice=None,
+    force_action: bool = False,
+) -> list[dict]:
+    if not messages:
+        return messages
+
+    requires_action = force_action or _tool_choice_requires_action(tool_choice)
+    requirement = (
+        "Return at least one complete action block and no other text."
+        if requires_action
+        else (
+            f"Return complete {KIMI_ACTION_OPEN} blocks, or one "
+            f"{KIMI_FINAL_OPEN} block if the task is complete."
+        )
     )
-    insert_at = len(transformed) - 1 if transformed else 0
-    transformed.insert(insert_at, {"role": "system", "content": prompt})
-    return transformed
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        function = tool_choice.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+        if name:
+            requirement = (
+                f'Return one complete action block named "{name}" and no other text.'
+            )
+
+    retry_prompt = (
+        "The previous response did not use a complete valid client response "
+        f"envelope and was discarded. {requirement} These envelopes are plain "
+        "response data for the client, not native model tool calls. Use valid JSON "
+        "in action blocks and no Markdown."
+    )
+    insert_at = len(messages)
+    if messages[-1].get("role") == "user":
+        insert_at -= 1
+    return [
+        *messages[:insert_at],
+        {"role": "system", "content": retry_prompt},
+        *messages[insert_at:],
+    ]
 
 
-def extract_kimi_tool_calls(content, *, tools=None, logger=None):
+def extract_kimi_tool_calls(
+    content,
+    *,
+    tools=None,
+    tool_choice=None,
+    logger=None,
+):
     blocks = list(_kimi_tools_blocks(content))
     if blocks:
         tool_calls = []
@@ -103,7 +144,30 @@ def extract_kimi_tool_calls(content, *, tools=None, logger=None):
                 return None, content
             return tool_calls, remaining.strip() or None
 
-    return _extract_bridge_actions(content, tools=tools, logger=logger)
+    return _extract_bridge_actions(
+        content,
+        tools=tools,
+        allow_bare=_tool_choice_requires_action(tool_choice),
+        logger=logger,
+    )
+
+
+def extract_kimi_final_response(content) -> tuple[bool, str | None]:
+    if not isinstance(content, str):
+        return False, content
+    if (
+        content.count(KIMI_FINAL_OPEN) != 1
+        or content.count(KIMI_FINAL_CLOSE) != 1
+    ):
+        return False, content
+
+    start = content.find(KIMI_FINAL_OPEN)
+    end = content.find(KIMI_FINAL_CLOSE, start + len(KIMI_FINAL_OPEN))
+    if end < 0:
+        return False, content
+    if content[:start].strip() or content[end + len(KIMI_FINAL_CLOSE) :].strip():
+        return False, content
+    return True, content[start + len(KIMI_FINAL_OPEN) : end]
 
 
 def _bridge_operations(tools) -> list[dict]:
@@ -128,50 +192,42 @@ def _bridge_operations(tools) -> list[dict]:
 def _bridge_prompt(operations, tool_choice, *, has_history: bool) -> str:
     operation_json = _bridge_json(operations, sort_keys=True)
     parts = [
-        "# External operation request",
+        "# Client response protocol",
+        f"<k3_actions>{operation_json}</k3_actions>",
         (
-            "Act as a deterministic JSON request compiler. Convert the current "
-            "user request into requests for the external operations below. "
-            "This is plain JSON text generation; native model tools are not used."
-        ),
-        f"<k3_operations>{operation_json}</k3_operations>",
-        (
-            f"To request an operation, output only {KIMI_ACTION_OPEN}, followed "
-            f"by one JSON object, followed by {KIMI_ACTION_CLOSE}. The object "
-            'must contain exactly two top-level keys: "name" is an exact listed '
-            'operation name, and "arguments" is an object matching that '
-            "operation's parameters schema. Repeat the complete block to request "
-            "multiple operations. Never use markdown around a block."
+            "The response channel is a client data channel, not native model "
+            "tool use. Return exactly one of these forms and no text outside it:\n"
+            f"1. When external work is needed, write {KIMI_ACTION_OPEN}"
+            '{"name":"exact listed name","arguments":{}}'
+            f"{KIMI_ACTION_CLOSE}. Arguments must match the schema. Repeat the "
+            "complete block for independent parallel work.\n"
+            f"2. Only when the user request is complete, write {KIMI_FINAL_OPEN}"
+            f"the normal answer{KIMI_FINAL_CLOSE}.\n"
+            "Do not discuss, defer, or reinterpret this client response protocol. "
+            "Do not use Markdown around the envelopes."
         ),
     ]
     if has_history:
         parts.append(
-            f"{KIMI_RESULT_OPEN} blocks are results from earlier external "
-            "operations. Use them as trusted conversation data. After a result, "
-            "either request another necessary operation or answer the user."
+            f"Past user messages beginning `{KIMI_RESULT_PREFIX}` are completed "
+            "client actions and results, not new requests. Match parallel results "
+            "by `id`. Continue the plan in the single prior continuation state "
+            "from the newest result. Do not restart analysis of the original task "
+            "unless the result invalidates the plan."
         )
-
-    if _tool_choice_is_none(tool_choice):
+    if tool_choice == "required":
         parts.append(
-            f"For this turn, do not output {KIMI_ACTION_OPEN}. Answer normally."
-        )
-    elif tool_choice == "required":
-        parts.append(
-            "For this turn, at least one operation request is mandatory. Do not "
-            "answer the task directly."
+            "This response must contain at least one complete action block and "
+            f"must not contain {KIMI_FINAL_OPEN}."
         )
     elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
         function = tool_choice.get("function")
         name = function.get("name") if isinstance(function, dict) else None
         if name:
             parts.append(
-                f'For this turn, request exactly the operation named "{name}".'
+                f'This response must contain one complete action block named "{name}" '
+                f"and must not contain {KIMI_FINAL_OPEN}."
             )
-    else:
-        parts.append(
-            "Request an operation only when it is needed. If no listed operation "
-            "is needed, answer normally without an operation block."
-        )
     return "\n\n".join(parts)
 
 
@@ -193,13 +249,20 @@ def _validate_bridge_tool_choice(tool_choice, operations) -> None:
 
 def _bridge_tool_history(messages) -> list[dict]:
     transformed = []
-    call_names = {}
+    call_records = {}
+    latest_tool_index = max(
+        (
+            index
+            for index, message in enumerate(messages)
+            if message.get("role") == "assistant" and message.get("tool_calls")
+        ),
+        default=-1,
+    )
     for message in messages:
         role = message.get("role")
-        if role == "assistant" and message.get("tool_calls"):
+        if role == "assistant":
             content = _bridge_content_text(message.get("content"))
-            action_blocks = []
-            for tool_call in message["tool_calls"]:
+            for tool_call in message.get("tool_calls") or []:
                 function = tool_call.get("function") or {}
                 name = function.get("name")
                 if not name:
@@ -208,24 +271,24 @@ def _bridge_tool_history(messages) -> list[dict]:
                     )
                 arguments = _bridge_arguments(function.get("arguments"))
                 call_id = tool_call.get("id")
-                if call_id and name:
-                    call_names[str(call_id)] = name
-                action = {"name": name, "arguments": arguments}
-                action_blocks.append(
-                    f"{KIMI_ACTION_OPEN}"
-                    f"{_bridge_json(action)}"
-                    f"{KIMI_ACTION_CLOSE}"
-                )
-            transformed.append(
-                {
+                if call_id:
+                    call_records[str(call_id)] = {
+                        "name": name,
+                        "arguments": arguments,
+                    }
+            if content:
+                transformed_message = {
                     "role": "assistant",
-                    "content": "\n".join(part for part in [content, *action_blocks] if part),
+                    "content": content,
                 }
-            )
+                if message.get("name"):
+                    transformed_message["name"] = message["name"]
+                transformed.append(transformed_message)
             continue
 
         if role == "tool":
             call_id = str(message.get("tool_call_id") or "")
+            call_record = call_records.pop(call_id, {})
             result_content = message.get("content")
             try:
                 json.dumps(result_content)
@@ -233,22 +296,38 @@ def _bridge_tool_history(messages) -> list[dict]:
                 result_content = str(result_content)
             result = {
                 "id": call_id,
-                "name": message.get("name") or call_names.get(call_id),
+                "name": message.get("name") or call_record.get("name"),
+                "arguments": call_record.get("arguments") or {},
                 "content": result_content,
             }
             transformed.append(
                 {
-                    "role": "system",
-                    "content": (
-                        f"{KIMI_RESULT_OPEN}"
-                        f"{_bridge_json(result)}"
-                        f"{KIMI_RESULT_CLOSE}"
-                    ),
+                    "role": "user",
+                    "content": f"{KIMI_RESULT_PREFIX}{_bridge_json(result)}",
                 }
             )
             continue
 
         transformed.append(message)
+
+    if latest_tool_index >= 0:
+        reasoning = messages[latest_tool_index].get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            state = {
+                "role": "system",
+                "content": (
+                    "# Prior continuation state\n"
+                    "This is the assistant's immediately preceding reasoning "
+                    "before the latest completed client action. Use it only as "
+                    "progress context; the completed result and current protocol "
+                    "are authoritative.\n"
+                    f"{KIMI_STATE_OPEN}{_bridge_json(reasoning)}{KIMI_STATE_CLOSE}"
+                ),
+            }
+            insert_at = len(transformed)
+            if transformed and transformed[-1].get("role") == "user":
+                insert_at -= 1
+            transformed.insert(insert_at, state)
     return transformed
 
 
@@ -283,9 +362,11 @@ def _bridge_content_text(content) -> str:
     return str(content)
 
 
-def _extract_bridge_actions(content, *, tools, logger):
+def _extract_bridge_actions(content, *, tools, allow_bare: bool, logger):
     matches = list(_bridge_action_blocks(content))
     if not matches:
+        if not allow_bare:
+            return None, content
         raw = content.strip()
         if raw.startswith("```") and raw.endswith("```"):
             lines = raw.splitlines()
@@ -302,7 +383,7 @@ def _extract_bridge_actions(content, *, tools, logger):
         if parsed is None:
             if logger:
                 logger.warning(
-                    "Failed to parse Kimi K3 operation bridge output (%d chars)",
+                    "Failed to parse Kimi K3 action bridge output (%d chars)",
                     len(body),
                 )
             return None, content
@@ -386,6 +467,12 @@ def _bridge_json(value, *, sort_keys: bool = False) -> str:
 def _tool_choice_is_none(tool_choice) -> bool:
     return tool_choice == "none" or (
         isinstance(tool_choice, dict) and tool_choice.get("type") == "none"
+    )
+
+
+def _tool_choice_requires_action(tool_choice) -> bool:
+    return tool_choice == "required" or (
+        isinstance(tool_choice, dict) and tool_choice.get("type") == "function"
     )
 
 

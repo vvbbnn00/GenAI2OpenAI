@@ -38,8 +38,12 @@ def convert_responses_to_openai_request(
     request_tools = list(request_tools)
     request_tools.extend(_additional_tools_from_input(input_items))
     openai_tools, tool_map = _convert_responses_tools(request_tools)
+    model = req_data.get("model", "GPT-4.1")
+    is_kimi_k3 = (
+        isinstance(model, str) and select_tool_adapter(model) == KIMI_K3_ADAPTER
+    )
     tool_choice = req_data.get("tool_choice")
-    if tool_choice is None and _input_has_tool_output(input_items):
+    if tool_choice is None and _input_has_tool_output(input_items) and not is_kimi_k3:
         tool_choice = "none"
 
     messages = []
@@ -47,15 +51,11 @@ def convert_responses_to_openai_request(
     if isinstance(instructions, str) and instructions:
         messages.append({"role": "system", "content": instructions})
 
-    model = req_data.get("model", "GPT-4.1")
     messages.extend(
         _convert_response_input_items(
             input_items,
             tool_map,
-            preserve_images=(
-                isinstance(model, str)
-                and select_tool_adapter(model) == KIMI_K3_ADAPTER
-            ),
+            preserve_images=is_kimi_k3,
         )
     )
 
