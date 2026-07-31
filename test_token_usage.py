@@ -2223,7 +2223,7 @@ def test_kimi_tool_history_sends_only_latest_reasoning_as_continuation_state():
     state_messages = [
         message
         for message in upstream_payload["messages"]
-        if str(message.get("content", "")).startswith("# Prior continuation state\n")
+        if str(message.get("content", "")).startswith("# Continuation checkpoint\n")
     ]
     assert len(state_messages) == 1
     assert (
@@ -2232,6 +2232,12 @@ def test_kimi_tool_history_sends_only_latest_reasoning_as_continuation_state():
         in state_messages[0]["content"]
     )
     assert "<k3_state>" in state_messages[0]["content"]
+    assert '<k3_completed>[{"id":"call_src","name":"inspect"},' in (
+        state_messages[0]["content"]
+    )
+    assert '{"id":"call_tests","name":"inspect"}]</k3_completed>' in (
+        state_messages[0]["content"]
+    )
     assert "STALE_PLAN" not in json.dumps(
         upstream_payload["messages"],
         ensure_ascii=False,
@@ -2252,6 +2258,7 @@ def test_kimi_tool_history_sends_only_latest_reasoning_as_continuation_state():
     assert "CURRENT_PLAN" in encoded_prompt
     assert "STALE_PLAN" not in encoded_prompt
     assert encoded_prompt.count("<k3_state>") == 1
+    assert encoded_prompt.count("<k3_completed>") == 1
     assert "<|open|>think<|sep|>" in encoded_prompt
 
 

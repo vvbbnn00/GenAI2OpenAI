@@ -15,6 +15,8 @@ KIMI_FINAL_CLOSE = "</k3_final>"
 KIMI_RESULT_PREFIX = "Completed client action result: "
 KIMI_STATE_OPEN = "<k3_state>"
 KIMI_STATE_CLOSE = "</k3_state>"
+KIMI_COMPLETED_OPEN = "<k3_completed>"
+KIMI_COMPLETED_CLOSE = "</k3_completed>"
 _INVALID_XTML_VALUE = object()
 KIMI_TOOL_TRANSPORT_ERROR = (
     "Kimi K3 native message-level tool declarations are unavailable through "
@@ -211,9 +213,10 @@ def _bridge_prompt(operations, tool_choice, *, has_history: bool) -> str:
         parts.append(
             f"Past user messages beginning `{KIMI_RESULT_PREFIX}` are completed "
             "client actions and results, not new requests. Match parallel results "
-            "by `id`. Continue the plan in the single prior continuation state "
-            "from the newest result. Do not restart analysis of the original task "
-            "unless the result invalidates the plan."
+            "by `id`. When present, the continuation checkpoint lists actions "
+            "that already ran; do not repeat them merely because the original "
+            "request or archived reasoning names them. A later assistant answer "
+            "or the current user request is authoritative."
         )
     if tool_choice == "required":
         parts.append(
@@ -258,6 +261,7 @@ def _bridge_tool_history(messages) -> list[dict]:
         ),
         default=-1,
     )
+    completed_actions = _latest_completed_actions(messages, latest_tool_index)
     for message in messages:
         role = message.get("role")
         if role == "assistant":
@@ -310,25 +314,65 @@ def _bridge_tool_history(messages) -> list[dict]:
 
         transformed.append(message)
 
-    if latest_tool_index >= 0:
+    if completed_actions:
         reasoning = messages[latest_tool_index].get("reasoning_content")
+        checkpoint_parts = ["# Continuation checkpoint"]
         if isinstance(reasoning, str) and reasoning:
-            state = {
-                "role": "system",
-                "content": (
-                    "# Prior continuation state\n"
-                    "This is the assistant's immediately preceding reasoning "
-                    "before the latest completed client action. Use it only as "
-                    "progress context; the completed result and current protocol "
-                    "are authoritative.\n"
-                    f"{KIMI_STATE_OPEN}{_bridge_json(reasoning)}{KIMI_STATE_CLOSE}"
+            checkpoint_parts.extend(
+                [
+                    "The archived reasoning below was written before the listed "
+                    "client actions ran. It may describe one of those actions as "
+                    "the next step, but that step is now complete.",
+                    f"{KIMI_STATE_OPEN}{_bridge_json(reasoning)}{KIMI_STATE_CLOSE}",
+                ]
+            )
+        checkpoint_parts.extend(
+            [
+                "These client actions have completed and must not be repeated "
+                "unless their result explicitly reports failure:",
+                (
+                    f"{KIMI_COMPLETED_OPEN}{_bridge_json(completed_actions)}"
+                    f"{KIMI_COMPLETED_CLOSE}"
                 ),
-            }
-            insert_at = len(transformed)
-            if transformed and transformed[-1].get("role") == "user":
-                insert_at -= 1
-            transformed.insert(insert_at, state)
+                "Resume after all listed actions and continue with the first "
+                "unfinished step.",
+            ]
+        )
+        checkpoint = {
+            "role": "system",
+            "content": "\n".join(checkpoint_parts),
+        }
+        insert_at = len(transformed)
+        if transformed and transformed[-1].get("role") == "user":
+            insert_at -= 1
+        transformed.insert(insert_at, checkpoint)
     return transformed
+
+
+def _latest_completed_actions(
+    messages: list[dict], latest_tool_index: int
+) -> list[dict]:
+    if latest_tool_index < 0:
+        return []
+
+    continuation = messages[latest_tool_index + 1 :]
+    if any(message.get("role") == "assistant" for message in continuation):
+        return []
+
+    completed_ids = {
+        str(message.get("tool_call_id"))
+        for message in continuation
+        if message.get("role") == "tool" and message.get("tool_call_id")
+    }
+    completed = []
+    for tool_call in messages[latest_tool_index].get("tool_calls") or []:
+        call_id = tool_call.get("id")
+        function = tool_call.get("function") or {}
+        name = function.get("name")
+        if call_id is None or str(call_id) not in completed_ids or not name:
+            continue
+        completed.append({"id": str(call_id), "name": name})
+    return completed
 
 
 def _bridge_arguments(value) -> dict:
