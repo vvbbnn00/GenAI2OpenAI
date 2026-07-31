@@ -28,7 +28,7 @@ from urllib3 import HTTPConnectionPool, HTTPSConnectionPool, Timeout
 from urllib3.exceptions import HTTPError
 
 from genai_proxy.errors import ProxyError
-from genai_proxy.optimizations.registry import (
+from genai_proxy.models.registry import (
     DEEPSEEK_V4_FLASH_ADAPTER,
     DEEPSEEK_V4_PRO_ADAPTER,
     GLM_5_1_ADAPTER,

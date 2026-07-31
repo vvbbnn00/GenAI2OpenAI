@@ -39,7 +39,7 @@ from genai_proxy.compat.responses import (
 )
 from genai_proxy.errors import ProxyError
 from genai_proxy.messages import adapter_supports_vision, normalize_message_contents
-from genai_proxy.optimizations import (
+from genai_proxy.models import (
     DEEPSEEK_V4_ADAPTERS,
     GLM_5_2_ADAPTER,
     KIMI_FINAL_CLOSE,

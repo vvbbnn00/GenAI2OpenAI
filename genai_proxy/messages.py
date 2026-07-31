@@ -1,7 +1,7 @@
 from urllib.parse import urlsplit
 
 from genai_proxy.errors import ProxyError
-from genai_proxy.optimizations.registry import KIMI_K3_ADAPTER, QWEN_3_5_ADAPTER
+from genai_proxy.models.registry import KIMI_K3_ADAPTER, QWEN_3_5_ADAPTER
 
 
 _VISUAL_ADAPTERS = frozenset({KIMI_K3_ADAPTER, QWEN_3_5_ADAPTER})

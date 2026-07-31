@@ -5,7 +5,7 @@ from datetime import datetime
 
 from flask import jsonify
 
-from genai_proxy.optimizations import (
+from genai_proxy.models import (
     GLM_ADAPTERS,
     KIMI_K3_ADAPTER,
     MINIMAX_ADAPTER,

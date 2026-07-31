@@ -1,5 +1,5 @@
 from genai_proxy.errors import ProxyError
-from genai_proxy.optimizations.registry import (
+from genai_proxy.models.registry import (
     DEEPSEEK_V4_ADAPTERS,
     GLM_5_2_ADAPTER,
     KIMI_K3_ADAPTER,
