@@ -71,6 +71,8 @@ def test_omp_workspace_makes_chain_and_terminal_gates_explicit(tmp_path):
     assert "literal NEXT=NONE" in task
     assert "exactly 8 CHAIN_TOKEN values" in task
     assert "do not add Markdown, a table, an explanation" in task
+    assert "A successful write result is not a readback" in task
+    assert "the next action must be a read of that same file" in task
     assert f"finish with exactly {PASS_MARKER}" in task
 
     for index, stage_name in enumerate(expected["stage_names"]):

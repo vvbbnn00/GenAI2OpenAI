@@ -358,6 +358,10 @@ again. Then write COMPLETE.txt containing only {PASS_MARKER}, read COMPLETE.txt
 back, and finish with exactly {PASS_MARKER}. The final assistant message is
 checked by exact string equality: do not add Markdown, a table, an explanation,
 punctuation, a prefix, or a suffix.
+
+A successful write result is not a readback and does not verify file contents.
+Immediately after each write, the next action must be a read of that same file.
+Do not finish from memory of the value passed to write.
 """,
         encoding="utf-8",
     )
