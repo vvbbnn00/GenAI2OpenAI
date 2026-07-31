@@ -1,9 +1,12 @@
+import base64
+import io
 import logging
 import signal
 import time
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 import genai_proxy.upstream.transport as upstream_transport
 from genai_proxy.upstream.transport import (
@@ -14,13 +17,99 @@ from genai_proxy.upstream.transport import (
 from tests.live import allowed_models as live_models
 from tests.live.allowed_models import (
     ALLOWED_MODELS,
+    VISION_IMAGE_SIZE,
+    VISION_RGB,
     LiveCaseTimeout,
     LiveTransportAudit,
     _deepseek_max_prefixes,
     assert_optional_responses_reasoning_preserved,
+    assert_red_vision_result,
     live_case_deadline,
     quiet_integration_logger,
+    red_image_url,
 )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Red",
+        "The dominant color is crimson.",
+        "scarlet",
+        "#ff0000",
+        "RGB(255, 0, 0)",
+        "rgba(255, 0, 0, 1.0)",
+        "It is red, not green.",
+    ),
+)
+def test_live_vision_result_accepts_unambiguous_red_answers(text):
+    assert_red_vision_result(
+        text,
+        {"input_tokens": 10, "output_tokens": 2},
+        input_token_key="input_tokens",
+        output_token_key="output_tokens",
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_error"),
+    (
+        ("", "has no final text"),
+        ("green", "did not identify red"),
+        ("pink", "did not identify red"),
+        ("The image is not red.", "negative or uncertain"),
+        ("It is not #ff0000.", "negative or uncertain"),
+        ("It is not RGB(255, 0, 0).", "negative or uncertain"),
+        ("I cannot tell whether it is red.", "negative or uncertain"),
+    ),
+)
+def test_live_vision_result_rejects_empty_wrong_or_uncertain_answers(
+    text,
+    expected_error,
+):
+    with pytest.raises(AssertionError, match=expected_error):
+        assert_red_vision_result(
+            text,
+            {"input_tokens": 10, "output_tokens": 2},
+            input_token_key="input_tokens",
+            output_token_key="output_tokens",
+        )
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected_error"),
+    (
+        ({"input_tokens": 0, "output_tokens": 2}, "invalid input token usage"),
+        ({"input_tokens": 10, "output_tokens": 0}, "invalid output token usage"),
+        ({"input_tokens": "10", "output_tokens": 2}, "invalid input token usage"),
+        ({"input_tokens": 10, "output_tokens": True}, "invalid output token usage"),
+    ),
+)
+def test_live_vision_result_rejects_invalid_usage_without_leaking_other_fields(
+    usage,
+    expected_error,
+):
+    usage = {**usage, "secret": "must-not-leak"}
+
+    with pytest.raises(AssertionError, match=expected_error) as exc_info:
+        assert_red_vision_result(
+            "red",
+            usage,
+            input_token_key="input_tokens",
+            output_token_key="output_tokens",
+        )
+
+    assert "must-not-leak" not in str(exc_info.value)
+
+
+def test_live_red_image_uses_a_standard_size_and_exact_rgb_value():
+    prefix, encoded = red_image_url().split(",", 1)
+
+    assert prefix == "data:image/png;base64"
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+        assert image.mode == "RGB"
+        assert image.size == VISION_IMAGE_SIZE
+        assert image.getextrema() == tuple((value, value) for value in VISION_RGB)
 
 
 def test_live_model_matrix_covers_protocols_capabilities_and_continuations():
@@ -158,8 +247,84 @@ def test_live_audit_records_sanitized_transport_metadata():
             "thinking_present": True,
             "thinking": True,
             "has_max_prefix": True,
+            "image_count": 0,
+            "image_url_present": False,
+            "image_urls_present": False,
+            "image_width": None,
+            "image_height": None,
         }
     ]
+
+
+@pytest.mark.parametrize("model", ("qwen-instruct", "kimi-k3"))
+def test_live_audit_records_only_safe_image_metadata(model):
+    upstream = object()
+    audit = LiveTransportAudit()
+    audit._original_post = lambda *_args, **_kwargs: upstream
+    checkpoint = audit.checkpoint()
+    secret_image = "data:image/png;base64,MUST_NOT_BE_RECORDED"
+    payload = {
+        "aiType": model,
+        "chatInfo": "identify the image" if model == "kimi-k3" else "",
+        "messages": [],
+        "stream": True,
+    }
+    if model == "kimi-k3":
+        payload.update(
+            {
+                "imageUrl": secret_image,
+                "imageUrls": [secret_image],
+                "width": VISION_IMAGE_SIZE[0],
+                "height": VISION_IMAGE_SIZE[1],
+            }
+        )
+    else:
+        payload["messages"] = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": secret_image},
+                    }
+                ],
+            }
+        ]
+
+    assert audit._post(GENAI_URL, json=payload) is upstream
+    audit.assert_vision_transport(model, checkpoint)
+
+    observations = audit.chat_requests_since(checkpoint)
+    assert "MUST_NOT_BE_RECORDED" not in repr(observations)
+    assert observations[0]["image_count"] == 1
+    if model == "kimi-k3":
+        assert (
+            observations[0]["image_width"],
+            observations[0]["image_height"],
+        ) == VISION_IMAGE_SIZE
+
+
+def test_live_audit_rejects_empty_kimi_image_fields():
+    audit = LiveTransportAudit()
+    audit._original_post = lambda *_args, **_kwargs: object()
+    checkpoint = audit.checkpoint()
+
+    audit._post(
+        GENAI_URL,
+        json={
+            "aiType": "kimi-k3",
+            "chatInfo": "identify the image",
+            "messages": [],
+            "stream": True,
+            "imageUrl": "",
+            "imageUrls": [None],
+            "width": VISION_IMAGE_SIZE[0],
+            "height": VISION_IMAGE_SIZE[1],
+        },
+    )
+
+    with pytest.raises(AssertionError, match="exactly one image"):
+        audit.assert_vision_transport("kimi-k3", checkpoint)
 
 
 def test_live_audit_installs_and_restores_request_wrappers():

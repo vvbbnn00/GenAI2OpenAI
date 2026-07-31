@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import math
+import re
 import signal
 import sys
 import threading
@@ -41,6 +42,8 @@ REASONING_STREAM_MODELS = {
 }
 VISION_MODELS = {"qwen-instruct", "kimi-k3"}
 DEEPSEEK_MODELS = {"deepseek-chat", "deepseek-pro"}
+VISION_IMAGE_SIZE = (224, 224)
+VISION_RGB = (255, 0, 0)
 CITIES = (
     "Shanghai",
     "Beijing",
@@ -228,6 +231,29 @@ class LiveTransportAudit:
                 "non-Kimi request unexpectedly touched Kimi history endpoints"
             )
 
+    def assert_vision_transport(self, model, checkpoint):
+        observations = self.chat_requests_since(checkpoint)
+        assert observations, "vision request did not reach the upstream chat endpoint"
+        assert all(
+            observation["model"].casefold() == model.casefold()
+            for observation in observations
+        ), f"vision request reached the wrong upstream model: {observations}"
+        assert all(observation["image_count"] == 1 for observation in observations), (
+            "vision request did not carry exactly one image: "
+            f"{observations}"
+        )
+        if model.casefold() == "kimi-k3":
+            assert all(
+                observation["image_url_present"]
+                and observation["image_urls_present"]
+                and (
+                    observation["image_width"],
+                    observation["image_height"],
+                )
+                == VISION_IMAGE_SIZE
+                for observation in observations
+            ), f"Kimi vision transport fields are incomplete: {observations}"
+
     def summary(self):
         with self._lock:
             return {
@@ -271,6 +297,7 @@ class LiveTransportAudit:
                 "thinking_present": "thinking" in payload,
                 "thinking": payload.get("thinking"),
                 "has_max_prefix": has_max_prefix,
+                **_safe_image_transport_metadata(payload, messages),
             }
             with self._lock:
                 self._chat_requests.append(observation)
@@ -287,6 +314,69 @@ class LiveTransportAudit:
                 with self._lock:
                     self._successful_history_deletes += 1
         return response
+
+
+def _safe_image_transport_metadata(payload, messages):
+    image_urls = payload.get("imageUrls")
+    image_url_present = _has_nonempty_image_source(payload.get("imageUrl"))
+    image_urls_present = (
+        isinstance(image_urls, list)
+        and bool(image_urls)
+        and all(_has_nonempty_image_source(item) for item in image_urls)
+    )
+    image_url_count = (
+        sum(_has_nonempty_image_source(item) for item in image_urls)
+        if isinstance(image_urls, list)
+        else 0
+    )
+    if not image_url_count and image_url_present:
+        image_url_count = 1
+
+    message_image_count = 0
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            message_image_count += sum(
+                1
+                for part in content
+                if isinstance(part, dict)
+                and part.get("type") in {"image", "image_url"}
+                and _has_nonempty_message_image(part)
+            )
+
+    width = payload.get("width")
+    height = payload.get("height")
+    return {
+        "image_count": image_url_count + message_image_count,
+        "image_url_present": image_url_present,
+        "image_urls_present": image_urls_present,
+        "image_width": (
+            width if isinstance(width, int) and not isinstance(width, bool) else None
+        ),
+        "image_height": (
+            height
+            if isinstance(height, int) and not isinstance(height, bool)
+            else None
+        ),
+    }
+
+
+def _has_nonempty_message_image(part):
+    part_type = part.get("type")
+    source = part.get(part_type)
+    if source is None and part_type == "image":
+        source = part.get("url")
+    return _has_nonempty_image_source(source)
+
+
+def _has_nonempty_image_source(source):
+    if isinstance(source, dict):
+        source = source.get("url", source.get("data"))
+    return isinstance(source, str) and bool(source)
 
 
 def _successful_genai_response(response):
@@ -952,6 +1042,8 @@ def test_deepseek_thinking_modes(client, model, iteration):
 
 
 def test_openai_vision(client, model, iteration):
+    audit = client.application.extensions["live_transport_audit"]
+    checkpoint = audit.checkpoint()
     image_url = red_image_url()
     data = post_json(
         client,
@@ -981,13 +1073,18 @@ def test_openai_vision(client, model, iteration):
     )
 
     message = data["choices"][0]["message"]
-    assert "red" in (message.get("content") or "").lower()
-    usage = data.get("usage") or {}
-    assert usage.get("prompt_tokens", 0) > 0
-    assert usage.get("completion_tokens", 0) > 0
+    audit.assert_vision_transport(model, checkpoint)
+    assert_red_vision_result(
+        message.get("content"),
+        data.get("usage"),
+        input_token_key="prompt_tokens",
+        output_token_key="completion_tokens",
+    )
 
 
 def test_responses_vision(client, model, iteration):
+    audit = client.application.extensions["live_transport_audit"]
+    checkpoint = audit.checkpoint()
     data = post_json(
         client,
         "/v1/responses",
@@ -1016,9 +1113,13 @@ def test_responses_vision(client, model, iteration):
         },
     )
 
-    assert "red" in (data.get("output_text") or "").lower()
-    assert (data.get("usage") or {}).get("input_tokens", 0) > 0
-    assert (data.get("usage") or {}).get("output_tokens", 0) > 0
+    audit.assert_vision_transport(model, checkpoint)
+    assert_red_vision_result(
+        data.get("output_text"),
+        data.get("usage"),
+        input_token_key="input_tokens",
+        output_token_key="output_tokens",
+    )
 
 
 def test_nonvisual_vision_rejection(client, model, iteration):
@@ -1247,6 +1348,8 @@ def test_responses_multiturn_tool_call(client, model, iteration):
 
 
 def test_claude_vision(client, model, iteration):
+    audit = client.application.extensions["live_transport_audit"]
+    checkpoint = audit.checkpoint()
     image_url = red_image_url()
     data = post_json(
         client,
@@ -1284,9 +1387,13 @@ def test_claude_vision(client, model, iteration):
         for block in data.get("content", [])
         if block.get("type") == "text"
     )
-    assert "red" in text.lower()
-    assert (data.get("usage") or {}).get("input_tokens", 0) > 0
-    assert (data.get("usage") or {}).get("output_tokens", 0) > 0
+    audit.assert_vision_transport(model, checkpoint)
+    assert_red_vision_result(
+        text,
+        data.get("usage"),
+        input_token_key="input_tokens",
+        output_token_key="output_tokens",
+    )
 
 
 def test_claude_text(client, model, iteration):
@@ -1466,10 +1573,62 @@ def bash_prompt(iteration):
 
 def red_image_url():
     buffer = io.BytesIO()
-    Image.new("RGB", (56, 28), (255, 0, 0)).save(buffer, format="PNG")
+    Image.new("RGB", VISION_IMAGE_SIZE, VISION_RGB).save(buffer, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode(
         "ascii"
     )
+
+
+_RED_VISION_SOURCE = (
+    r"(?:\b(?:red|crimson|scarlet)\b|#(?:ff0000|f00)\b|"
+    r"\brgba?\s*\(\s*255\s*,\s*0\s*,\s*0"
+    r"(?:\s*,\s*1(?:\.0+)?)?\s*\))"
+)
+_RED_VISION_PATTERN = re.compile(_RED_VISION_SOURCE, re.IGNORECASE)
+_NON_AFFIRMATIVE_RED_PATTERN = re.compile(
+    r"\b(?:cannot|can't|unable|unclear|unknown|uncertain)\b|"
+    r"\b(?:(?:is|looks|appears|seems)\s+not|isn't|isnt|not|no)\s+"
+    r"(?:(?:predominantly|mainly|mostly|primarily|really)\s+)?"
+    + _RED_VISION_SOURCE,
+    re.IGNORECASE,
+)
+
+
+def assert_red_vision_result(
+    text,
+    usage,
+    *,
+    input_token_key,
+    output_token_key,
+):
+    safe_text = text if isinstance(text, str) else ""
+    safe_usage = usage if isinstance(usage, dict) else {}
+    summary = (
+        f"text={safe_text[:160]!r} "
+        f"usage={{'{input_token_key}': {safe_usage.get(input_token_key)!r}, "
+        f"'{output_token_key}': {safe_usage.get(output_token_key)!r}}}"
+    )
+
+    assert safe_text.strip(), f"vision response has no final text: {summary}"
+    assert not _NON_AFFIRMATIVE_RED_PATTERN.search(safe_text), (
+        f"vision response is negative or uncertain: {summary}"
+    )
+    assert _RED_VISION_PATTERN.search(safe_text), (
+        f"vision response did not identify red: {summary}"
+    )
+
+    input_tokens = safe_usage.get(input_token_key)
+    output_tokens = safe_usage.get(output_token_key)
+    assert (
+        isinstance(input_tokens, int)
+        and not isinstance(input_tokens, bool)
+        and input_tokens > 0
+    ), f"vision response has invalid input token usage: {summary}"
+    assert (
+        isinstance(output_tokens, int)
+        and not isinstance(output_tokens, bool)
+        and output_tokens > 0
+    ), f"vision response has invalid output token usage: {summary}"
 
 
 def city_for(iteration):
