@@ -55,7 +55,7 @@ class FakeStreamResponse:
         self.events = events
         self.closed = False
 
-    def iter_lines(self):
+    def iter_lines(self, *args, **kwargs):
         for event in self.events:
             yield json.dumps(event).encode()
 

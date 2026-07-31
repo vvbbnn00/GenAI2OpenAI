@@ -91,7 +91,7 @@ class FakeResponse:
     def __init__(self, lines):
         self._lines = lines
 
-    def iter_lines(self):
+    def iter_lines(self, *args, **kwargs):
         for line in self._lines:
             yield line.encode("utf-8")
 
@@ -177,11 +177,29 @@ def test_responses_text_stream_emits_codex_events_and_reasoning_delta():
 
     assert [event["event"] for event in events][:4] == [
         "response.created",
-        "response.reasoning_text.delta",
         "response.output_item.added",
-        "response.output_text.delta",
+        "response.content_part.added",
+        "response.reasoning_text.delta",
     ]
-    assert events[2]["data"]["item"]["type"] == "message"
+    reasoning_added = events[1]["data"]
+    reasoning_part = events[2]["data"]
+    reasoning_delta = events[3]["data"]
+    assert reasoning_added["item"]["type"] == "reasoning"
+    assert reasoning_added["output_index"] == 0
+    assert reasoning_part["item_id"] == reasoning_added["item"]["id"]
+    assert reasoning_delta["item_id"] == reasoning_added["item"]["id"]
+    assert reasoning_delta["output_index"] == 0
+    assert reasoning_delta["content_index"] == 0
+    assert reasoning_delta["delta"] == "thinking"
+    assert [event["data"]["sequence_number"] for event in events] == list(
+        range(len(events))
+    )
+    reasoning_items = [
+        item for item in output_items(events) if item["type"] == "reasoning"
+    ]
+    assert reasoning_items[-1]["content"] == [
+        {"type": "reasoning_text", "text": "thinking"}
+    ]
     assert any(
         event["event"] == "response.output_text.delta"
         and event["data"]["delta"] == " world"
@@ -189,14 +207,51 @@ def test_responses_text_stream_emits_codex_events_and_reasoning_delta():
     )
     message_items = [item for item in output_items(events) if item["type"] == "message"]
     assert message_items[-1]["content"] == [
-        {"type": "output_text", "text": "Hello world"}
+        {
+            "type": "output_text",
+            "text": "Hello world",
+            "annotations": [],
+        }
     ]
     assert completed_event(events)["end_turn"] is True
     assert captured[0]["messages"][0] == {
         "role": "system",
-        "content": "You are Codex.\n\nReasoning Effort: High",
+        "content": "You are Codex.",
     }
     assert captured[0]["messages"][1] == {"role": "user", "content": "Say hello."}
+
+
+def test_responses_created_event_precedes_prompt_token_counting():
+    service, _captured, fake_post = make_service(
+        [
+            genai_sse({"reasoning_content": "thinking"}),
+            genai_sse({"content": "Hello"}),
+            genai_sse({}, "stop"),
+        ]
+    )
+    request = {
+        "model": "chatglm",
+        "input": "Hello",
+        "stream": True,
+    }
+
+    with (
+        patch("genai_proxy.services.genai.requests.post", fake_post),
+        patch(
+            "genai_proxy.services.genai.count_openai_request_tokens",
+            return_value=7,
+        ) as count_tokens,
+    ):
+        stream = service.stream_responses(request)
+        first_event = parse_response_events([next(stream)])
+        count_tokens.assert_not_called()
+        remaining_events = parse_response_events(stream)
+
+    assert first_event[0]["event"] == "response.created"
+    assert any(
+        event["event"] == "response.reasoning_text.delta" for event in remaining_events
+    )
+    count_tokens.assert_called_once()
 
 
 def test_responses_input_accepts_easy_message_without_type():
@@ -255,7 +310,7 @@ def test_responses_input_image_is_preserved_as_openai_vision_content():
     ]
 
 
-def test_responses_image_preservation_is_scoped_to_kimi_k3():
+def test_responses_image_preservation_is_scoped_to_visual_models():
     context = convert_responses_to_openai_request(
         {
             "model": "GPT-4.1",
@@ -277,6 +332,40 @@ def test_responses_image_preservation_is_scoped_to_kimi_k3():
         {
             "role": "user",
             "content": "[image: https://example.test/image.png]",
+        }
+    ]
+
+
+def test_responses_qwen_image_is_preserved_for_official_visual_template():
+    image_url = "https://example.test/image.png"
+    context = convert_responses_to_openai_request(
+        {
+            "model": "qwen-instruct",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Describe this image."},
+                        {
+                            "type": "input_image",
+                            "image_url": image_url,
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert context.openai_request["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this image."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                },
+            ],
         }
     ]
 
@@ -405,6 +494,12 @@ def test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item()
     function_items = [
         item for item in output_items(events) if item["type"] == "function_call"
     ]
+    function_added = next(
+        event["data"]["item"]
+        for event in events
+        if event["event"] == "response.output_item.added"
+        and event["data"]["item"].get("type") == "function_call"
+    )
     reasoning_events = [
         event for event in events if event["event"] == "response.reasoning_text.delta"
     ]
@@ -412,8 +507,15 @@ def test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item()
     assert reasoning_events[0]["data"]["delta"] == "I should call weather."
     assert function_items
     assert function_items[0]["name"] == "get_weather"
+    assert function_items[0]["id"].startswith("fc_")
+    assert function_items[0]["status"] == "completed"
     assert json.loads(function_items[0]["arguments"]) == {"location": "Shanghai"}
     assert function_items[0]["call_id"].startswith("call_")
+    assert function_added == {
+        **function_items[0],
+        "arguments": "",
+        "status": "in_progress",
+    }
     assert completed_event(events)["end_turn"] is False
     function_done_index = next(
         index
@@ -423,7 +525,8 @@ def test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item()
     )
     assert events.index(reasoning_events[0]) < function_done_index
     prompt = captured[0]["messages"][0]["content"]
-    assert prompt.startswith("Reasoning Effort: High\n\n# Tools\n\n")
+    assert prompt.startswith("\n# Tools\n\n")
+    assert "Reasoning Effort:" not in prompt
     assert '"name": "get_weather"' in prompt
 
 
@@ -479,15 +582,26 @@ def test_responses_function_call_output_turn_returns_final_message():
 
     message_items = [item for item in output_items(events) if item["type"] == "message"]
     assert message_items[-1]["content"] == [
-        {"type": "output_text", "text": "Shanghai is sunny."}
+        {
+            "type": "output_text",
+            "text": "Shanghai is sunny.",
+            "annotations": [],
+        }
     ]
     assert completed_event(events)["end_turn"] is True
     assert (
         "This turn must end with final assistant text only"
         not in captured[0]["messages"][0]["content"]
     )
-    assert captured[0]["messages"][-1]["content"].startswith("<|observation|>")
-    assert "Return the final answer only" not in captured[0]["messages"][-1]["content"]
+    assert captured[0]["messages"][-1] == {
+        "role": "tool",
+        "tool_call_id": "call_weather",
+        "content": "Shanghai is sunny.",
+    }
+    assert captured[0]["messages"][-2]["role"] == "assistant"
+    assert captured[0]["messages"][-2]["tool_calls"][0]["function"]["name"] == (
+        "get_weather"
+    )
 
 
 def test_responses_kimi_function_output_keeps_tools_available_by_default():
@@ -524,9 +638,7 @@ def test_responses_kimi_function_output_keeps_tools_available_by_default():
     )
     assert prepared.has_tools
     assert prepared.tool_choice == "auto"
-    assert prepared.messages[-2]["content"].startswith(
-        "# Client response protocol\n"
-    )
+    assert prepared.messages[-2]["content"].startswith("# Client response protocol\n")
     assert prepared.messages[-1]["role"] == "user"
     assert prepared.messages[-1]["content"].startswith(
         "Completed client action result: "
@@ -589,9 +701,17 @@ def test_responses_custom_apply_patch_tool_becomes_custom_tool_call_with_input_d
     custom_items = [
         item for item in output_items(events) if item["type"] == "custom_tool_call"
     ]
+    custom_added = next(
+        event["data"]["item"]
+        for event in events
+        if event["event"] == "response.output_item.added"
+        and event["data"]["item"].get("type") == "custom_tool_call"
+    )
     assert custom_items
+    assert custom_items[0]["id"].startswith("ctc_")
     assert custom_items[0]["name"] == "apply_patch"
     assert custom_items[0]["input"].startswith("*** Begin Patch")
+    assert custom_added == {**custom_items[0], "input": ""}
 
 
 def test_responses_namespace_tool_flattens_for_model_and_restores_namespace():
@@ -738,13 +858,18 @@ def test_responses_ignores_hosted_tools_codex_may_send_by_default():
 
     message_items = [item for item in output_items(events) if item["type"] == "message"]
     assert message_items[-1]["content"] == [
-        {"type": "output_text", "text": "No search needed."}
+        {
+            "type": "output_text",
+            "text": "No search needed.",
+            "annotations": [],
+        }
     ]
     assert "web_search" not in json.dumps(captured[0]["messages"], ensure_ascii=False)
 
 
 if __name__ == "__main__":
     test_responses_text_stream_emits_codex_events_and_reasoning_delta()
+    test_responses_created_event_precedes_prompt_token_counting()
     test_responses_input_accepts_easy_message_without_type()
     test_responses_local_shell_call_preserves_command_argv()
     test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item()

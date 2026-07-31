@@ -12,10 +12,10 @@ from genai_proxy.optimizations import (
     GLM_ADAPTER,
     KIMI_K3_ADAPTER,
     MINIMAX_ADAPTER,
+    QWEN_3_5_ADAPTER,
     select_tool_adapter,
 )
 from genai_proxy.optimizations.deepseek import (
-    DEEPSEEK_V4_REASONING_EFFORT_MAX,
     inject_deepseek_reasoning_prompt,
     inject_deepseek_tool_prompt,
 )
@@ -26,8 +26,15 @@ from genai_proxy.optimizations.kimi import (
     kimi_tool_retry_messages,
 )
 from genai_proxy.optimizations.minimax import inject_minimax_tool_prompt
+from genai_proxy.optimizations.qwen import inject_qwen35_tool_prompt
 from genai_proxy.reasoning import normalize_reasoning_for_adapter
 from genai_proxy.services.genai import _tool_start_tags_for_request
+from genai_proxy.token_usage import official_reasoning_prefix_for_adapter
+
+DEEPSEEK_V4_REASONING_EFFORT_MAX = official_reasoning_prefix_for_adapter(
+    DEEPSEEK_V4_PRO_ADAPTER,
+    "max",
+)
 
 WEATHER_TOOL = {
     "type": "function",
@@ -280,6 +287,17 @@ def test_genai_model_record_mapping():
     )
     assert (
         select_tool_adapter(
+            "qwen-instruct",
+            {
+                "aiName": "Qwen-3.5",
+                "simpleName": "Qwen3.5-397-A17B",
+                "rootModelName": "Xinference",
+            },
+        )
+        == QWEN_3_5_ADAPTER
+    )
+    assert (
+        select_tool_adapter(
             "kimi-k3",
             {"aiName": "Kimi-K3", "rootModelName": "Azure"},
         )
@@ -344,11 +362,7 @@ def test_kimi_official_xtml_rejects_partial_or_mistyped_calls():
     ]
 
     for invalid_call in invalid_calls:
-        content = (
-            "<|open|>tools<|sep|>"
-            f"{valid_call}{invalid_call}"
-            "<|close|>tools<|sep|>"
-        )
+        content = f"<|open|>tools<|sep|>{valid_call}{invalid_call}<|close|>tools<|sep|>"
         tool_calls, remaining = extract_tool_calls(
             content,
             tools=[SEARCH_TOOL],
@@ -359,10 +373,7 @@ def test_kimi_official_xtml_rejects_partial_or_mistyped_calls():
         assert remaining == content
 
     content = (
-        "<|open|>tools<|sep|>"
-        f"{valid_call}"
-        "<|close|>tools<|sep|>"
-        "<|open|>tools<|sep|>"
+        f"<|open|>tools<|sep|>{valid_call}<|close|>tools<|sep|><|open|>tools<|sep|>"
     )
     tool_calls, remaining = extract_tool_calls(
         content,
@@ -390,9 +401,7 @@ def test_kimi_nonofficial_function_expression_is_not_recovered():
 def test_kimi_active_tools_use_plain_response_action_bridge():
     messages = [{"role": "user", "content": "Search for Kimi K3."}]
 
-    bridged = inject_kimi_tool_prompt(
-        messages, [SEARCH_TOOL], tool_choice="required"
-    )
+    bridged = inject_kimi_tool_prompt(messages, [SEARCH_TOOL], tool_choice="required")
 
     assert bridged[-1] == messages[-1]
     prompt = bridged[-2]["content"]
@@ -464,28 +473,28 @@ def test_kimi_tool_protocol_stays_near_current_turn_in_long_history():
     assert bridged[-2]["content"].startswith("# Client response protocol\n")
     assert bridged[-1] == messages[-1]
     assert len(system_messages) == 3
-    assert sum(
-        str(message.get("content", "")).startswith(
-            "Completed client action result: "
+    assert (
+        sum(
+            str(message.get("content", "")).startswith(
+                "Completed client action result: "
+            )
+            for message in bridged
         )
-        for message in bridged
-    ) == 12
+        == 12
+    )
     assistant_messages = [
         message for message in bridged if message.get("role") == "assistant"
     ]
     assert assistant_messages == []
     assistant_text = "\n".join(
-        str(message.get("content", ""))
-        for message in assistant_messages
+        str(message.get("content", "")) for message in assistant_messages
     )
     assert "<k3_call>" not in assistant_text
     assert not any("reasoning_content" in message for message in assistant_messages)
     state_messages = [
         message
         for message in system_messages
-        if str(message.get("content", "")).startswith(
-            "# Prior continuation state\n"
-        )
+        if str(message.get("content", "")).startswith("# Prior continuation state\n")
     ]
     assert len(state_messages) == 1
     assert "<k3_state>" in state_messages[0]["content"]
@@ -542,8 +551,7 @@ def test_kimi_large_parallel_tool_history_keeps_one_continuation_state():
     ]
     assert assistant_messages == []
     assistant_text = "\n".join(
-        str(message.get("content", ""))
-        for message in assistant_messages
+        str(message.get("content", "")) for message in assistant_messages
     )
     user_text = "\n".join(
         str(message.get("content", ""))
@@ -557,9 +565,7 @@ def test_kimi_large_parallel_tool_history_keeps_one_continuation_state():
     state_messages = [
         message
         for message in bridged
-        if str(message.get("content", "")).startswith(
-            "# Prior continuation state\n"
-        )
+        if str(message.get("content", "")).startswith("# Prior continuation state\n")
     ]
     assert len(state_messages) == 1
     assert "STATE_63:" in state_messages[0]["content"]
@@ -568,9 +574,7 @@ def test_kimi_large_parallel_tool_history_keeps_one_continuation_state():
     assert '"id":"call_63_0"' in user_text
     assert '"id":"call_63_1"' in user_text
     assert bridged[-2]["content"].startswith("# Client response protocol")
-    assert bridged[-1]["content"].startswith(
-        "Completed client action result: "
-    )
+    assert bridged[-1]["content"].startswith("Completed client action result: ")
 
 
 def test_kimi_blank_turn_preserves_result_and_uses_generic_bridge():
@@ -607,13 +611,16 @@ def test_kimi_blank_turn_preserves_result_and_uses_generic_bridge():
         'Completed client action result: {"id":"call_search","name":"search",'
         '"arguments":{"query":"stage one"},"content":"Stage one complete."}'
     )
-    assert sum(
-        str(message.get("content", "")).startswith(
-            "Completed client action result: "
+    assert (
+        sum(
+            str(message.get("content", "")).startswith(
+                "Completed client action result: "
+            )
+            for message in bridged
+            if message.get("role") == "user"
         )
-        for message in bridged
-        if message.get("role") == "user"
-    ) == 1
+        == 1
+    )
 
 
 def test_kimi_bridge_drops_all_historical_reasoning_and_empty_assistant_turns():
@@ -655,8 +662,7 @@ def test_kimi_bridge_drops_all_historical_reasoning_and_empty_assistant_turns():
         {"role": "assistant", "content": "I will inspect it in stages."}
     ]
     assert not any(
-        "reasoning_content" in message or "reasoning" in message
-        for message in bridged
+        "reasoning_content" in message or "reasoning" in message for message in bridged
     )
     encoded = json.dumps(bridged, ensure_ascii=False)
     assert "OLD_PRIVATE_REASONING" not in encoded
@@ -735,8 +741,7 @@ def test_kimi_tool_choice_none_does_not_inject_or_reject():
     messages = [{"role": "user", "content": "Answer directly."}]
 
     assert (
-        inject_kimi_tool_prompt(messages, [SEARCH_TOOL], tool_choice="none")
-        == messages
+        inject_kimi_tool_prompt(messages, [SEARCH_TOOL], tool_choice="none") == messages
     )
 
 
@@ -780,10 +785,7 @@ def test_kimi_external_operation_bridge_output_is_recovered():
 def test_kimi_required_action_recovers_exact_bare_json():
     cases = [
         (
-            (
-                '{"name":"search","arguments":'
-                '{"query":"Kimi K3","num_results":3}}'
-            ),
+            ('{"name":"search","arguments":{"query":"Kimi K3","num_results":3}}'),
             None,
         ),
         (
@@ -815,10 +817,7 @@ def test_kimi_required_action_recovers_exact_bare_json():
 
 
 def test_kimi_auto_does_not_treat_plain_json_answer_as_an_action():
-    content = (
-        '{"name":"search","arguments":'
-        '{"query":"Kimi K3","num_results":3}}'
-    )
+    content = '{"name":"search","arguments":{"query":"Kimi K3","num_results":3}}'
 
     tool_calls, remaining = extract_tool_calls(
         content,
@@ -837,10 +836,7 @@ def test_kimi_external_operation_bridge_rejects_unknown_or_invalid_calls():
         '<k3_action>{"name":"unknown","arguments":{}}</k3_action>',
         '<k3_action>{"name":"search","arguments":[]}</k3_action>',
         '<k3_action>{"name":"search","arguments":bad}</k3_action>',
-        (
-            '<k3_action>{"name":"search","arguments":{},'
-            '"extra":true}</k3_action>'
-        ),
+        ('<k3_action>{"name":"search","arguments":{},"extra":true}</k3_action>'),
         (
             '<k3_action>{"name":"search","arguments":{"query":"ok"}}</k3_action>'
             '<k3_action>{"name":"search","arguments":[]}</k3_action>'
@@ -910,16 +906,12 @@ def test_kimi_tool_history_is_serialized_outside_native_tool_fields():
 
     assert all(message.get("role") != "tool" for message in bridged)
     assert all(not message.get("tool_calls") for message in bridged)
-    assert not any(
-        message.get("role") == "assistant" for message in bridged
-    )
+    assert not any(message.get("role") == "assistant" for message in bridged)
     result = bridged[-1]
     state = next(
         message
         for message in bridged
-        if str(message.get("content", "")).startswith(
-            "# Prior continuation state\n"
-        )
+        if str(message.get("content", "")).startswith("# Prior continuation state\n")
     )
     assert "Search first, then inspect the selected result." in state["content"]
     assert "<k3_state>" in state["content"]
@@ -964,28 +956,20 @@ def test_kimi_tool_choice_none_history_omits_operation_schemas():
         for message in bridged
     )
     assert all(
-        "<k3_action>" not in str(message.get("content", ""))
-        for message in bridged
+        "<k3_action>" not in str(message.get("content", "")) for message in bridged
     )
     assert all(
-        "<k3_result>" not in str(message.get("content", ""))
-        for message in bridged
+        "<k3_result>" not in str(message.get("content", "")) for message in bridged
     )
-    assert not any(
-        message.get("role") == "assistant" for message in bridged
-    )
+    assert not any(message.get("role") == "assistant" for message in bridged)
     state = next(
         message
         for message in bridged
-        if str(message.get("content", "")).startswith(
-            "# Prior continuation state\n"
-        )
+        if str(message.get("content", "")).startswith("# Prior continuation state\n")
     )
     assert "The search is complete; summarize its result." in state["content"]
     assert bridged[-1]["role"] == "user"
-    assert bridged[-1]["content"].startswith(
-        "Completed client action result: "
-    )
+    assert bridged[-1]["content"].startswith("Completed client action result: ")
 
 
 def test_kimi_reasoning_effort_uses_upstream_default_max():
@@ -1820,7 +1804,7 @@ def test_streaming_detection_keeps_claude_code_tool_name_prefix():
     assert max(tag_prefix_len("Bash ", tag) for tag in tags) == len("Bash ")
 
 
-def test_tool_result_turn_allows_additional_tools_by_default():
+def test_tool_result_turn_preserves_structured_official_history():
     messages = [
         {"role": "user", "content": "Use get_weather for Shanghai."},
         {
@@ -1845,23 +1829,19 @@ def test_tool_result_turn_allows_additional_tools_by_default():
     ]
 
     minimax_messages = inject_minimax_tool_prompt(messages, [WEATHER_TOOL])
-    assert minimax_messages[-1]["content"].startswith(
-        "<response>Shanghai is sunny.</response>"
-    )
-    assert (
-        "Only call another tool if the current result is genuinely insufficient"
-        in minimax_messages[-1]["content"]
-    )
+    assert minimax_messages[-1] == messages[-1]
+    assert minimax_messages[-2] == messages[-2]
 
     deepseek_messages = inject_deepseek_tool_prompt(
         messages,
         [WEATHER_TOOL],
         adapter=DEEPSEEK_V4_FLASH_ADAPTER,
     )
-    assert (
-        deepseek_messages[-1]["content"]
-        == "<tool_result>Shanghai is sunny.</tool_result>"
-    )
+    assert deepseek_messages[-1] == {
+        "role": "user",
+        "content": "<tool_result>Shanghai is sunny.</tool_result>",
+    }
+    assert "<｜DSML｜tool_calls>" in deepseek_messages[0]["content"]
 
     glm52_messages = inject_glm_tool_prompt(
         messages,
@@ -1874,7 +1854,8 @@ def test_tool_result_turn_allows_additional_tools_by_default():
         "This turn must end with final assistant text only"
         not in glm52_messages[0]["content"]
     )
-    assert "Do not call any tool again" not in glm52_messages[-1]["content"]
+    assert glm52_messages[-1] == messages[-1]
+    assert glm52_messages[-2] == messages[-2]
 
 
 def test_official_prompt_shapes_are_not_mixed_between_model_versions():
@@ -1901,7 +1882,10 @@ def test_official_prompt_shapes_are_not_mixed_between_model_versions():
     assert "### Available Tool Schemas" not in deepseek_legacy_prompt
 
     minimax_prompt = inject_minimax_tool_prompt(messages, [WEATHER_TOOL])[0]["content"]
-    assert minimax_prompt.startswith("# Tools\nYou may call one or more tools")
+    assert minimax_prompt.startswith(
+        "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax."
+        "\n\n# Tools\nYou may call one or more tools"
+    )
     assert "<minimax:tool_call>" in minimax_prompt
     assert '<tool>{"name": "get_weather"' in minimax_prompt
     assert "Rules:" not in minimax_prompt
@@ -1911,7 +1895,7 @@ def test_official_prompt_shapes_are_not_mixed_between_model_versions():
         [WEATHER_TOOL],
         adapter=GLM_5_1_ADAPTER,
     )[0]["content"]
-    assert glm51_prompt.startswith("# Tools\n\nYou may call one or more functions")
+    assert glm51_prompt.startswith("\n# Tools\n\nYou may call one or more functions")
     assert "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>" in glm51_prompt
     assert "Reasoning Effort:" not in glm51_prompt
     assert "<minimax:tool_call>" not in glm51_prompt
@@ -1922,7 +1906,8 @@ def test_official_prompt_shapes_are_not_mixed_between_model_versions():
         [WEATHER_TOOL],
         adapter=GLM_5_2_ADAPTER,
     )[0]["content"]
-    assert glm52_prompt.startswith("Reasoning Effort: Max\n\n# Tools\n\n")
+    assert glm52_prompt.startswith("\n# Tools\n\n")
+    assert "Reasoning Effort:" not in glm52_prompt
     assert "<tools>" in glm52_prompt
     assert "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>" in glm52_prompt
     assert "<|system|>" not in glm52_prompt
@@ -1931,7 +1916,7 @@ def test_official_prompt_shapes_are_not_mixed_between_model_versions():
     assert "Rules:" not in glm52_prompt
 
 
-def test_glm52_reasoning_effort_prompt_mapping():
+def test_glm52_reasoning_effort_does_not_duplicate_template_owned_prompt():
     messages = [{"role": "user", "content": "What's the weather in Beijing?"}]
 
     high_prompt = inject_glm_tool_prompt(
@@ -1940,7 +1925,8 @@ def test_glm52_reasoning_effort_prompt_mapping():
         adapter=GLM_5_2_ADAPTER,
         reasoning_config={"effort": "high"},
     )[0]["content"]
-    assert high_prompt.startswith("Reasoning Effort: High\n\n# Tools\n\n")
+    assert high_prompt.startswith("\n# Tools\n\n")
+    assert "Reasoning Effort:" not in high_prompt
 
     max_prompt = inject_glm_tool_prompt(
         messages,
@@ -1948,7 +1934,7 @@ def test_glm52_reasoning_effort_prompt_mapping():
         adapter=GLM_5_2_ADAPTER,
         reasoning_config={"effort": "max"},
     )[0]["content"]
-    assert max_prompt.startswith("Reasoning Effort: Max\n\n# Tools\n\n")
+    assert max_prompt == high_prompt
 
     other_prompt = inject_glm_tool_prompt(
         messages,
@@ -1956,7 +1942,7 @@ def test_glm52_reasoning_effort_prompt_mapping():
         adapter=GLM_5_2_ADAPTER,
         reasoning_config={"effort": "none"},
     )[0]["content"]
-    assert other_prompt.startswith("Reasoning Effort: Max\n\n# Tools\n\n")
+    assert other_prompt == high_prompt
 
 
 def test_glm52_prompt_filters_template_internal_tool_fields():
@@ -2071,7 +2057,80 @@ def test_deepseek_v4_reasoning_effort_matches_official_prefix_placement():
     assert max_messages[1] == {"role": "user", "content": "Solve this carefully."}
 
 
-def test_history_tool_calls_render_in_each_official_adapter_format():
+def test_qwen35_tool_prompt_matches_official_chat_template_shape():
+    messages = [
+        {"role": "system", "content": "Be concise."},
+        {"role": "user", "content": "What's the weather in Shanghai?"},
+    ]
+    rendered = inject_qwen35_tool_prompt(messages, [WEATHER_TOOL])
+
+    prompt = rendered[0]["content"]
+    assert prompt.startswith(
+        "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+    )
+    assert json.dumps(WEATHER_TOOL, ensure_ascii=False) in prompt
+    assert (
+        "If you choose to call a function ONLY reply in the following format "
+        "with NO suffix:" in prompt
+    )
+    assert "<function=example_function_name>" in prompt
+    assert (
+        "- Function calls MUST follow the specified format: an inner "
+        "<function=...></function> block must be nested within "
+        "<tool_call></tool_call> XML tags" in prompt
+    )
+    assert prompt.endswith("</IMPORTANT>\n\nBe concise.")
+    assert rendered[1] == messages[1]
+
+
+def test_qwen35_official_tool_call_and_history_are_round_tripped():
+    content = (
+        "Checking the tool.\n"
+        "<tool_call>\n"
+        "<function=get_weather>\n"
+        "<parameter=location>\nShanghai\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    calls, remaining = extract_tool_calls(
+        content,
+        tools=[WEATHER_TOOL],
+        model="qwen-instruct",
+        adapter=QWEN_3_5_ADAPTER,
+    )
+
+    assert remaining == "Checking the tool."
+    assert calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"location": "Shanghai"}
+
+    history = inject_qwen35_tool_prompt(
+        [
+            {"role": "user", "content": "Use the weather tool."},
+            {
+                "role": "assistant",
+                "reasoning_content": "Need current weather.",
+                "content": None,
+                "tool_calls": calls,
+            },
+            {
+                "role": "tool",
+                "tool_call_id": calls[0]["id"],
+                "content": "Sunny.",
+            },
+        ],
+        [WEATHER_TOOL],
+    )
+    assert history[2]["reasoning_content"] == "Need current weather."
+    assert history[2]["content"] is None
+    assert history[2]["tool_calls"] == calls
+    assert history[3] == {
+        "role": "tool",
+        "tool_call_id": calls[0]["id"],
+        "content": "Sunny.",
+    }
+
+
+def test_history_tool_calls_use_first_party_official_transports():
     messages = [
         {"role": "user", "content": "Use get_weather for Shanghai."},
         {
@@ -2088,6 +2147,11 @@ def test_history_tool_calls_render_in_each_official_adapter_format():
                 }
             ],
         },
+        {
+            "role": "tool",
+            "tool_call_id": "call_weather",
+            "content": "Shanghai is sunny.",
+        },
     ]
 
     deepseek_messages = inject_deepseek_tool_prompt(
@@ -2095,18 +2159,19 @@ def test_history_tool_calls_render_in_each_official_adapter_format():
         [WEATHER_TOOL],
         adapter=DEEPSEEK_V4_FLASH_ADAPTER,
     )
-    assert "<｜DSML｜tool_calls>" in deepseek_messages[-1]["content"]
-    assert "<｜DSML｜function_calls>" not in deepseek_messages[-1]["content"]
+    assert [message["role"] for message in deepseek_messages] == ["system", "user"]
+    assert "<｜DSML｜tool_calls>" in deepseek_messages[0]["content"]
+    assert deepseek_messages[1]["content"] == (
+        "<tool_result>Shanghai is sunny.</tool_result>"
+    )
 
     minimax_messages = inject_minimax_tool_prompt(messages, [WEATHER_TOOL])
-    assert "<minimax:tool_call>" in minimax_messages[-1]["content"]
-    assert '<invoke name="get_weather">' in minimax_messages[-1]["content"]
+    assert minimax_messages[-1] == messages[-1]
+    assert minimax_messages[-2] == messages[-2]
 
     glm_messages = inject_glm_tool_prompt(messages, [WEATHER_TOOL])
-    assert (
-        "<tool_call>get_weather<arg_key>location</arg_key><arg_value>Shanghai</arg_value></tool_call>"
-        in glm_messages[-1]["content"]
-    )
+    assert glm_messages[-1] == messages[-1]
+    assert glm_messages[-2] == messages[-2]
 
 
 def test_required_tool_choice_still_allows_additional_tool_calls():
@@ -2136,12 +2201,10 @@ def test_required_tool_choice_still_allows_additional_tool_calls():
     minimax_messages = inject_minimax_tool_prompt(
         messages, [WEATHER_TOOL], tool_choice=tool_choice
     )
-    assert minimax_messages[-1]["content"].startswith(
-        "<response>Shanghai is sunny.</response>"
-    )
-    assert (
-        "Only call another tool if the current result is genuinely insufficient"
-        in minimax_messages[-1]["content"]
+    assert minimax_messages[-1] == messages[-1]
+    assert 'must call the tool named "get_weather"' in minimax_messages[0]["content"]
+    assert minimax_messages[0]["content"].index("must call the tool named") < (
+        minimax_messages[0]["content"].index("# Tools")
     )
 
 
@@ -2208,12 +2271,12 @@ if __name__ == "__main__":
     test_mixed_claude_code_transcript_and_xml_tool_calls_are_recovered()
     test_deepseek_mixed_transcript_and_dsml_prefers_dsml_calls()
     test_streaming_detection_keeps_claude_code_tool_name_prefix()
-    test_tool_result_turn_allows_additional_tools_by_default()
+    test_tool_result_turn_preserves_structured_official_history()
     test_official_prompt_shapes_are_not_mixed_between_model_versions()
-    test_glm52_reasoning_effort_prompt_mapping()
+    test_glm52_reasoning_effort_does_not_duplicate_template_owned_prompt()
     test_glm52_prompt_filters_template_internal_tool_fields()
     test_deepseek_v4_prompt_matches_hf_encoding_test_shape()
     test_deepseek_v4_reasoning_effort_matches_official_prefix_placement()
-    test_history_tool_calls_render_in_each_official_adapter_format()
+    test_history_tool_calls_use_first_party_official_transports()
     test_required_tool_choice_still_allows_additional_tool_calls()
     print("tool adapter tests passed")

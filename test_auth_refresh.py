@@ -41,7 +41,9 @@ def _b64(payload: dict) -> str:
 
 
 class FakeResponse:
-    def __init__(self, payload=None, status_code=200, url="https://genai.shanghaitech.edu.cn/"):
+    def __init__(
+        self, payload=None, status_code=200, url="https://genai.shanghaitech.edu.cn/"
+    ):
         self._payload = payload if payload is not None else {}
         self.status_code = status_code
         self.url = url
@@ -57,7 +59,7 @@ class FakeStreamingResponse(FakeResponse):
         self._lines = lines
         self.closed = False
 
-    def iter_lines(self):
+    def iter_lines(self, *args, **kwargs):
         return iter(self._lines)
 
     def close(self):
@@ -131,12 +133,22 @@ class AuthRefreshTests(unittest.TestCase):
     def test_genai_auth_failure_detection_matches_current_business_errors(self):
         self.assertTrue(
             is_genai_auth_failure(
-                {"success": False, "message": "Token失效，请重新登录", "code": 500, "result": None}
+                {
+                    "success": False,
+                    "message": "Token失效，请重新登录",
+                    "code": 500,
+                    "result": None,
+                }
             )
         )
         self.assertTrue(
             is_genai_auth_failure(
-                {"success": False, "message": "鉴权失败，请重新登录", "code": 500, "result": None}
+                {
+                    "success": False,
+                    "message": "鉴权失败，请重新登录",
+                    "code": 500,
+                    "result": None,
+                }
             )
         )
         self.assertFalse(
@@ -162,7 +174,14 @@ class AuthRefreshTests(unittest.TestCase):
         token_manager = FakeTokenManager()
         manager = ModelManager(self.logger, token_manager)
         responses = [
-            FakeResponse({"success": False, "message": "Token失效，请重新登录", "code": 500, "result": None}),
+            FakeResponse(
+                {
+                    "success": False,
+                    "message": "Token失效，请重新登录",
+                    "code": 500,
+                    "result": None,
+                }
+            ),
             FakeResponse(
                 {
                     "success": True,
@@ -180,14 +199,22 @@ class AuthRefreshTests(unittest.TestCase):
             ),
         ]
 
-        with patch("genai_proxy.services.models.requests.get", side_effect=responses) as mocked_get:
+        with patch(
+            "genai_proxy.services.models.requests.get", side_effect=responses
+        ) as mocked_get:
             models = manager.list_genai_models(force_refresh=True)
 
         self.assertEqual(token_manager.refresh_count, 1)
         self.assertEqual(token_manager.rejected_token, "stale-token")
         self.assertEqual(models[0]["aiType"], "deepseek-chat")
-        self.assertEqual(mocked_get.call_args_list[0].kwargs["headers"]["X-Access-Token"], "stale-token")
-        self.assertEqual(mocked_get.call_args_list[1].kwargs["headers"]["X-Access-Token"], "fresh-token")
+        self.assertEqual(
+            mocked_get.call_args_list[0].kwargs["headers"]["X-Access-Token"],
+            "stale-token",
+        )
+        self.assertEqual(
+            mocked_get.call_args_list[1].kwargs["headers"]["X-Access-Token"],
+            "fresh-token",
+        )
 
     def test_chat_preserves_structured_upstream_error_details(self):
         service = GenAIService(
@@ -251,11 +278,18 @@ class AuthRefreshTests(unittest.TestCase):
     def test_non_stream_completion_raises_when_stream_auth_refresh_fails(self):
         token_manager = FailedRefreshTokenManager()
         service = GenAIService(self.logger, token_manager, FakeModelManager())
-        auth_failure = {"success": False, "message": "Token失效，请重新登录", "code": 500, "result": None}
+        auth_failure = {
+            "success": False,
+            "message": "Token失效，请重新登录",
+            "code": 500,
+            "result": None,
+        }
 
         with patch(
             "genai_proxy.services.genai.requests.post",
-            return_value=FakeStreamingResponse([json.dumps(auth_failure, ensure_ascii=False).encode()]),
+            return_value=FakeStreamingResponse(
+                [json.dumps(auth_failure, ensure_ascii=False).encode()]
+            ),
         ):
             with self.assertRaises(ProxyError) as raised:
                 service.build_openai_completion(
@@ -273,11 +307,18 @@ class AuthRefreshTests(unittest.TestCase):
     def test_tool_stream_raises_when_stream_auth_refresh_fails(self):
         token_manager = FailedRefreshTokenManager()
         service = GenAIService(self.logger, token_manager, FakeModelManager())
-        auth_failure = {"success": False, "message": "Token失效，请重新登录", "code": 500, "result": None}
+        auth_failure = {
+            "success": False,
+            "message": "Token失效，请重新登录",
+            "code": 500,
+            "result": None,
+        }
 
         with patch(
             "genai_proxy.services.genai.requests.post",
-            return_value=FakeStreamingResponse([json.dumps(auth_failure, ensure_ascii=False).encode()]),
+            return_value=FakeStreamingResponse(
+                [json.dumps(auth_failure, ensure_ascii=False).encode()]
+            ),
         ):
             stream = service.stream_openai_completion(
                 {
@@ -362,7 +403,9 @@ class AuthRefreshTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.error_type, "upstream_error")
         self.assertEqual(raised.exception.status, 502)
-        self.assertEqual(raised.exception.message, "Upstream error: temporary upstream failure")
+        self.assertEqual(
+            raised.exception.message, "Upstream error: temporary upstream failure"
+        )
 
     def test_stream_completion_raises_on_initial_business_error(self):
         service = GenAIService(
@@ -394,7 +437,9 @@ class AuthRefreshTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.error_type, "upstream_error")
         self.assertEqual(raised.exception.status, 502)
-        self.assertEqual(raised.exception.message, "Upstream error: temporary upstream failure")
+        self.assertEqual(
+            raised.exception.message, "Upstream error: temporary upstream failure"
+        )
 
     def test_tool_stream_raises_when_buffered_attempt_errors_after_content(self):
         service = GenAIService(
@@ -404,7 +449,9 @@ class AuthRefreshTests(unittest.TestCase):
             max_retries=0,
         )
         lines = [
-            json.dumps({"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]}).encode(),
+            json.dumps(
+                {"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]}
+            ).encode(),
             json.dumps(
                 {
                     "success": False,
@@ -445,7 +492,9 @@ class AuthRefreshTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.error_type, "upstream_error")
         self.assertEqual(raised.exception.status, 502)
-        self.assertEqual(raised.exception.message, "Upstream error: temporary upstream failure")
+        self.assertEqual(
+            raised.exception.message, "Upstream error: temporary upstream failure"
+        )
 
     def test_non_stream_empty_error_finish_uses_generic_error_message(self):
         service = GenAIService(
@@ -455,7 +504,9 @@ class AuthRefreshTests(unittest.TestCase):
             max_retries=0,
         )
         lines = [
-            json.dumps({"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]}).encode(),
+            json.dumps(
+                {"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]}
+            ).encode(),
             json.dumps({"choices": [{"delta": {}, "finish_reason": "error"}]}).encode(),
         ]
 
@@ -504,7 +555,9 @@ class AuthRefreshTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json["error"]["code"], "upstream_auth_failed")
 
-    def test_openai_stream_route_returns_500_when_first_chunk_raises_unhandled_error(self):
+    def test_openai_stream_route_returns_500_when_first_chunk_raises_unhandled_error(
+        self,
+    ):
         class FailingStreamService:
             def stream_openai_completion(self, req_data):
                 def gen():
@@ -531,7 +584,9 @@ class AuthRefreshTests(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json["error"]["code"], "internal_error")
 
-    def test_claude_stream_conversion_raises_before_message_start_when_openai_auth_fails(self):
+    def test_claude_stream_conversion_raises_before_message_start_when_openai_auth_fails(
+        self,
+    ):
         def failing_openai_stream():
             raise ProxyError(
                 "Upstream GenAI token is invalid or expired",
@@ -554,7 +609,9 @@ class AuthRefreshTests(unittest.TestCase):
         with self.assertRaises(ProxyError):
             next(stream)
 
-    def test_claude_stream_conversion_raises_before_message_start_for_openai_error_chunk(self):
+    def test_claude_stream_conversion_raises_before_message_start_for_openai_error_chunk(
+        self,
+    ):
         stream = stream_openai_to_claude(
             iter([make_error_chunk("upstream failed", "chatglm")]),
             {
@@ -571,10 +628,14 @@ class AuthRefreshTests(unittest.TestCase):
         self.assertEqual(raised.exception.status, 502)
         self.assertEqual(raised.exception.message, "upstream failed")
 
-    def test_claude_stream_conversion_emits_error_event_for_late_openai_error_chunk(self):
+    def test_claude_stream_conversion_emits_error_event_for_late_openai_error_chunk(
+        self,
+    ):
         normal_chunk = (
             "data: "
-            + json.dumps({"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]})
+            + json.dumps(
+                {"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]}
+            )
             + "\n\n"
         )
         stream = stream_openai_to_claude(
@@ -590,7 +651,9 @@ class AuthRefreshTests(unittest.TestCase):
         events = list(stream)
 
         self.assertTrue(any("event: content_block_delta" in event for event in events))
-        self.assertTrue(any("event: error" in event and "late failure" in event for event in events))
+        self.assertTrue(
+            any("event: error" in event and "late failure" in event for event in events)
+        )
 
     def test_billing_stores_token_returned_by_current_user_response(self):
         old_token = make_jwt(exp=int(time.time()) + 3600)
@@ -627,14 +690,20 @@ class AuthRefreshTests(unittest.TestCase):
             ),
         ]
 
-        with patch("genai_proxy.services.genai.requests.get", side_effect=responses) as mocked_get:
+        with patch(
+            "genai_proxy.services.genai.requests.get", side_effect=responses
+        ) as mocked_get:
             result = service.fetch_openai_billing_subscription()
 
         self.assertEqual(result["access_until"], new_exp)
         self.assertEqual(token_manager.token, new_token)
         self.assertEqual(token_manager.billing_user_id, "42")
-        self.assertEqual(token_manager.upstream_token_updates, [(new_token, "current user response")])
-        self.assertEqual(mocked_get.call_args_list[1].kwargs["headers"]["X-Access-Token"], old_token)
+        self.assertEqual(
+            token_manager.upstream_token_updates, [(new_token, "current user response")]
+        )
+        self.assertEqual(
+            mocked_get.call_args_list[1].kwargs["headers"]["X-Access-Token"], old_token
+        )
 
     def test_billing_reuses_cached_user_id_after_first_lookup(self):
         old_token = make_jwt(exp=int(time.time()) + 3600)
@@ -670,7 +739,9 @@ class AuthRefreshTests(unittest.TestCase):
             ),
         ]
 
-        with patch("genai_proxy.services.genai.requests.get", side_effect=responses) as mocked_get:
+        with patch(
+            "genai_proxy.services.genai.requests.get", side_effect=responses
+        ) as mocked_get:
             service.fetch_openai_billing_subscription()
             usage = service.fetch_openai_billing_usage()
 
@@ -679,7 +750,9 @@ class AuthRefreshTests(unittest.TestCase):
         self.assertIn("/htk/user/info/", mocked_get.call_args_list[0].args[0])
         self.assertIn("/htk/ai-user-info/list", mocked_get.call_args_list[1].args[0])
         self.assertIn("/htk/ai-user-info/list", mocked_get.call_args_list[2].args[0])
-        self.assertEqual(mocked_get.call_args_list[2].kwargs["headers"]["X-Access-Token"], new_token)
+        self.assertEqual(
+            mocked_get.call_args_list[2].kwargs["headers"]["X-Access-Token"], new_token
+        )
 
     def test_billing_uses_cached_user_id_without_current_user_lookup(self):
         token = make_jwt()
@@ -721,7 +794,9 @@ class AuthRefreshTests(unittest.TestCase):
             keystore_path = os.path.join(temp_dir, "docker-deploy.keystore")
             cache_path = f"{keystore_path}.token.json"
             with open(cache_path, "w", encoding="utf-8") as cache_file:
-                json.dump({"token": "stale-token", "exp": int(time.time()) + 3600}, cache_file)
+                json.dump(
+                    {"token": "stale-token", "exp": int(time.time()) + 3600}, cache_file
+                )
 
             manager = TokenManager(
                 self.logger,
@@ -737,7 +812,9 @@ class AuthRefreshTests(unittest.TestCase):
                 manager._token = make_jwt()
                 manager._token_exp = int(time.time()) + 3600
 
-            with patch.object(manager, "_refresh_token", side_effect=fake_refresh) as refresh:
+            with patch.object(
+                manager, "_refresh_token", side_effect=fake_refresh
+            ) as refresh:
                 self.assertTrue(manager.refresh_after_auth_failure("unit test"))
 
             self.assertEqual(refresh.call_count, 1)
@@ -748,7 +825,10 @@ class AuthRefreshTests(unittest.TestCase):
             keystore_path = os.path.join(temp_dir, "missing.keystore")
             cache_path = f"{keystore_path}.token.json"
             with open(cache_path, "w", encoding="utf-8") as cache_file:
-                json.dump({"token": "rejected-token", "exp": int(time.time()) + 3600}, cache_file)
+                json.dump(
+                    {"token": "rejected-token", "exp": int(time.time()) + 3600},
+                    cache_file,
+                )
 
             manager = TokenManager(
                 self.logger,
@@ -765,14 +845,18 @@ class AuthRefreshTests(unittest.TestCase):
 
             self.assertFalse(os.path.exists(cache_path))
 
-    def test_refresh_after_auth_failure_reuses_newer_cached_token_for_rejected_token(self):
+    def test_refresh_after_auth_failure_reuses_newer_cached_token_for_rejected_token(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temp_dir:
             keystore_path = os.path.join(temp_dir, "docker-deploy.keystore")
             cache_path = f"{keystore_path}.token.json"
             rejected_token = make_jwt(exp=int(time.time()) + 3600)
             cached_token = make_jwt(exp=int(time.time()) + 7200)
             with open(cache_path, "w", encoding="utf-8") as cache_file:
-                json.dump({"token": cached_token, "exp": int(time.time()) + 7200}, cache_file)
+                json.dump(
+                    {"token": cached_token, "exp": int(time.time()) + 7200}, cache_file
+                )
 
             manager = TokenManager(
                 self.logger,
@@ -802,7 +886,9 @@ class AuthRefreshTests(unittest.TestCase):
                 token_check_interval=0,
             )
 
-            with patch.object(manager, "_refresh_token", side_effect=RuntimeError("ids failed")) as refresh:
+            with patch.object(
+                manager, "_refresh_token", side_effect=RuntimeError("ids failed")
+            ) as refresh:
                 self.assertEqual(manager.token, current_token)
                 self.assertEqual(manager.token, current_token)
 
@@ -820,7 +906,9 @@ class AuthRefreshTests(unittest.TestCase):
                 token_check_interval=0,
             )
 
-            with patch.object(manager, "_refresh_token", side_effect=RuntimeError("ids failed")):
+            with patch.object(
+                manager, "_refresh_token", side_effect=RuntimeError("ids failed")
+            ):
                 self.assertFalse(
                     manager.refresh_after_auth_failure(
                         "unit test",
@@ -846,7 +934,9 @@ class AuthRefreshTests(unittest.TestCase):
                 manager._token = make_jwt()
                 manager._token_exp = int(time.time()) + 3600
 
-            with patch.object(manager, "_refresh_token", side_effect=fake_refresh) as refresh:
+            with patch.object(
+                manager, "_refresh_token", side_effect=fake_refresh
+            ) as refresh:
                 manager._confirm_token_for_background()
 
             self.assertEqual(refresh.call_count, 1)
@@ -858,7 +948,9 @@ class AuthRefreshTests(unittest.TestCase):
             old_token = make_jwt(exp=int(time.time()) + 3600)
             cached_token = make_jwt(exp=int(time.time()) + 7200)
             with open(cache_path, "w", encoding="utf-8") as cache_file:
-                json.dump({"token": cached_token, "exp": int(time.time()) + 7200}, cache_file)
+                json.dump(
+                    {"token": cached_token, "exp": int(time.time()) + 7200}, cache_file
+                )
 
             manager = TokenManager(
                 self.logger,
@@ -933,20 +1025,26 @@ class AuthRefreshTests(unittest.TestCase):
                 manager.shutdown()
                 self.assertFalse(manager._token_check_thread.is_alive())
 
-    def test_genai_login_flow_prefers_current_oauth_entry_and_falls_back_to_legacy_cas(self):
+    def test_genai_login_flow_prefers_current_oauth_entry_and_falls_back_to_legacy_cas(
+        self,
+    ):
         manager = TokenManager(
             self.logger,
             token=make_jwt(),
             keystore_path="unused.keystore",
             token_check_interval=0,
         )
-        current_response = FakeResponse(url="https://genai.shanghaitech.edu.cn/?token=current")
+        current_response = FakeResponse(
+            url="https://genai.shanghaitech.edu.cn/?token=current"
+        )
         client = type("FakeClient", (), {"session": FakeSession([current_response])})()
 
         self.assertIs(manager._get_genai_login_response(client), current_response)
         self.assertEqual(client.session.urls, [GENAI_LOGIN_URL])
 
-        fallback_response = FakeResponse(url="https://genai.shanghaitech.edu.cn/?token=legacy")
+        fallback_response = FakeResponse(
+            url="https://genai.shanghaitech.edu.cn/?token=legacy"
+        )
         client = type(
             "FakeClient",
             (),
@@ -961,7 +1059,9 @@ class AuthRefreshTests(unittest.TestCase):
         )()
 
         self.assertIs(manager._get_genai_login_response(client), fallback_response)
-        self.assertEqual(client.session.urls, [GENAI_LOGIN_URL, GENAI_LEGACY_CAS_SERVICE_URL])
+        self.assertEqual(
+            client.session.urls, [GENAI_LOGIN_URL, GENAI_LEGACY_CAS_SERVICE_URL]
+        )
 
 
 if __name__ == "__main__":

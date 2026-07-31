@@ -7,15 +7,27 @@ import socket
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import requests
 from PIL import Image
 
 from genai_proxy.app import create_app
 from genai_proxy.compat.claude import convert_claude_to_openai
-from genai_proxy.optimizations.deepseek import inject_deepseek_reasoning_prompt
+from genai_proxy.errors import ProxyError
+from genai_proxy.optimizations.deepseek import (
+    inject_deepseek_reasoning_prompt,
+    inject_deepseek_tool_prompt,
+)
+from genai_proxy.optimizations.glm import inject_glm_tool_prompt
+from genai_proxy.optimizations.minimax import inject_minimax_tool_prompt
+from genai_proxy.optimizations.qwen import inject_qwen35_tool_prompt
 from genai_proxy.services.genai import GenAIService
 from genai_proxy.token_usage import (
+    DEEPSEEK_V4_PRO_SPEC,
+    GLM_5_1_SPEC,
+    GLM_5_2_SPEC,
     KIMI_K3_SPEC,
+    MINIMAX_M2_7_SPEC,
     QWEN_3_5_SPEC,
     Artifact,
     TokenizerSpec,
@@ -24,6 +36,9 @@ from genai_proxy.token_usage import (
     _decode_data_url,
     _kimi_image_token_count,
     _load_python_encoder,
+    _load_template,
+    _normalize_messages,
+    _qwen_image_token_count,
     _request_public_image,
     _serialized_completion,
     count_openai_completion_tokens,
@@ -46,6 +61,11 @@ class FakeModelManager:
             "aiName": "GLM-5.2",
             "rootModelName": "Xinference",
         },
+        "chatglm51": {
+            "aiType": "chatglm51",
+            "aiName": "GLM-5.1",
+            "rootModelName": "Xinference",
+        },
         "deepseek-chat": {
             "aiType": "deepseek-chat",
             "aiName": "DeepSeek-V4-Flash",
@@ -59,6 +79,11 @@ class FakeModelManager:
         "qwen3.5": {
             "aiType": "qwen3.5",
             "aiName": "Qwen3.5-397B-A17B",
+            "rootModelName": "Xinference",
+        },
+        "MiniMax-M1": {
+            "aiType": "MiniMax-M1",
+            "aiName": "MiniMax-M2.7",
             "rootModelName": "Xinference",
         },
         "kimi-k3": {
@@ -88,7 +113,7 @@ class FakeResponse:
     def __init__(self, lines):
         self.lines = lines
 
-    def iter_lines(self):
+    def iter_lines(self, *args, **kwargs):
         return iter(self.lines)
 
     def close(self):
@@ -113,6 +138,33 @@ def fake_completion(content, *, reasoning=None):
             ).encode()
         ]
     )
+
+
+def _official_multiturn_messages():
+    return [
+        {"role": "system", "content": "Be concise."},
+        {"role": "user", "content": "Weather?"},
+        {
+            "role": "assistant",
+            "reasoning_content": "Need the current weather.",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_weather",
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "arguments": '{"city":"Shanghai"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_weather",
+            "content": "Sunny.",
+        },
+    ]
 
 
 def _app():
@@ -174,6 +226,13 @@ def _official_kimi_completion(message: dict) -> str:
 def test_qwen_uses_full_model_as_revision_authority():
     assert QWEN_3_5_SPEC.repository == "Qwen/Qwen3.5-397B-A17B"
     assert QWEN_3_5_SPEC.revision == "8472618112abcbd45acbcdc58436aff4233c23f7"
+
+
+def test_glm51_and_minimax_use_pinned_official_assets():
+    assert GLM_5_1_SPEC.repository == "zai-org/GLM-5.1"
+    assert GLM_5_1_SPEC.revision == "26e1bd6e011feb778d25ae34b09b07074139d92d"
+    assert MINIMAX_M2_7_SPEC.repository == "MiniMaxAI/MiniMax-M2.7"
+    assert MINIMAX_M2_7_SPEC.revision == "d494266a4affc0d2995ba1fa35c8481cbd84294b"
 
 
 def test_kimi_uses_pinned_official_encoder_and_tiktoken_assets():
@@ -272,6 +331,21 @@ def test_supported_model_families_are_resolved_from_alias_and_record():
         == "qwen_3_5"
     )
     assert (
+        tokenizer_family_for_model("MiniMax-M1", manager.get_model_record("MiniMax-M1"))
+        == "minimax_m2_7"
+    )
+    assert (
+        tokenizer_family_for_model(
+            "chatglm",
+            {
+                "aiType": "chatglm",
+                "aiName": "GLM-5.1",
+                "rootModelName": "Xinference",
+            },
+        )
+        == "glm_5_1"
+    )
+    assert (
         tokenizer_family_for_model("kimi-k3", manager.get_model_record("kimi-k3"))
         == "kimi_k3"
     )
@@ -280,6 +354,7 @@ def test_supported_model_families_are_resolved_from_alias_and_record():
 def test_model_family_version_matching_does_not_accept_longer_minor_version():
     assert tokenizer_family_for_model("qwen3.50") is None
     assert tokenizer_family_for_model("glm5.20") is None
+    assert tokenizer_family_for_model("minimax2.70") is None
     assert tokenizer_family_for_model("kimi-k30") is None
     assert tokenizer_family_for_model("kimi-k3.1") is None
 
@@ -317,6 +392,7 @@ def test_tokenizer_artifact_download_retries_transient_failure(tmp_path):
 def test_official_prompt_templates_have_stable_reference_counts():
     messages = [{"role": "user", "content": "Hello, 世界"}]
     cases = [
+        ("chatglm51", "glm_5_1", "glm_5_1", 8, "[gMASK]<sop>"),
         ("chatglm", "glm_5_2", "glm_5_2", 15, "[gMASK]<sop>"),
         (
             "deepseek-pro",
@@ -333,6 +409,7 @@ def test_official_prompt_templates_have_stable_reference_counts():
             "<｜begin▁of▁sentence｜>",
         ),
         ("qwen3.5", "qwen_3_5", None, 14, "<|im_start|>user\n"),
+        ("MiniMax-M1", "minimax_m2_7", "minimax", 41, "]~!b["),
         (
             "kimi-k3",
             "kimi_k3",
@@ -369,6 +446,356 @@ def test_deepseek_max_injection_matches_official_encoder_prompt_exactly():
         add_generation_prompt=True,
     )
     assert transported_prompt == official_prompt
+
+
+def test_deepseek_tool_transport_matches_official_encoder_exactly():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "Get the weather.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    encoder = _load_python_encoder(DEEPSEEK_V4_PRO_SPEC)
+    for messages in (
+        [{"role": "user", "content": "Weather?"}],
+        [
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "Weather?"},
+        ],
+    ):
+        if messages[0]["role"] == "system":
+            official_messages = [
+                {**messages[0], "tools": tools},
+                *messages[1:],
+            ]
+        else:
+            official_messages = [
+                {"role": "system", "content": "", "tools": tools},
+                *messages,
+            ]
+        official_prompt = encoder["encode_messages"](
+            official_messages,
+            thinking_mode="thinking",
+            reasoning_effort="max",
+        )
+        transported_prompt = render_chat_prompt(
+            inject_deepseek_tool_prompt(
+                messages,
+                tools,
+                adapter="deepseek_v4_pro",
+                reasoning_config={"effort": "max"},
+            ),
+            "deepseek_v4_pro",
+            add_generation_prompt=True,
+            thinking=True,
+        )
+
+        assert transported_prompt == official_prompt
+
+
+def test_deepseek_chat_and_thinking_modes_match_official_encoder_boundaries():
+    messages = [{"role": "user", "content": "Hello"}]
+    chat_prompt = render_chat_prompt(
+        messages,
+        "deepseek_v4_pro",
+        add_generation_prompt=True,
+        thinking=False,
+    )
+    thinking_prompt = render_chat_prompt(
+        messages,
+        "deepseek_v4_pro",
+        add_generation_prompt=True,
+        reasoning_config={"effort": "high"},
+        thinking=True,
+    )
+
+    assert chat_prompt.endswith("<｜Assistant｜></think>")
+    assert thinking_prompt.endswith("<｜Assistant｜><think>")
+    chat_message = {"role": "assistant", "content": "answer"}
+    assert render_chat_prompt(
+        [*messages, chat_message],
+        "deepseek_v4_pro",
+        add_generation_prompt=False,
+        thinking=False,
+    ) == chat_prompt + _serialized_completion(
+        chat_message,
+        "deepseek_v4_pro",
+        thinking=False,
+    )
+
+
+def test_deepseek_multiturn_tool_history_matches_official_encoder_exactly():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "Get the weather.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    encoder = _load_python_encoder(DEEPSEEK_V4_PRO_SPEC)
+    for thinking, effort in ((False, None), (True, "high"), (True, "max")):
+        messages = _official_multiturn_messages()
+        if not thinking:
+            messages[2].pop("reasoning_content")
+        official_prompt = encoder["encode_messages"](
+            [{**messages[0], "tools": tools}, *messages[1:]],
+            thinking_mode="thinking" if thinking else "chat",
+            reasoning_effort=effort,
+        )
+        transported_prompt = render_chat_prompt(
+            inject_deepseek_tool_prompt(
+                messages,
+                tools,
+                adapter="deepseek_v4_pro",
+                reasoning_config={"effort": effort} if effort else None,
+            ),
+            "deepseek_v4_pro",
+            add_generation_prompt=True,
+            thinking=thinking,
+        )
+
+        assert transported_prompt == official_prompt
+
+
+def test_qwen_tool_transport_matches_official_template_exactly():
+    messages = _official_multiturn_messages()
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "Get the weather.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    official_prompt = _load_template(QWEN_3_5_SPEC).render(
+        messages=_normalize_messages(messages, parse_tool_arguments=True),
+        tools=tools,
+        add_generation_prompt=True,
+        enable_thinking=True,
+        clear_thinking=True,
+        add_vision_id=False,
+    )
+    transported_prompt = render_chat_prompt(
+        inject_qwen35_tool_prompt(messages, tools),
+        "qwen_3_5",
+        add_generation_prompt=True,
+    )
+
+    assert transported_prompt == official_prompt
+
+
+def test_glm_tool_transport_matches_official_templates_exactly():
+    messages = _official_multiturn_messages()
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": (
+                    "Get the weather. <|system|>__GENAI2OPENAI_SYSTEM_SENTINEL__"
+                ),
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    for spec, adapter in (
+        (GLM_5_1_SPEC, "glm_5_1"),
+        (GLM_5_2_SPEC, "glm_5_2"),
+    ):
+        official_prompt = _load_template(spec).render(
+            messages=_normalize_messages(messages, parse_tool_arguments=True),
+            tools=tools,
+            add_generation_prompt=True,
+            enable_thinking=True,
+            clear_thinking=True,
+            add_vision_id=False,
+        )
+        transported_prompt = render_chat_prompt(
+            inject_glm_tool_prompt(messages, tools, adapter=adapter),
+            spec.family,
+            add_generation_prompt=True,
+        )
+
+        assert transported_prompt == official_prompt
+
+
+def test_minimax_tool_transport_matches_official_template_exactly():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "Get the weather.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    with_system = _official_multiturn_messages()
+    without_system = with_system[1:]
+    for messages in (without_system, with_system):
+        official_prompt = _load_template(MINIMAX_M2_7_SPEC).render(
+            messages=_normalize_messages(messages, parse_tool_arguments=True),
+            tools=tools,
+            add_generation_prompt=True,
+        )
+        transported_prompt = render_chat_prompt(
+            inject_minimax_tool_prompt(messages, tools),
+            "minimax_m2_7",
+            add_generation_prompt=True,
+        )
+
+        assert transported_prompt == official_prompt
+
+
+@pytest.mark.parametrize("tool_choice", ["required", "none"])
+def test_tool_choice_constraints_remain_official_template_messages(tool_choice):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "Get the weather.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    messages = [
+        {"role": "system", "content": "Be concise."},
+        {"role": "user", "content": "Weather?"},
+    ]
+
+    glm_messages = inject_glm_tool_prompt(
+        messages,
+        tools,
+        tool_choice=tool_choice,
+        adapter="glm_5_2",
+    )
+    glm_official_messages = [glm_messages[1], *messages]
+    glm_official = _load_template(GLM_5_2_SPEC).render(
+        messages=_normalize_messages(
+            glm_official_messages,
+            parse_tool_arguments=True,
+        ),
+        tools=tools,
+        add_generation_prompt=True,
+        enable_thinking=True,
+        clear_thinking=True,
+        add_vision_id=False,
+    )
+    assert (
+        render_chat_prompt(
+            glm_messages,
+            "glm_5_2",
+            add_generation_prompt=True,
+        )
+        == glm_official
+    )
+
+    qwen_messages = inject_qwen35_tool_prompt(
+        messages,
+        tools,
+        tool_choice=tool_choice,
+    )
+    qwen_constraint = (
+        "For this turn, you must call at least one available function."
+        if tool_choice == "required"
+        else "For this turn, do not call a function or emit a <tool_call> block."
+    )
+    qwen_official_messages = [
+        {
+            "role": "system",
+            "content": f"{qwen_constraint}\n\nBe concise.",
+        },
+        messages[1],
+    ]
+    qwen_official = _load_template(QWEN_3_5_SPEC).render(
+        messages=_normalize_messages(
+            qwen_official_messages,
+            parse_tool_arguments=True,
+        ),
+        tools=tools,
+        add_generation_prompt=True,
+        enable_thinking=True,
+        clear_thinking=True,
+        add_vision_id=False,
+    )
+    assert (
+        render_chat_prompt(
+            qwen_messages,
+            "qwen_3_5",
+            add_generation_prompt=True,
+        )
+        == qwen_official
+    )
+
+    minimax_messages = inject_minimax_tool_prompt(
+        messages,
+        tools,
+        tool_choice=tool_choice,
+    )
+    minimax_constraint = (
+        "\nFor this turn, you must call at least one tool using a "
+        "<minimax:tool_call> block."
+        if tool_choice == "required"
+        else "\nFor this turn, do not call any tool or emit tool call tags."
+    )
+    minimax_official_messages = [
+        {
+            "role": "system",
+            "content": f"Be concise.{minimax_constraint}",
+        },
+        messages[1],
+    ]
+    minimax_official = _load_template(MINIMAX_M2_7_SPEC).render(
+        messages=_normalize_messages(
+            minimax_official_messages,
+            parse_tool_arguments=True,
+        ),
+        tools=tools,
+        add_generation_prompt=True,
+    )
+    assert (
+        render_chat_prompt(
+            minimax_messages,
+            "minimax_m2_7",
+            add_generation_prompt=True,
+        )
+        == minimax_official
+    )
 
 
 def test_kimi_visual_prompt_and_patch_tokens_match_official_rules():
@@ -418,6 +845,49 @@ def test_kimi_visual_token_count_matches_official_resize_boundaries():
 
     for dimensions, expected in cases.items():
         assert _kimi_image_token_count(*dimensions) == expected
+
+
+def test_qwen_visual_token_count_matches_official_resize_boundaries():
+    cases = {
+        (1, 1): 64,
+        (32, 32): 64,
+        (256, 256): 64,
+        (640, 480): 300,
+        (512, 512): 256,
+        (4096, 4096): 16384,
+        (8192, 8192): 16384,
+    }
+
+    for dimensions, expected in cases.items():
+        assert _qwen_image_token_count(*dimensions) == expected
+
+    with pytest.raises(ProxyError, match="aspect ratio"):
+        _qwen_image_token_count(201, 1)
+
+
+def test_qwen_visual_request_count_expands_official_image_placeholder():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _png_data_url(32, 32)},
+                },
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+    ]
+    prompt = render_chat_prompt(
+        messages,
+        "qwen_3_5",
+        add_generation_prompt=True,
+    )
+    placeholder_count = _count_encoded("qwen_3_5", prompt)
+
+    assert count_openai_request_tokens(messages, "qwen3.5") == (
+        placeholder_count + _qwen_image_token_count(32, 32) - 1
+    )
 
 
 def test_kimi_service_preserves_visual_blocks_and_counts_data_url():
@@ -487,8 +957,10 @@ def test_kimi_service_reads_remote_image_dimensions_once():
         "genai_proxy.token_usage._request_public_image",
         return_value=(remote, pool),
     ) as request_image:
-        prepared = _app().extensions["genai_service"]._prepare_chat_request(
-            {"model": "kimi-k3", "messages": messages}
+        prepared = (
+            _app()
+            .extensions["genai_service"]
+            ._prepare_chat_request({"model": "kimi-k3", "messages": messages})
         )
 
     request_image.assert_called_once_with("https://example.test/image.png")
@@ -669,9 +1141,7 @@ def test_kimi_transport_preserves_multiple_current_images_in_order():
         "genai_proxy.services.genai.requests.post",
         return_value=upstream,
     ) as post:
-        chunks = list(
-            app.extensions["genai_service"].stream_openai_completion(request)
-        )
+        chunks = list(app.extensions["genai_service"].stream_openai_completion(request))
 
     payload = post.call_args.kwargs["json"]
     assert payload["chatInfo"] == "Compare these images."
@@ -682,11 +1152,15 @@ def test_kimi_transport_preserves_multiple_current_images_in_order():
 
 
 def test_kimi_empty_current_user_gets_nonempty_transport_trigger():
-    prepared = _app().extensions["genai_service"]._prepare_chat_request(
-        {
-            "model": "kimi-k3",
-            "messages": [{"role": "user", "content": ""}],
-        }
+    prepared = (
+        _app()
+        .extensions["genai_service"]
+        ._prepare_chat_request(
+            {
+                "model": "kimi-k3",
+                "messages": [{"role": "user", "content": ""}],
+            }
+        )
     )
 
     assert prepared.messages == [{"role": "user", "content": "\u200b"}]
@@ -694,18 +1168,22 @@ def test_kimi_empty_current_user_gets_nonempty_transport_trigger():
 
 def test_kimi_image_only_current_user_gets_nonempty_transport_trigger():
     data_url = _png_data_url(56, 28)
-    prepared = _app().extensions["genai_service"]._prepare_chat_request(
-        {
-            "model": "kimi-k3",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                }
-            ],
-        }
+    prepared = (
+        _app()
+        .extensions["genai_service"]
+        ._prepare_chat_request(
+            {
+                "model": "kimi-k3",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    }
+                ],
+            }
+        )
     )
 
     assert prepared.messages[0]["content"][0] == {
@@ -853,8 +1331,7 @@ def test_kimi_active_tools_use_validated_bridge_without_chat_group_id():
     app = _app()
     client = app.test_client()
     raw_content = (
-        '<k3_action>{"name":"get_weather",'
-        '"arguments":{"city":"Shanghai"}}</k3_action>'
+        '<k3_action>{"name":"get_weather","arguments":{"city":"Shanghai"}}</k3_action>'
     )
     upstream = FakeResponse(
         [
@@ -868,16 +1345,12 @@ def test_kimi_active_tools_use_validated_bridge_without_chat_group_id():
                     ]
                 }
             ).encode(),
-            json.dumps(
-                {"choices": [{"delta": {}, "finish_reason": "stop"}]}
-            ).encode(),
+            json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}).encode(),
         ]
     )
     request = {
         "model": "kimi-k3",
-        "messages": [
-            {"role": "user", "content": "Weather in Shanghai?"}
-        ],
+        "messages": [{"role": "user", "content": "Weather in Shanghai?"}],
         "tools": tools,
     }
 
@@ -895,9 +1368,7 @@ def test_kimi_active_tools_use_validated_bridge_without_chat_group_id():
     assert choice["finish_reason"] == "tool_calls"
     tool_call = choice["message"]["tool_calls"][0]
     assert tool_call["function"]["name"] == "get_weather"
-    assert json.loads(tool_call["function"]["arguments"]) == {
-        "city": "Shanghai"
-    }
+    assert json.loads(tool_call["function"]["arguments"]) == {"city": "Shanghai"}
 
     upstream_payload = post.call_args.kwargs["json"]
     assert upstream_payload["chatInfo"] == "Weather in Shanghai?"
@@ -945,9 +1416,7 @@ def test_kimi_auto_never_executes_a_plain_json_answer():
                     "choices": [
                         {
                             "delta": {
-                                "content": (
-                                    '{"name":"get_weather","arguments":{}}'
-                                )
+                                "content": ('{"name":"get_weather","arguments":{}}')
                             },
                             "finish_reason": "stop",
                         }
@@ -960,18 +1429,23 @@ def test_kimi_auto_never_executes_a_plain_json_answer():
     with patch(
         "genai_proxy.services.genai.requests.post", return_value=upstream
     ) as post:
-        response = _app().test_client().post(
-            "/v1/chat/completions",
-            json={
-                "model": "kimi-k3",
-                "messages": [{"role": "user", "content": "Answer directly."}],
-                "tools": tools,
-            },
+        response = (
+            _app()
+            .test_client()
+            .post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kimi-k3",
+                    "messages": [{"role": "user", "content": "Answer directly."}],
+                    "tools": tools,
+                },
+            )
         )
 
     assert response.status_code == 502
-    assert "neither a valid client action nor a final response" in (
-        response.get_json()["error"]["message"]
+    assert (
+        "neither a valid client action nor a final response"
+        in (response.get_json()["error"]["message"])
     )
     assert post.call_count == 3
 
@@ -982,8 +1456,7 @@ def test_kimi_auto_retries_unwrapped_response_as_required_action():
         reasoning="The requested check still needs external evidence. ",
     )
     second = fake_completion(
-        '<k3_action>{"name":"get_weather",'
-        '"arguments":{"city":"Shanghai"}}</k3_action>',
+        '<k3_action>{"name":"get_weather","arguments":{"city":"Shanghai"}}</k3_action>',
         reasoning="I will encode the client action as response data.",
     )
     request = {
@@ -1008,9 +1481,13 @@ def test_kimi_auto_retries_unwrapped_response_as_required_action():
         "genai_proxy.services.genai.requests.post",
         side_effect=[first, second],
     ) as post:
-        response = _app().test_client().post(
-            "/v1/chat/completions",
-            json=request,
+        response = (
+            _app()
+            .test_client()
+            .post(
+                "/v1/chat/completions",
+                json=request,
+            )
         )
 
     assert response.status_code == 200
@@ -1065,9 +1542,7 @@ def test_kimi_bridge_stream_waits_for_complete_action_then_emits_tool_chunks():
                     ]
                 }
             ).encode(),
-            json.dumps(
-                {"choices": [{"delta": {}, "finish_reason": "stop"}]}
-            ).encode(),
+            json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}).encode(),
         ]
     )
     request = {
@@ -1078,21 +1553,15 @@ def test_kimi_bridge_stream_waits_for_complete_action_then_emits_tool_chunks():
         "stream_options": {"include_usage": True},
     }
 
-    with patch(
-        "genai_proxy.services.genai.requests.post", return_value=upstream
-    ):
+    with patch("genai_proxy.services.genai.requests.post", return_value=upstream):
         body = "".join(
             _app().extensions["genai_service"].stream_openai_completion(request)
         )
 
     events = [
-        json.loads(line[6:])
-        for line in body.splitlines()
-        if line.startswith("data: {")
+        json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: {")
     ]
-    choices = [
-        choice for event in events for choice in event.get("choices", [])
-    ]
+    choices = [choice for event in events for choice in event.get("choices", [])]
     tool_chunks = [
         tool_call
         for choice in choices
@@ -1100,9 +1569,7 @@ def test_kimi_bridge_stream_waits_for_complete_action_then_emits_tool_chunks():
     ]
     assert len(tool_chunks) == 1
     assert tool_chunks[0]["function"]["name"] == "get_weather"
-    assert json.loads(tool_chunks[0]["function"]["arguments"]) == {
-        "city": "Shanghai"
-    }
+    assert json.loads(tool_chunks[0]["function"]["arguments"]) == {"city": "Shanghai"}
     assert any(choice.get("finish_reason") == "tool_calls" for choice in choices)
     assert "<k3_action>" not in body
     usage_events = [event["usage"] for event in events if event.get("usage")]
@@ -1128,8 +1595,7 @@ def test_kimi_bridge_rejects_malformed_tagged_action():
                         {
                             "delta": {
                                 "content": (
-                                    '<k3_action>{"name":"get_weather",'
-                                    '"arguments":'
+                                    '<k3_action>{"name":"get_weather","arguments":'
                                 )
                             },
                             "finish_reason": "stop",
@@ -1140,16 +1606,18 @@ def test_kimi_bridge_rejects_malformed_tagged_action():
         ]
     )
 
-    with patch(
-        "genai_proxy.services.genai.requests.post", return_value=upstream
-    ):
-        response = _app().test_client().post(
-            "/v1/chat/completions",
-            json={
-                "model": "kimi-k3",
-                "messages": [{"role": "user", "content": "Check weather."}],
-                "tools": tools,
-            },
+    with patch("genai_proxy.services.genai.requests.post", return_value=upstream):
+        response = (
+            _app()
+            .test_client()
+            .post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kimi-k3",
+                    "messages": [{"role": "user", "content": "Check weather."}],
+                    "tools": tools,
+                },
+            )
         )
 
     assert response.status_code == 502
@@ -1174,25 +1642,27 @@ def test_kimi_bridge_enforces_required_tool_choice():
         ]
     )
 
-    with patch(
-        "genai_proxy.services.genai.requests.post", return_value=upstream
-    ):
-        response = _app().test_client().post(
-            "/v1/chat/completions",
-            json={
-                "model": "kimi-k3",
-                "messages": [{"role": "user", "content": "Check weather."}],
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "get_weather",
-                            "parameters": {"type": "object"},
-                        },
-                    }
-                ],
-                "tool_choice": "required",
-            },
+    with patch("genai_proxy.services.genai.requests.post", return_value=upstream):
+        response = (
+            _app()
+            .test_client()
+            .post(
+                "/v1/chat/completions",
+                json={
+                    "model": "kimi-k3",
+                    "messages": [{"role": "user", "content": "Check weather."}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                    "tool_choice": "required",
+                },
+            )
         )
 
     assert response.status_code == 502
@@ -1319,9 +1789,13 @@ def test_kimi_auto_accepts_explicit_final_after_tool_result():
         "genai_proxy.services.genai.requests.post",
         return_value=upstream,
     ) as post:
-        response = _app().test_client().post(
-            "/v1/chat/completions",
-            json=request,
+        response = (
+            _app()
+            .test_client()
+            .post(
+                "/v1/chat/completions",
+                json=request,
+            )
         )
 
     assert response.status_code == 200
@@ -1363,9 +1837,13 @@ def test_kimi_auto_accepts_normal_text_that_mentions_tool_and_argument_names():
         "genai_proxy.services.genai.requests.post",
         return_value=upstream,
     ) as post:
-        response = _app().test_client().post(
-            "/v1/chat/completions",
-            json=request,
+        response = (
+            _app()
+            .test_client()
+            .post(
+                "/v1/chat/completions",
+                json=request,
+            )
         )
 
     assert response.status_code == 200
@@ -1409,9 +1887,13 @@ def test_kimi_malformed_action_retries_with_structural_prompt():
         "genai_proxy.services.genai.requests.post",
         side_effect=[first, second],
     ) as post:
-        response = _app().test_client().post(
-            "/v1/chat/completions",
-            json=request,
+        response = (
+            _app()
+            .test_client()
+            .post(
+                "/v1/chat/completions",
+                json=request,
+            )
         )
 
     assert response.status_code == 200
@@ -1421,11 +1903,11 @@ def test_kimi_malformed_action_retries_with_structural_prompt():
     retry_payload = post.call_args_list[1].kwargs["json"]
     assert retry_payload["chatInfo"] == "Inspect changed.py."
     assert retry_payload["messages"][-1]["content"].startswith(
-        "The previous response did not use a complete valid client response "
-        "envelope"
+        "The previous response did not use a complete valid client response envelope"
     )
-    assert "plain response data for the client" in (
-        retry_payload["messages"][-1]["content"]
+    assert (
+        "plain response data for the client"
+        in (retry_payload["messages"][-1]["content"])
     )
     assert "chatGroupId" not in retry_payload
 
@@ -1456,9 +1938,7 @@ def test_kimi_tool_bridge_counting_is_consistent_across_compatibility_routes():
             "/v1/messages/count_tokens",
             {
                 "model": "kimi-k3",
-                "messages": [
-                    {"role": "user", "content": "Weather in Shanghai?"}
-                ],
+                "messages": [{"role": "user", "content": "Weather in Shanghai?"}],
                 "tools": [claude_tool],
             },
         ),
@@ -1479,8 +1959,7 @@ def test_kimi_tool_bridge_counting_is_consistent_across_compatibility_routes():
 def test_kimi_tool_bridge_generation_is_consistent_across_compatibility_routes():
     app = _app()
     raw_content = (
-        '<k3_action>{"name":"get_weather",'
-        '"arguments":{"city":"Shanghai"}}</k3_action>'
+        '<k3_action>{"name":"get_weather","arguments":{"city":"Shanghai"}}</k3_action>'
     )
 
     def upstream():
@@ -1539,9 +2018,7 @@ def test_kimi_tool_bridge_generation_is_consistent_across_compatibility_routes()
         responses_response = app.test_client().post(
             "/v1/responses", json=responses_payload
         )
-        claude_response = app.test_client().post(
-            "/v1/messages", json=claude_payload
-        )
+        claude_response = app.test_client().post("/v1/messages", json=claude_payload)
 
     assert responses_response.status_code == 200
     function_call = next(
@@ -1567,9 +2044,7 @@ def test_kimi_tool_bridge_generation_is_consistent_across_compatibility_routes()
         assert "chatGroupId" not in upstream_payload
         assert upstream_payload["chatInfo"] == "Weather in Shanghai?"
         assert any(
-            str(message.get("content", "")).startswith(
-                "# Client response protocol\n"
-            )
+            str(message.get("content", "")).startswith("# Client response protocol\n")
             for message in upstream_payload["messages"]
         )
 
@@ -1624,18 +2099,17 @@ def test_kimi_tool_history_result_becomes_nonempty_current_input():
 
     assert response.status_code == 200
     assert (
-        response.get_json()["choices"][0]["message"]["content"]
-        == "Shanghai is sunny."
+        response.get_json()["choices"][0]["message"]["content"] == "Shanghai is sunny."
     )
     upstream_payload = post.call_args.kwargs["json"]
-    assert upstream_payload["chatInfo"].startswith(
-        "Completed client action result: "
-    )
+    assert upstream_payload["chatInfo"].startswith("Completed client action result: ")
     assert '"name":"get_weather"' in upstream_payload["chatInfo"]
     assert '"arguments":{"city":"Shanghai"}' in upstream_payload["chatInfo"]
     assert '"content":"Sunny."' in upstream_payload["chatInfo"]
     assert "chatGroupId" not in upstream_payload
-    assert all(message.get("role") != "tool" for message in upstream_payload["messages"])
+    assert all(
+        message.get("role") != "tool" for message in upstream_payload["messages"]
+    )
     assert all(
         not message.get("tool_calls") for message in upstream_payload["messages"]
     )
@@ -1724,13 +2198,15 @@ def test_kimi_tool_history_sends_only_latest_reasoning_as_continuation_state():
 
     with patch(
         "genai_proxy.services.genai.requests.post",
-        return_value=fake_completion(
-            "<k3_final>Inspection complete.</k3_final>"
-        ),
+        return_value=fake_completion("<k3_final>Inspection complete.</k3_final>"),
     ) as post:
-        response = _app().test_client().post(
-            "/v1/chat/completions",
-            json=request,
+        response = (
+            _app()
+            .test_client()
+            .post(
+                "/v1/chat/completions",
+                json=request,
+            )
         )
 
     assert response.status_code == 200
@@ -1742,15 +2218,12 @@ def test_kimi_tool_history_sends_only_latest_reasoning_as_continuation_state():
     ]
     assert reasoning_messages == []
     assert not any(
-        message.get("role") == "assistant"
-        for message in upstream_payload["messages"]
+        message.get("role") == "assistant" for message in upstream_payload["messages"]
     )
     state_messages = [
         message
         for message in upstream_payload["messages"]
-        if str(message.get("content", "")).startswith(
-            "# Prior continuation state\n"
-        )
+        if str(message.get("content", "")).startswith("# Prior continuation state\n")
     ]
     assert len(state_messages) == 1
     assert (
@@ -1763,9 +2236,7 @@ def test_kimi_tool_history_sends_only_latest_reasoning_as_continuation_state():
         upstream_payload["messages"],
         ensure_ascii=False,
     )
-    assert upstream_payload["chatInfo"].startswith(
-        "Completed client action result: "
-    )
+    assert upstream_payload["chatInfo"].startswith("Completed client action result: ")
     assert '"id":"call_tests"' in upstream_payload["chatInfo"]
     assert '"arguments":{"path":"tests"}' in upstream_payload["chatInfo"]
     assert "chatGroupId" not in upstream_payload
@@ -1828,8 +2299,10 @@ def test_kimi_history_preserves_official_name_and_reasoning_fields():
         {"role": "user", "content": "Summarize."},
     ]
 
-    prepared = _app().extensions["genai_service"]._prepare_chat_request(
-        {"model": "kimi-k3", "messages": messages}
+    prepared = (
+        _app()
+        .extensions["genai_service"]
+        ._prepare_chat_request({"model": "kimi-k3", "messages": messages})
     )
 
     assert prepared.messages[:2] == messages[:2]
@@ -1844,13 +2317,17 @@ def test_kimi_history_preserves_official_name_and_reasoning_fields():
 
 
 def test_kimi_current_user_name_is_removed_with_chat_info_transport():
-    prepared = _app().extensions["genai_service"]._prepare_chat_request(
-        {
-            "model": "kimi-k3",
-            "messages": [
-                {"role": "user", "name": "requester", "content": "Hello"},
-            ],
-        }
+    prepared = (
+        _app()
+        .extensions["genai_service"]
+        ._prepare_chat_request(
+            {
+                "model": "kimi-k3",
+                "messages": [
+                    {"role": "user", "name": "requester", "content": "Hello"},
+                ],
+            }
+        )
     )
 
     assert prepared.messages == [{"role": "user", "content": "Hello"}]
@@ -1881,7 +2358,9 @@ def test_kimi_rejects_invalid_history_content_shape():
     )
 
     assert response.status_code == 400
-    assert "supports only text and image parts" in response.get_json()["error"]["message"]
+    assert (
+        "supports only text and image parts" in response.get_json()["error"]["message"]
+    )
 
 
 def test_openai_responses_input_tokens_route_uses_official_qwen_template():
@@ -1897,6 +2376,55 @@ def test_openai_responses_input_tokens_route_uses_official_qwen_template():
     assert response.get_json() == {
         "object": "response.input_tokens",
         "input_tokens": 14,
+    }
+
+
+def test_openai_responses_input_tokens_counts_qwen_visual_patches():
+    data_url = _png_data_url(32, 32)
+    response = (
+        _app()
+        .test_client()
+        .post(
+            "/v1/responses/input_tokens",
+            json={
+                "model": "qwen3.5",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_image",
+                                "image_url": data_url,
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": data_url},
+                }
+            ],
+        }
+    ]
+    prompt = render_chat_prompt(
+        messages,
+        "qwen_3_5",
+        add_generation_prompt=True,
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "object": "response.input_tokens",
+        "input_tokens": (
+            _count_encoded("qwen_3_5", prompt) + _qwen_image_token_count(32, 32) - 1
+        ),
     }
 
 
@@ -1969,19 +2497,77 @@ def test_glm_maps_developer_role_to_supported_system_role():
     )
     assert prepared.messages[0] == {
         "role": "system",
-        "content": "Developer instruction\n\nReasoning Effort: Max",
+        "content": "Developer instruction",
     }
 
 
-def test_kimi_maps_developer_role_to_supported_system_role():
-    prepared = _app().extensions["genai_service"]._prepare_chat_request(
+def test_glm51_maps_developer_role_to_supported_system_role():
+    service = _app().extensions["genai_service"]
+    prepared = service._prepare_chat_request(
         {
-            "model": "kimi-k3",
+            "model": "chatglm51",
             "messages": [
                 {"role": "developer", "content": "Developer instruction"},
                 {"role": "user", "content": "Hello"},
             ],
         }
+    )
+    assert prepared.tool_adapter == "glm_5_1"
+    assert prepared.messages[0] == {
+        "role": "system",
+        "content": "Developer instruction",
+    }
+    assert prepared.prompt_tokens == count_openai_request_tokens(
+        prepared.messages,
+        "chatglm51",
+        model_record=FakeModelManager.records["chatglm51"],
+        tool_adapter=prepared.tool_adapter,
+    )
+
+
+def test_minimax_merges_developer_and_system_for_official_template():
+    service = _app().extensions["genai_service"]
+    prepared = service._prepare_chat_request(
+        {
+            "model": "MiniMax-M1",
+            "messages": [
+                {"role": "user", "content": "Earlier"},
+                {"role": "developer", "content": "Developer instruction"},
+                {"role": "system", "content": "System instruction"},
+                {"role": "user", "content": "Hello"},
+            ],
+        }
+    )
+
+    assert prepared.messages == [
+        {
+            "role": "system",
+            "content": "Developer instruction\n\nSystem instruction",
+        },
+        {"role": "user", "content": "Earlier"},
+        {"role": "user", "content": "Hello"},
+    ]
+    assert prepared.prompt_tokens == count_openai_request_tokens(
+        prepared.messages,
+        "MiniMax-M1",
+        model_record=FakeModelManager.records["MiniMax-M1"],
+        tool_adapter=prepared.tool_adapter,
+    )
+
+
+def test_kimi_maps_developer_role_to_supported_system_role():
+    prepared = (
+        _app()
+        .extensions["genai_service"]
+        ._prepare_chat_request(
+            {
+                "model": "kimi-k3",
+                "messages": [
+                    {"role": "developer", "content": "Developer instruction"},
+                    {"role": "user", "content": "Hello"},
+                ],
+            }
+        )
     )
 
     assert prepared.messages[0] == {
@@ -1991,12 +2577,16 @@ def test_kimi_maps_developer_role_to_supported_system_role():
 
 
 def test_kimi_reasoning_effort_count_matches_upstream_default_max():
-    prepared = _app().extensions["genai_service"]._prepare_chat_request(
-        {
-            "model": "kimi-k3",
-            "reasoning_effort": "low",
-            "messages": [{"role": "user", "content": "Hello"}],
-        }
+    prepared = (
+        _app()
+        .extensions["genai_service"]
+        ._prepare_chat_request(
+            {
+                "model": "kimi-k3",
+                "reasoning_effort": "low",
+                "messages": [{"role": "user", "content": "Hello"}],
+            }
+        )
     )
 
     assert prepared.token_reasoning_config == {"effort": "max"}
@@ -2006,10 +2596,11 @@ def test_kimi_reasoning_effort_count_matches_upstream_default_max():
 def test_openai_input_token_route_covers_all_supported_model_families():
     client = _app().test_client()
     expected = {
-        "chatglm": 20,
+        "chatglm": 13,
         "deepseek-pro": 5,
         "deepseek-chat": 5,
         "qwen3.5": 11,
+        "MiniMax-M1": 39,
         "kimi-k3": 127,
     }
     for model, input_tokens in expected.items():
@@ -2040,7 +2631,14 @@ def test_completion_serialization_matches_official_templates():
             }
         ],
     }
-    for family in ("glm_5_2", "deepseek_v4_pro", "qwen_3_5", "kimi_k3"):
+    for family in (
+        "glm_5_1",
+        "glm_5_2",
+        "deepseek_v4_pro",
+        "qwen_3_5",
+        "minimax_m2_7",
+        "kimi_k3",
+    ):
         generation_prompt = render_chat_prompt(
             [user], family, add_generation_prompt=True
         )
@@ -2073,7 +2671,13 @@ def test_completion_serialization_matches_official_templates_for_sparse_outputs(
             ],
         },
     )
-    for family in ("glm_5_2", "deepseek_v4_pro", "qwen_3_5", "kimi_k3"):
+    for family in (
+        "glm_5_1",
+        "glm_5_2",
+        "deepseek_v4_pro",
+        "qwen_3_5",
+        "kimi_k3",
+    ):
         generation_prompt = render_chat_prompt(
             [user], family, add_generation_prompt=True
         )
@@ -2089,6 +2693,45 @@ def test_completion_serialization_matches_official_templates_for_sparse_outputs(
             assert completed_prompt == generation_prompt + _serialized_completion(
                 assistant, family
             )
+
+
+def test_minimax_empty_reasoning_uses_official_generation_boundary():
+    user = {"role": "user", "content": "Hello"}
+    sentinel = "__GENAI2OPENAI_REASONING_SENTINEL__"
+    for assistant in (
+        {"role": "assistant", "content": "answer"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {"name": "ping", "arguments": "{}"},
+                }
+            ],
+        },
+    ):
+        with_reasoning = {
+            **assistant,
+            "content": assistant.get("content") or "",
+            "reasoning_content": sentinel,
+        }
+        generation_prompt = render_chat_prompt(
+            [user],
+            "minimax_m2_7",
+            add_generation_prompt=True,
+        )
+        completed_prompt = render_chat_prompt(
+            [user, with_reasoning],
+            "minimax_m2_7",
+            add_generation_prompt=False,
+        )
+        official_suffix = completed_prompt.removeprefix(generation_prompt)
+        assert official_suffix.startswith(f"{sentinel}\n")
+        assert _serialized_completion(
+            assistant,
+            "minimax_m2_7",
+        ) == official_suffix.removeprefix(f"{sentinel}\n")
 
 
 def test_qwen_completion_count_uses_full_sequence_boundary():
@@ -2200,16 +2843,17 @@ def test_anthropic_count_tokens_route_uses_mapped_official_glm_template():
         )
     )
     assert response.status_code == 200
-    assert response.get_json() == {"input_tokens": 22}
+    assert response.get_json() == {"input_tokens": 15}
 
 
 def test_anthropic_count_token_route_covers_all_supported_model_families():
     client = _app().test_client()
     expected = {
-        "chatglm": 20,
+        "chatglm": 13,
         "deepseek-pro": 5,
         "deepseek-chat": 5,
         "qwen3.5": 11,
+        "MiniMax-M1": 39,
         "kimi-k3": 127,
     }
     for model, input_tokens in expected.items():
@@ -2226,10 +2870,11 @@ def test_anthropic_count_token_route_covers_all_supported_model_families():
 
 def test_nonstream_usage_covers_all_supported_model_families():
     expected = {
-        "chatglm": (20, 2),
-        "deepseek-pro": (5, 3),
-        "deepseek-chat": (5, 3),
+        "chatglm": (13, 2),
+        "deepseek-pro": (5, 2),
+        "deepseek-chat": (5, 2),
         "qwen3.5": (11, 5),
+        "MiniMax-M1": (39, 5),
         "kimi-k3": (127, 14),
     }
     for model, (prompt_tokens, completion_tokens) in expected.items():
@@ -2624,9 +3269,9 @@ def test_chat_stream_include_usage_counts_reasoning_and_content():
     ]
     usage = next(chunk["usage"] for chunk in chunks if not chunk["choices"])
     assert usage == {
-        "prompt_tokens": 20,
+        "prompt_tokens": 13,
         "completion_tokens": 3,
-        "total_tokens": 23,
+        "total_tokens": 16,
         "prompt_tokens_details": {"cached_tokens": 0},
         "completion_tokens_details": {"reasoning_tokens": 1},
     }
@@ -2669,6 +3314,54 @@ def test_chat_stream_without_usage_skips_tokenizer_counting():
         json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: {")
     ]
     assert not any(not chunk["choices"] for chunk in chunks)
+
+
+def test_chat_stream_defers_requested_usage_until_after_first_delta():
+    service = _app().extensions["genai_service"]
+    upstream = FakeResponse(
+        [
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {"content": "first"},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ).encode(),
+            json.dumps(
+                {
+                    "choices": [
+                        {"delta": {"content": " second"}, "finish_reason": "stop"}
+                    ]
+                }
+            ).encode(),
+        ]
+    )
+    with (
+        patch("genai_proxy.services.genai.requests.post", return_value=upstream),
+        patch(
+            "genai_proxy.services.genai.count_openai_request_tokens",
+            return_value=13,
+        ) as count_request,
+    ):
+        stream = service.stream_openai_completion(
+            {
+                "model": "chatglm",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+        )
+        count_request.assert_not_called()
+        first = next(stream)
+        count_request.assert_not_called()
+        remaining = "".join(stream)
+
+    assert '"content": "first"' in first
+    count_request.assert_called_once()
+    assert '"usage"' in remaining
 
 
 def test_chat_usage_propagates_length_finish_reason():

@@ -16,10 +16,16 @@ __test__ = False
 ALLOWED_MODELS = (
     "deepseek-chat",
     "deepseek-pro",
-    "MiniMax-M1",
     "chatglm",
+    "qwen-instruct",
     "kimi-k3",
 )
+REASONING_STREAM_MODELS = {
+    "deepseek-chat",
+    "deepseek-pro",
+    "chatglm",
+    "qwen-instruct",
+}
 CITIES = (
     "Shanghai",
     "Beijing",
@@ -85,7 +91,10 @@ OPENAI_BASH_TOOL = {
             "properties": {
                 "command": {"type": "string", "description": "Command to run"},
                 "description": {"type": "string", "description": "Short description"},
-                "timeout": {"type": "integer", "description": "Timeout in milliseconds"},
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in milliseconds",
+                },
             },
             "required": ["command"],
         },
@@ -155,7 +164,9 @@ def main():
 
     disallowed = [model for model in args.models if model not in ALLOWED_MODELS]
     if disallowed:
-        raise SystemExit(f"Refusing to test disallowed model(s): {', '.join(disallowed)}")
+        raise SystemExit(
+            f"Refusing to test disallowed model(s): {', '.join(disallowed)}"
+        )
     if args.repeat < 1 or args.kimi_repeat < 1:
         raise SystemExit("Repeat counts must be positive")
 
@@ -169,7 +180,7 @@ def main():
             api_key=None,
             token_check_interval=60,
             claude_haiku_model="chatglm",
-            claude_sonnet_model="MiniMax-M1",
+            claude_sonnet_model="deepseek-pro",
             claude_opus_model="deepseek-chat",
         ),
         logger,
@@ -215,10 +226,21 @@ def main():
                         ),
                         ("claude_tool_result_turn", test_claude_tool_result_turn),
                     ]
+                    if model.casefold() in REASONING_STREAM_MODELS:
+                        tests.extend(
+                            (
+                                (
+                                    "openai_stream_reasoning",
+                                    test_openai_stream_reasoning,
+                                ),
+                                (
+                                    "responses_stream_reasoning",
+                                    test_responses_stream_reasoning,
+                                ),
+                            )
+                        )
                 repeat = (
-                    args.kimi_repeat
-                    if model.casefold() == "kimi-k3"
-                    else args.repeat
+                    args.kimi_repeat if model.casefold() == "kimi-k3" else args.repeat
                 )
                 for name, fn in tests:
                     for iteration in range(repeat):
@@ -248,7 +270,12 @@ def test_openai_tool_call(client, model, iteration):
         "/v1/chat/completions",
         {
             "model": model,
-            "messages": [{"role": "user", "content": f"Run {iteration}: use get_weather for {city}."}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"Run {iteration}: use get_weather for {city}.",
+                }
+            ],
             "tools": [OPENAI_WEATHER_TOOL],
             "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
             "max_tokens": 1024,
@@ -266,7 +293,12 @@ def test_openai_stream_tool_call(client, model, iteration):
         "/v1/chat/completions",
         {
             "model": model,
-            "messages": [{"role": "user", "content": f"Stream run {iteration}: use get_weather for {city}."}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"Stream run {iteration}: use get_weather for {city}.",
+                }
+            ],
             "tools": [OPENAI_WEATHER_TOOL],
             "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
             "stream": True,
@@ -345,7 +377,12 @@ def test_openai_tool_result_turn(client, model, iteration):
         "/v1/chat/completions",
         {
             "model": model,
-            "messages": [{"role": "user", "content": f"Use get_weather for {city}, run {iteration}."}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"Use get_weather for {city}, run {iteration}.",
+                }
+            ],
             "tools": [OPENAI_WEATHER_TOOL],
             "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
             "max_tokens": 1024,
@@ -358,7 +395,10 @@ def test_openai_tool_result_turn(client, model, iteration):
         {
             "model": model,
             "messages": [
-                {"role": "user", "content": f"Use get_weather for {city}, run {iteration}."},
+                {
+                    "role": "user",
+                    "content": f"Use get_weather for {city}, run {iteration}.",
+                },
                 {
                     "role": "assistant",
                     "content": first["choices"][0]["message"].get("content"),
@@ -368,7 +408,11 @@ def test_openai_tool_result_turn(client, model, iteration):
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "content": json.dumps(
-                        {"location": city, "temperature": temperature, "condition": condition}
+                        {
+                            "location": city,
+                            "temperature": temperature,
+                            "condition": condition,
+                        }
                     ),
                 },
             ],
@@ -377,7 +421,9 @@ def test_openai_tool_result_turn(client, model, iteration):
         },
     )
     message = second["choices"][0]["message"]
-    assert not message.get("tool_calls"), "model called another tool after receiving result"
+    assert not message.get("tool_calls"), (
+        "model called another tool after receiving result"
+    )
     assert (message.get("content") or "").strip(), "final answer was empty"
 
 
@@ -409,9 +455,7 @@ def test_openai_text(client, model, iteration):
         "/v1/chat/completions",
         {
             "model": model,
-            "messages": [
-                {"role": "user", "content": f"Reply with exactly {marker}"}
-            ],
+            "messages": [{"role": "user", "content": f"Reply with exactly {marker}"}],
             "max_tokens": 128,
         },
     )
@@ -427,9 +471,7 @@ def test_openai_stream_text(client, model, iteration):
         "/v1/chat/completions",
         {
             "model": model,
-            "messages": [
-                {"role": "user", "content": f"Reply with exactly {marker}"}
-            ],
+            "messages": [{"role": "user", "content": f"Reply with exactly {marker}"}],
             "stream": True,
             "max_tokens": 128,
         },
@@ -441,6 +483,103 @@ def test_openai_stream_text(client, model, iteration):
     )
 
     assert content.strip() == marker
+
+
+def test_openai_stream_reasoning(client, model, iteration):
+    events = post_stream(
+        client,
+        "/v1/chat/completions",
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        f"Reasoning stream run {iteration}: calculate 127 * 389 "
+                        "and give the final number."
+                    ),
+                }
+            ],
+            "reasoning": {"effort": "high"},
+            "stream": True,
+            "max_tokens": 512,
+        },
+    )
+    reasoning_indices = []
+    content = []
+    finish_indices = []
+    for event_index, event in enumerate(events):
+        for choice in event.get("choices", []):
+            delta = choice.get("delta", {})
+            if delta.get("reasoning_content"):
+                reasoning_indices.append(event_index)
+            if delta.get("content"):
+                content.append(str(delta["content"]))
+            if choice.get("finish_reason") is not None:
+                finish_indices.append(event_index)
+
+    assert reasoning_indices, (
+        "stream did not contain reasoning_content: "
+        + json.dumps(events, ensure_ascii=False)[:800]
+    )
+    assert finish_indices and reasoning_indices[0] < finish_indices[-1]
+    assert "".join(content).strip(), "stream did not contain final answer content"
+
+
+def test_responses_stream_reasoning(client, model, iteration):
+    events = post_stream(
+        client,
+        "/v1/responses",
+        {
+            "model": model,
+            "input": (
+                f"Responses reasoning run {iteration}: calculate 127 * 389 "
+                "and give the final number."
+            ),
+            "reasoning": {"effort": "high"},
+            "stream": True,
+            "max_output_tokens": 512,
+        },
+    )
+    reasoning_deltas = [
+        event
+        for event in events
+        if event.get("type") == "response.reasoning_text.delta"
+    ]
+    assert reasoning_deltas, (
+        "Responses stream did not contain reasoning_text.delta: "
+        + json.dumps(events, ensure_ascii=False)[:800]
+    )
+    reasoning_item_id = reasoning_deltas[0].get("item_id")
+    reasoning_output_index = reasoning_deltas[0].get("output_index")
+    assert reasoning_item_id
+    assert isinstance(reasoning_output_index, int)
+    assert all(
+        event.get("item_id") == reasoning_item_id
+        and event.get("output_index") == reasoning_output_index
+        and event.get("content_index") == 0
+        for event in reasoning_deltas
+    )
+    sequence_numbers = [event.get("sequence_number") for event in events]
+    assert sequence_numbers == list(range(len(events)))
+
+    completed = completed_responses_stream(events)
+    reasoning_items = [
+        item for item in completed.get("output", []) if item.get("type") == "reasoning"
+    ]
+    assert reasoning_items
+    streamed_reasoning = "".join(event.get("delta", "") for event in reasoning_deltas)
+    assert reasoning_items[0].get("content") == [
+        {"type": "reasoning_text", "text": streamed_reasoning}
+    ]
+    assert any(
+        item.get("type") == "message"
+        and any(
+            part.get("type") == "output_text" and part.get("text", "").strip()
+            for part in item.get("content", [])
+        )
+        for item in completed.get("output", [])
+    )
 
 
 def test_openai_vision(client, model, iteration):
@@ -579,8 +718,7 @@ def test_responses_multiturn_tool_call(client, model, iteration):
     )
     first = completed_responses_stream(first_events)
     assert any(
-        event.get("type") == "response.reasoning_text.delta"
-        for event in first_events
+        event.get("type") == "response.reasoning_text.delta" for event in first_events
     ), json.dumps(first_events, ensure_ascii=False)[:800]
     first_call = first_responses_function_call(first)
     assert first_call["name"] == "get_stage_one"
@@ -606,8 +744,7 @@ def test_responses_multiturn_tool_call(client, model, iteration):
     )
     second = completed_responses_stream(second_events)
     assert any(
-        event.get("type") == "response.reasoning_text.delta"
-        for event in second_events
+        event.get("type") == "response.reasoning_text.delta" for event in second_events
     ), json.dumps(second_events, ensure_ascii=False)[:800]
     second_call = first_responses_function_call(second)
     assert second_call["name"] == "get_stage_two", json.dumps(
@@ -699,9 +836,7 @@ def test_claude_text(client, model, iteration):
         {
             "model": model,
             "max_tokens": 128,
-            "messages": [
-                {"role": "user", "content": f"Reply with exactly {marker}"}
-            ],
+            "messages": [{"role": "user", "content": f"Reply with exactly {marker}"}],
         },
     )
     text = "".join(
@@ -716,7 +851,11 @@ def test_claude_text(client, model, iteration):
 
 def test_claude_tool_use(client, model, iteration):
     city = city_for(iteration + 3)
-    data = post_json(client, "/v1/messages", claude_tool_request(model, f"Use get_weather for {city}."))
+    data = post_json(
+        client,
+        "/v1/messages",
+        claude_tool_request(model, f"Use get_weather for {city}."),
+    )
     block = first_claude_tool_use(data)
     assert block["name"] == "get_weather"
     assert block["input"]
@@ -729,7 +868,9 @@ def test_claude_stream_tool_use(client, model, iteration):
         client,
         "/v1/messages",
         {
-            **claude_tool_request(model, f"Stream this request: use get_weather for {city}."),
+            **claude_tool_request(
+                model, f"Stream this request: use get_weather for {city}."
+            ),
             "stream": True,
         },
     )
@@ -751,7 +892,11 @@ def test_claude_stream_tool_use(client, model, iteration):
 
 
 def test_claude_bash_tool_use(client, model, iteration):
-    data = post_json(client, "/v1/messages", claude_bash_tool_request(model, bash_prompt(iteration + 2)))
+    data = post_json(
+        client,
+        "/v1/messages",
+        claude_bash_tool_request(model, bash_prompt(iteration + 2)),
+    )
     block = first_claude_tool_use(data)
     assert_bash_tool_use(block)
     assert data["stop_reason"] == "tool_use"
@@ -788,7 +933,11 @@ def test_claude_tool_result_turn(client, model, iteration):
     city = city_for(iteration + 5)
     condition = CONDITIONS[(iteration + 2) % len(CONDITIONS)]
     temperature = 17 + (iteration % 13)
-    first = post_json(client, "/v1/messages", claude_tool_request(model, f"Use get_weather for {city}."))
+    first = post_json(
+        client,
+        "/v1/messages",
+        claude_tool_request(model, f"Use get_weather for {city}."),
+    )
     tool_use = first_claude_tool_use(first)
     second = post_json(
         client,
@@ -813,14 +962,16 @@ def test_claude_tool_result_turn(client, model, iteration):
             "tools": [CLAUDE_WEATHER_TOOL],
         },
     )
-    assert second["stop_reason"] == "end_turn", json.dumps(second, ensure_ascii=False)[:500]
+    assert second["stop_reason"] == "end_turn", json.dumps(second, ensure_ascii=False)[
+        :500
+    ]
     assert any(
         block.get("type") == "text" and block.get("text", "").strip()
         for block in second["content"]
     ), json.dumps(second, ensure_ascii=False)[:500]
-    assert not any(
-        block.get("type") == "tool_use" for block in second["content"]
-    ), json.dumps(second, ensure_ascii=False)[:500]
+    assert not any(block.get("type") == "tool_use" for block in second["content"]), (
+        json.dumps(second, ensure_ascii=False)[:500]
+    )
 
 
 def claude_tool_request(model, text):
@@ -855,9 +1006,8 @@ def bash_prompt(iteration):
 def red_image_url():
     buffer = io.BytesIO()
     Image.new("RGB", (56, 28), (255, 0, 0)).save(buffer, format="PNG")
-    return (
-        "data:image/png;base64,"
-        + base64.b64encode(buffer.getvalue()).decode("ascii")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode(
+        "ascii"
     )
 
 
@@ -868,7 +1018,9 @@ def city_for(iteration):
 def post_json(client, path, payload):
     response = client.post(path, json=payload)
     if response.status_code != 200:
-        raise AssertionError(f"HTTP {response.status_code}: {response.get_data(as_text=True)[:500]}")
+        raise AssertionError(
+            f"HTTP {response.status_code}: {response.get_data(as_text=True)[:500]}"
+        )
     data = response.get_json()
     if not data:
         raise AssertionError("empty JSON response")
@@ -879,7 +1031,9 @@ def post_json(client, path, payload):
 def post_stream(client, path, payload):
     response = client.post(path, json=payload, buffered=False)
     if response.status_code != 200:
-        raise AssertionError(f"HTTP {response.status_code}: {response.get_data(as_text=True)[:500]}")
+        raise AssertionError(
+            f"HTTP {response.status_code}: {response.get_data(as_text=True)[:500]}"
+        )
     events = []
     for raw in response.response:
         text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
@@ -898,7 +1052,9 @@ def post_stream(client, path, payload):
 def post_claude_stream(client, path, payload):
     response = client.post(path, json=payload, buffered=False)
     if response.status_code != 200:
-        raise AssertionError(f"HTTP {response.status_code}: {response.get_data(as_text=True)[:500]}")
+        raise AssertionError(
+            f"HTTP {response.status_code}: {response.get_data(as_text=True)[:500]}"
+        )
 
     events = []
     current_event = None
@@ -920,7 +1076,9 @@ def post_claude_stream(client, path, payload):
 def first_openai_tool_call(data):
     message = data["choices"][0]["message"]
     tool_calls = message.get("tool_calls") or []
-    assert tool_calls, f"no tool_calls in response: {json.dumps(data, ensure_ascii=False)[:500]}"
+    assert tool_calls, (
+        f"no tool_calls in response: {json.dumps(data, ensure_ascii=False)[:500]}"
+    )
     return tool_calls[0]
 
 
@@ -929,22 +1087,18 @@ def first_responses_function_call(data):
         if item.get("type") == "function_call":
             return item
     raise AssertionError(
-        "no function_call in response: "
-        + json.dumps(data, ensure_ascii=False)[:800]
+        "no function_call in response: " + json.dumps(data, ensure_ascii=False)[:800]
     )
 
 
 def completed_responses_stream(events):
-    failures = [
-        event for event in events if event.get("type") == "response.failed"
-    ]
+    failures = [event for event in events if event.get("type") == "response.failed"]
     assert not failures, json.dumps(failures, ensure_ascii=False)[:800]
     for event in reversed(events):
         if event.get("type") == "response.completed":
             return event["response"]
     raise AssertionError(
-        "no response.completed event: "
-        + json.dumps(events, ensure_ascii=False)[:800]
+        "no response.completed event: " + json.dumps(events, ensure_ascii=False)[:800]
     )
 
 
@@ -952,7 +1106,9 @@ def first_claude_tool_use(data):
     for block in data.get("content", []):
         if block.get("type") == "tool_use":
             return block
-    raise AssertionError(f"no tool_use block: {json.dumps(data, ensure_ascii=False)[:500]}")
+    raise AssertionError(
+        f"no tool_use block: {json.dumps(data, ensure_ascii=False)[:500]}"
+    )
 
 
 def assert_bash_tool_call(tool_call):
@@ -964,7 +1120,10 @@ def assert_bash_tool_call(tool_call):
 def assert_bash_tool_use(block):
     assert block["name"] == "Bash"
     assert isinstance(block.get("input"), dict)
-    assert isinstance(block["input"].get("command"), str) and block["input"]["command"].strip()
+    assert (
+        isinstance(block["input"].get("command"), str)
+        and block["input"]["command"].strip()
+    )
 
 
 def assert_no_error_payload(data):

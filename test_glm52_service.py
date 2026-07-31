@@ -3,15 +3,25 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from genai_proxy.compat.claude import (
     convert_claude_to_openai,
     convert_openai_to_claude_response,
     stream_openai_to_claude,
 )
 from genai_proxy.errors import ProxyError
-from genai_proxy.optimizations.deepseek import DEEPSEEK_V4_REASONING_EFFORT_MAX
 from genai_proxy.routes.claude import map_claude_model_alias
 from genai_proxy.services.genai import GenAIService
+from genai_proxy.token_usage import (
+    official_reasoning_prefix_for_adapter,
+    render_chat_prompt,
+)
+
+DEEPSEEK_V4_REASONING_EFFORT_MAX = official_reasoning_prefix_for_adapter(
+    "deepseek_v4_pro",
+    "max",
+)
 
 OPENAI_WEATHER_TOOL = {
     "type": "function",
@@ -106,7 +116,7 @@ class FakeResponse:
     def __init__(self, lines):
         self._lines = lines
 
-    def iter_lines(self):
+    def iter_lines(self, *args, **kwargs):
         for line in self._lines:
             yield line.encode("utf-8")
 
@@ -197,7 +207,7 @@ def claude_tool_input_from_events(events, tool_name):
     raise AssertionError(json.dumps(events, ensure_ascii=False))
 
 
-def test_glm52_maps_lower_reasoning_effort_to_max():
+def test_glm52_uses_official_default_max_without_duplicate_directive():
     service, captured, fake_post = make_service(
         [
             sse_line({"content": "Done."}),
@@ -216,12 +226,17 @@ def test_glm52_maps_lower_reasoning_effort_to_max():
 
     assert response["choices"][0]["message"]["content"] == "Done."
     system_prompt = captured[0]["messages"][0]["content"]
-    assert system_prompt.startswith("Reasoning Effort: Max\n\n# Tools\n\n"), (
-        system_prompt
+    assert system_prompt.startswith("\n# Tools\n\n")
+    assert "Reasoning Effort:" not in system_prompt
+    rendered = render_chat_prompt(
+        captured[0]["messages"],
+        "glm_5_2",
+        add_generation_prompt=True,
     )
+    assert rendered.count("<|system|>Reasoning Effort: Max") == 1
 
 
-def test_openai_reasoning_effort_max_is_preserved_for_glm52():
+def test_glm52_max_request_does_not_duplicate_template_owned_directive():
     service, captured, fake_post = make_service(
         [
             sse_line({"content": "Done."}),
@@ -238,13 +253,16 @@ def test_openai_reasoning_effort_max_is_preserved_for_glm52():
         response = service.build_openai_completion(request)
 
     assert response["choices"][0]["message"]["content"] == "Done."
-    assert captured[0]["messages"][0] == {
-        "role": "system",
-        "content": "Reasoning Effort: Max",
-    }
+    assert captured[0]["messages"] == request["messages"]
+    rendered = render_chat_prompt(
+        captured[0]["messages"],
+        "glm_5_2",
+        add_generation_prompt=True,
+    )
+    assert rendered.count("<|system|>Reasoning Effort: Max") == 1
 
 
-def test_glm52_openai_reasoning_effort_alias_injects_prompt_without_tools():
+def test_glm52_high_alias_falls_back_to_only_available_upstream_max():
     service, captured, fake_post = make_service(
         [
             sse_line({"content": "Done."}),
@@ -261,10 +279,14 @@ def test_glm52_openai_reasoning_effort_alias_injects_prompt_without_tools():
         response = service.build_openai_completion(request)
 
     assert response["choices"][0]["message"]["content"] == "Done."
-    assert captured[0]["messages"][0] == {
-        "role": "system",
-        "content": "Reasoning Effort: High",
-    }
+    assert captured[0]["messages"] == request["messages"]
+    rendered = render_chat_prompt(
+        captured[0]["messages"],
+        "glm_5_2",
+        add_generation_prompt=True,
+    )
+    assert "<|system|>Reasoning Effort: Max" in rendered
+    assert "Reasoning Effort: High" not in rendered
 
 
 def test_deepseek_v4_reasoning_effort_is_normalized_before_prompt_injection():
@@ -300,9 +322,135 @@ def test_deepseek_v4_reasoning_effort_is_normalized_before_prompt_injection():
         "role": "user",
         "content": "Answer directly.",
     }
+    assert captured[0]["thinking"] is True
+    assert "chatGroupId" not in captured[0]
 
 
-def test_glm52_openai_non_stream_xml_tool_call_uses_reasoning_high():
+def test_deepseek_v4_tool_prompt_accepts_openai_text_content_parts():
+    record = {
+        "aiType": "deepseek-chat",
+        "aiName": "DeepSeek V4 Flash",
+        "descInfo": "DeepSeek V4",
+        "rootModelName": "Xinference",
+        "rootAiType": "xinference",
+    }
+    service, captured, fake_post = make_service(
+        [
+            sse_line({"content": "Done."}),
+            sse_line({}, "stop"),
+        ],
+        record=record,
+    )
+    request = {
+        "model": "deepseek-chat",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Attached file contents.\n"},
+                    {"type": "text", "text": "Run the requested tool."},
+                ],
+            }
+        ],
+        "tools": [OPENAI_BASH_TOOL],
+    }
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        response = service.build_openai_completion(request)
+
+    assert response["choices"][0]["message"]["content"] == "Done."
+    assert [message["role"] for message in captured[0]["messages"]] == [
+        "system",
+        "user",
+    ]
+    assert captured[0]["messages"][1]["content"] == (
+        "Attached file contents.\nRun the requested tool."
+    )
+    assert "chatGroupId" not in captured[0]
+
+
+def test_deepseek_v4_tool_prompt_rejects_non_text_content_parts():
+    record = {
+        "aiType": "deepseek-pro",
+        "aiName": "DeepSeek V4 Pro",
+        "descInfo": "DeepSeek V4",
+        "rootModelName": "Xinference",
+        "rootAiType": "xinference",
+    }
+    service, _, _ = make_service([], record=record)
+    request = {
+        "model": "deepseek-pro",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.invalid/image.png"},
+                    }
+                ],
+            }
+        ],
+        "tools": [OPENAI_BASH_TOOL],
+    }
+
+    with pytest.raises(ProxyError) as exc_info:
+        service.build_openai_completion(request)
+
+    assert exc_info.value.status == 400
+    assert exc_info.value.code == "unsupported_content_type"
+
+
+def test_deepseek_v4_thinking_and_effort_mapping_matches_upstream_capability():
+    record = {
+        "aiType": "deepseek-chat",
+        "aiName": "DeepSeek V4 Flash",
+        "descInfo": "DeepSeek V4",
+        "rootModelName": "Xinference",
+        "rootAiType": "xinference",
+        "enableDeepThink": 1,
+    }
+    cases = (
+        (None, False, False),
+        ("none", False, False),
+        ("minimal", True, False),
+        ("low", True, False),
+        ("medium", True, False),
+        ("high", True, False),
+        ("xhigh", True, True),
+        ("max", True, True),
+    )
+
+    for effort, expected_thinking, expected_max_prefix in cases:
+        service, captured, fake_post = make_service(
+            [
+                sse_line({"content": "Done."}),
+                sse_line({}, "stop"),
+            ],
+            record=record,
+        )
+        request = {
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": "Answer directly."}],
+        }
+        if effort is not None:
+            request["reasoning"] = {"effort": effort}
+
+        with patch("genai_proxy.services.genai.requests.post", fake_post):
+            service.build_openai_completion(request)
+
+        payload = captured[0]
+        assert payload["thinking"] is expected_thinking
+        assert "chatGroupId" not in payload
+        has_max_prefix = (
+            payload["messages"][0]
+            .get("content", "")
+            .startswith(DEEPSEEK_V4_REASONING_EFFORT_MAX)
+        )
+        assert has_max_prefix is expected_max_prefix
+
+
+def test_glm52_openai_non_stream_xml_tool_call_uses_official_default_max():
     service, captured, fake_post = make_service(
         [
             sse_line(
@@ -332,8 +480,16 @@ def test_glm52_openai_non_stream_xml_tool_call_uses_reasoning_high():
     assert tool_call["function"]["name"] == "get_weather"
     assert json.loads(tool_call["function"]["arguments"]) == {"location": "Shanghai"}
     prompt = captured[0]["messages"][0]["content"]
-    assert prompt.startswith("Reasoning Effort: High\n\n# Tools\n\n")
+    assert prompt.startswith("\n# Tools\n\n")
+    assert "Reasoning Effort:" not in prompt
     assert "<|system|>" not in prompt
+    rendered = render_chat_prompt(
+        captured[0]["messages"],
+        "glm_5_2",
+        add_generation_prompt=True,
+    )
+    assert rendered.count("<|system|>Reasoning Effort: Max") == 1
+    assert "Reasoning Effort: High" not in rendered
 
 
 def test_glm52_openai_stream_bash_tool_call_uses_default_reasoning_max():
@@ -376,9 +532,7 @@ def test_glm52_openai_stream_bash_tool_call_uses_default_reasoning_max():
         for event in events
         for choice in event["choices"]
     )
-    assert captured[0]["messages"][0]["content"].startswith(
-        "Reasoning Effort: Max\n\n# Tools\n\n"
-    )
+    assert captured[0]["messages"][0]["content"].startswith("\n# Tools\n\n")
 
 
 def test_glm52_required_tool_choice_accepts_xml_tool_call():
@@ -430,7 +584,7 @@ def test_glm52_tool_choice_none_does_not_return_tool_calls():
     assert not message.get("tool_calls")
     assert message["content"] == "Paris."
     assert (
-        "For this turn, do not call any tool" in captured[0]["messages"][0]["content"]
+        "For this turn, do not call any tool" in captured[0]["messages"][1]["content"]
     )
 
 
@@ -474,12 +628,8 @@ def test_glm52_tool_result_turn_returns_final_text():
         not in captured[0]["messages"][0]["content"]
     )
     assert "<tools>" in captured[0]["messages"][0]["content"]
-    assert captured[0]["messages"][-1]["content"].startswith("<|observation|>")
-    assert "Return the final answer only" not in captured[0]["messages"][-1]["content"]
-    assert (
-        "Do not emit <tool_call>, <arg_key>, or <arg_value> tags"
-        not in captured[0]["messages"][-1]["content"]
-    )
+    assert captured[0]["messages"][-1] == request["messages"][-1]
+    assert captured[0]["messages"][-2] == request["messages"][-2]
 
 
 def test_glm52_native_upstream_tool_call_deltas_are_preserved():
@@ -553,11 +703,159 @@ def test_glm52_openai_stream_reasoning_content_passes_through_without_tools():
     )
 
 
+def test_upstream_reasoning_alias_is_forwarded_without_buffering():
+    service, _captured, fake_post = make_service(
+        [
+            sse_line({"reasoning": "thinking"}),
+            sse_line({"content": "Answer"}),
+            sse_line({}, "stop"),
+        ]
+    )
+    request = {
+        "model": "chatglm",
+        "messages": [{"role": "user", "content": "Answer directly."}],
+        "stream": True,
+    }
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        stream = service.stream_openai_completion(request)
+        first_event = parse_openai_events([next(stream)])[0]
+        remaining = parse_openai_events(stream)
+
+    assert first_event["choices"][0]["delta"]["reasoning_content"] == "thinking"
+    assert any(
+        choice.get("delta", {}).get("content") == "Answer"
+        for event in remaining
+        for choice in event["choices"]
+    )
+
+
+def test_upstream_sse_reader_requests_single_byte_chunks():
+    calls = []
+
+    class TrackingResponse(FakeResponse):
+        def iter_lines(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            yield sse_line({"content": "Answer"}).encode("utf-8")
+            yield sse_line({}, "stop").encode("utf-8")
+
+    service, _captured, _fake_post = make_service([])
+    request = {
+        "model": "chatglm",
+        "messages": [{"role": "user", "content": "Answer directly."}],
+        "stream": True,
+    }
+    with patch(
+        "genai_proxy.services.genai.requests.post",
+        return_value=TrackingResponse([]),
+    ):
+        list(service.stream_openai_completion(request))
+
+    assert calls == [((), {"chunk_size": 1, "decode_unicode": True})]
+
+
+def test_split_think_tags_are_parsed_incrementally_without_leaking_markup():
+    service, _captured, fake_post = make_service(
+        [
+            sse_line({"content": "<thi"}),
+            sse_line({"content": "nk>first"}),
+            sse_line({"content": " step</th"}),
+            sse_line({"content": "ink>Answer"}),
+            sse_line({}, "stop"),
+        ]
+    )
+    request = {
+        "model": "chatglm",
+        "messages": [{"role": "user", "content": "Answer directly."}],
+        "stream": True,
+    }
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        events = parse_openai_events(service.stream_openai_completion(request))
+
+    reasoning = "".join(
+        str(choice.get("delta", {}).get("reasoning_content") or "")
+        for event in events
+        for choice in event["choices"]
+    )
+    content = "".join(
+        str(choice.get("delta", {}).get("content") or "")
+        for event in events
+        for choice in event["choices"]
+    )
+    assert reasoning == "first step"
+    assert content == "Answer"
+    assert "<think>" not in json.dumps(events)
+    assert "</think>" not in json.dumps(events)
+
+
+def test_mid_answer_think_tags_remain_literal_content():
+    service, _captured, fake_post = make_service(
+        [
+            sse_line({"content": "Explain <thi"}),
+            sse_line({"content": "nk>literal</think> safely."}),
+            sse_line({}, "stop"),
+        ]
+    )
+    request = {
+        "model": "chatglm",
+        "messages": [{"role": "user", "content": "Answer directly."}],
+        "stream": True,
+    }
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        events = parse_openai_events(service.stream_openai_completion(request))
+
+    reasoning = "".join(
+        str(choice.get("delta", {}).get("reasoning_content") or "")
+        for event in events
+        for choice in event["choices"]
+    )
+    content = "".join(
+        str(choice.get("delta", {}).get("content") or "")
+        for event in events
+        for choice in event["choices"]
+    )
+    assert reasoning == ""
+    assert content == "Explain <think>literal</think> safely."
+
+
+def test_native_reasoning_field_disables_think_tag_fallback():
+    service, _captured, fake_post = make_service(
+        [
+            sse_line({"reasoning_content": "native", "content": "<think>"}),
+            sse_line({"content": "literal</think>"}),
+            sse_line({}, "stop"),
+        ]
+    )
+    request = {
+        "model": "chatglm",
+        "messages": [{"role": "user", "content": "Answer directly."}],
+        "stream": True,
+    }
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        events = parse_openai_events(service.stream_openai_completion(request))
+
+    reasoning = "".join(
+        str(choice.get("delta", {}).get("reasoning_content") or "")
+        for event in events
+        for choice in event["choices"]
+    )
+    content = "".join(
+        str(choice.get("delta", {}).get("content") or "")
+        for event in events
+        for choice in event["choices"]
+    )
+    assert reasoning == "native"
+    assert content == "<think>literal</think>"
+
+
 def test_tool_stream_forwards_reasoning_before_tool_output_is_consumed():
     steps = []
 
     class IncrementalResponse(FakeResponse):
-        def iter_lines(self):
+        def iter_lines(self, *args, **kwargs):
             steps.append("reasoning")
             yield sse_line({"reasoning_content": "checking"}).encode("utf-8")
             steps.append("tool")
@@ -978,6 +1276,56 @@ def test_claude_rejects_non_official_output_config_effort():
         raise AssertionError("non-Claude output_config effort did not fail")
 
 
+def test_claude_thinking_control_maps_to_deepseek_upstream_switch():
+    record = {
+        "aiType": "deepseek-chat",
+        "aiName": "DeepSeek-V4-Flash",
+        "rootModelName": "Xinference",
+        "rootAiType": "xinference",
+    }
+    model_manager = FakeModelManager(record)
+    cases = (
+        ({"type": "enabled", "budget_tokens": 4096}, None, "high", True),
+        ({"type": "adaptive"}, {"effort": "max"}, "max", True),
+        ({"type": "disabled"}, {"effort": "max"}, "none", False),
+    )
+    for thinking, output_config, expected_effort, expected_thinking in cases:
+        claude_request = {
+            "model": "deepseek-chat",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Answer carefully."}],
+            "thinking": thinking,
+        }
+        if output_config is not None:
+            claude_request["output_config"] = output_config
+        openai_request = convert_claude_to_openai(claude_request, model_manager)
+        assert openai_request["reasoning"] == {"effort": expected_effort}
+
+        service, captured, fake_post = make_service(
+            [sse_line({"content": "Done."}, "stop")],
+            record=record,
+        )
+        with patch("genai_proxy.services.genai.requests.post", fake_post):
+            service.build_openai_completion(openai_request)
+        assert captured[0]["thinking"] is expected_thinking
+        assert "chatGroupId" not in captured[0]
+
+
+def test_claude_rejects_invalid_thinking_control():
+    model_manager = FakeModelManager()
+    for thinking in ("enabled", {}, {"type": "unknown"}):
+        claude_request = {
+            "model": "chatglm",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Answer directly."}],
+            "thinking": thinking,
+        }
+        with pytest.raises(ProxyError) as raised:
+            convert_claude_to_openai(claude_request, model_manager)
+        assert raised.value.status == 400
+        assert raised.value.code == "invalid_thinking_config"
+
+
 def test_claude_model_alias_route_uses_configured_genai_models():
     config = SimpleNamespace(
         claude_haiku_model="deepseek-chat",
@@ -1090,11 +1438,11 @@ def test_claude_route_preserves_shell_strings_across_target_adapters():
 
 
 if __name__ == "__main__":
-    test_glm52_maps_lower_reasoning_effort_to_max()
-    test_openai_reasoning_effort_max_is_preserved_for_glm52()
-    test_glm52_openai_reasoning_effort_alias_injects_prompt_without_tools()
+    test_glm52_uses_official_default_max_without_duplicate_directive()
+    test_glm52_max_request_does_not_duplicate_template_owned_directive()
+    test_glm52_high_alias_falls_back_to_only_available_upstream_max()
     test_deepseek_v4_reasoning_effort_is_normalized_before_prompt_injection()
-    test_glm52_openai_non_stream_xml_tool_call_uses_reasoning_high()
+    test_glm52_openai_non_stream_xml_tool_call_uses_official_default_max()
     test_glm52_openai_stream_bash_tool_call_uses_default_reasoning_max()
     test_glm52_required_tool_choice_accepts_xml_tool_call()
     test_glm52_tool_choice_none_does_not_return_tool_calls()

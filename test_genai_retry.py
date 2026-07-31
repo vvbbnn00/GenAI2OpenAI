@@ -18,7 +18,11 @@ from genai_proxy.retry import (
     retry_delay,
 )
 from genai_proxy.routes.openai import bp as openai_bp
-from genai_proxy.services.genai import GenAIService
+from genai_proxy.services.genai import (
+    GENAI_STREAM_TIMEOUT,
+    GENAI_TIMEOUT_MAX_RETRIES,
+    GenAIService,
+)
 from genai_proxy.services.models import ModelManager
 
 
@@ -49,7 +53,7 @@ class FakeResponse:
         self.text = text or (json.dumps(payload) if payload is not None else "")
         self.closed = False
 
-    def iter_lines(self):
+    def iter_lines(self, *args, **kwargs):
         yield from self._lines
 
     def close(self):
@@ -81,8 +85,12 @@ def make_request():
 
 def completion_lines(content="ok"):
     return [
-        ("data: " + json.dumps({"choices": [{"delta": {"content": content}}]})).encode(),
-        ("data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})).encode(),
+        (
+            "data: " + json.dumps({"choices": [{"delta": {"content": content}}]})
+        ).encode(),
+        (
+            "data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        ).encode(),
     ]
 
 
@@ -97,6 +105,12 @@ class GenAIRetryTests(unittest.TestCase):
     def test_retryable_business_error_excludes_permanent_code_500_errors(self):
         self.assertTrue(is_retryable_business_error(500, "temporary upstream failure"))
         self.assertFalse(is_retryable_business_error(500, "模型不存在"))
+        self.assertFalse(
+            is_retryable_business_error(
+                500,
+                "未找到对应节点信息，请重新设置",
+            )
+        )
         self.assertFalse(is_retryable_business_error(500, "Invalid request parameters"))
         self.assertTrue(is_retryable_business_error(502, "bad gateway"))
 
@@ -106,7 +120,10 @@ class GenAIRetryTests(unittest.TestCase):
 
         with patch(
             "genai_proxy.services.genai.requests.post",
-            side_effect=[requests.ConnectionError("[Errno 101] Network is unreachable"), success],
+            side_effect=[
+                requests.ConnectionError("[Errno 101] Network is unreachable"),
+                success,
+            ],
         ) as post:
             chunks = list(service.stream_openai_completion(make_request()))
 
@@ -127,6 +144,24 @@ class GenAIRetryTests(unittest.TestCase):
         self.assertEqual(post.call_count, 2)
         self.assertTrue(success.closed)
         self.assertTrue(any('"content": "ok"' in chunk for chunk in chunks))
+
+    def test_timeout_retries_are_bounded_independently_of_general_retries(self):
+        service = make_service(max_retries=10)
+
+        with patch(
+            "genai_proxy.services.genai.requests.post",
+            side_effect=requests.ReadTimeout("upstream stalled"),
+        ) as post:
+            with self.assertRaises(ProxyError) as raised:
+                list(service.stream_openai_completion(make_request()))
+
+        self.assertEqual(GENAI_STREAM_TIMEOUT, (10, 90))
+        self.assertEqual(GENAI_TIMEOUT_MAX_RETRIES, 1)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(
+            raised.exception.message,
+            "Upstream stream timed out or stalled",
+        )
 
     def test_retries_retryable_http_status_before_stream_starts(self):
         service = make_service()
@@ -155,33 +190,41 @@ class GenAIRetryTests(unittest.TestCase):
                 list(service.stream_openai_completion(make_request()))
 
         self.assertEqual(raised.exception.status, 502)
-        self.assertEqual(raised.exception.message, "Failed to connect to upstream GenAI")
+        self.assertEqual(
+            raised.exception.message, "Failed to connect to upstream GenAI"
+        )
         self.assertEqual(post.call_count, 3)
 
     def test_does_not_retry_after_stream_content_was_emitted(self):
         service = make_service()
 
         class InterruptedResponse(FakeResponse):
-            def iter_lines(self):
+            def iter_lines(self, *args, **kwargs):
                 yield completion_lines("partial")[0]
                 raise requests.ConnectionError("connection reset")
 
         response = InterruptedResponse()
-        with patch("genai_proxy.services.genai.requests.post", return_value=response) as post:
+        with patch(
+            "genai_proxy.services.genai.requests.post", return_value=response
+        ) as post:
             chunks = list(service.stream_openai_completion(make_request()))
 
         self.assertEqual(post.call_count, 1)
         self.assertTrue(response.closed)
         self.assertTrue(any('"content": "partial"' in chunk for chunk in chunks))
-        self.assertTrue(any("Failed to connect to upstream GenAI" in chunk for chunk in chunks))
+        self.assertTrue(
+            any("Failed to connect to upstream GenAI" in chunk for chunk in chunks)
+        )
 
     def test_non_stream_retries_after_partial_upstream_disconnect(self):
         service = make_service()
 
         class InterruptedResponse(FakeResponse):
-            def iter_lines(self):
+            def iter_lines(self, *args, **kwargs):
                 yield completion_lines("discarded partial")[0]
-                raise requests.exceptions.ChunkedEncodingError("response ended prematurely")
+                raise requests.exceptions.ChunkedEncodingError(
+                    "response ended prematurely"
+                )
 
         interrupted = InterruptedResponse()
         success = FakeResponse(completion_lines("complete"))
@@ -240,37 +283,42 @@ class GenAIRetryTests(unittest.TestCase):
         self.assertTrue(any('"content": "ok"' in chunk for chunk in chunks))
 
     def test_does_not_retry_permanent_business_error_from_stream(self):
-        service = make_service(max_retries=3)
-        business_error = FakeResponse(
-            [
-                (
-                    "data: "
-                    + json.dumps(
-                        {
-                            "success": False,
-                            "code": 500,
-                            "message": "模型不存在",
-                        }
-                    )
-                ).encode()
-            ]
-        )
+        for message in ("模型不存在", "未找到对应节点信息，请重新设置"):
+            with self.subTest(message=message):
+                service = make_service(max_retries=3)
+                business_error = FakeResponse(
+                    [
+                        (
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "success": False,
+                                    "code": 500,
+                                    "message": message,
+                                }
+                            )
+                        ).encode()
+                    ]
+                )
 
-        with patch(
-            "genai_proxy.services.genai.requests.post",
-            return_value=business_error,
-        ) as post:
-            with self.assertRaises(ProxyError) as raised:
-                list(service.stream_openai_completion(make_request()))
+                with patch(
+                    "genai_proxy.services.genai.requests.post",
+                    return_value=business_error,
+                ) as post:
+                    with self.assertRaises(ProxyError) as raised:
+                        list(service.stream_openai_completion(make_request()))
 
-        self.assertEqual(post.call_count, 1)
-        self.assertEqual(raised.exception.message, "Upstream error: 模型不存在")
+                self.assertEqual(post.call_count, 1)
+                self.assertEqual(
+                    raised.exception.message,
+                    f"Upstream error: {message}",
+                )
 
     def test_tool_stream_retries_partial_upstream_disconnect_before_client_output(self):
         service = make_service()
 
         class InterruptedResponse(FakeResponse):
-            def iter_lines(self):
+            def iter_lines(self, *args, **kwargs):
                 yield completion_lines("discarded partial")[0]
                 raise requests.ConnectionError("stream closed")
 
@@ -293,7 +341,10 @@ class GenAIRetryTests(unittest.TestCase):
 
         with patch(
             "genai_proxy.services.genai.requests.post",
-            side_effect=[InterruptedResponse(), FakeResponse(completion_lines("complete"))],
+            side_effect=[
+                InterruptedResponse(),
+                FakeResponse(completion_lines("complete")),
+            ],
         ) as post:
             chunks = list(service.stream_openai_completion(request))
 
@@ -306,7 +357,7 @@ class GenAIRetryTests(unittest.TestCase):
         service = make_service()
 
         class InterruptedResponse(FakeResponse):
-            def iter_lines(self):
+            def iter_lines(self, *args, **kwargs):
                 yield (
                     "data: "
                     + json.dumps(
@@ -595,12 +646,17 @@ class GenAIRetryTests(unittest.TestCase):
             "GPT-4.1",
             {model["id"] for model in response.get_json()["data"]},
         )
+        self.assertIn(
+            "qwen-instruct",
+            {model["id"] for model in response.get_json()["data"]},
+        )
+        self.assertNotIn(
+            "MiniMax-M1",
+            {model["id"] for model in response.get_json()["data"]},
+        )
         self.assertEqual(
             response.headers["Cache-Control"],
-            (
-                "private, max-age=60, stale-while-revalidate=300, "
-                "stale-if-error=86400"
-            ),
+            ("private, max-age=60, stale-while-revalidate=300, stale-if-error=86400"),
         )
 
     def test_retry_settings_are_available_as_cli_options(self):
