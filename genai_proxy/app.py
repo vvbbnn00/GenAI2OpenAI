@@ -2,10 +2,10 @@ from flask import Flask
 from flask_cors import CORS
 
 from genai_proxy.auth import register_auth
+from genai_proxy.chat.service import GenAIService
 from genai_proxy.retry import DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BACKOFF
 from genai_proxy.routes.claude import bp as claude_bp
 from genai_proxy.routes.openai import bp as openai_bp
-from genai_proxy.services.genai import GenAIService
 from genai_proxy.upstream.auth import TokenManager
 from genai_proxy.upstream.catalog import ModelManager
 

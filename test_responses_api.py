@@ -243,12 +243,16 @@ def test_responses_created_event_precedes_prompt_token_counting():
     with (
         patch("genai_proxy.services.genai.requests.post", fake_post),
         patch(
-            "genai_proxy.services.genai.count_openai_request_tokens",
+            "genai_proxy.chat.preparation.count_openai_request_tokens",
+        ) as prepare_count_tokens,
+        patch(
+            "genai_proxy.chat.usage.count_openai_request_tokens",
             return_value=7,
         ) as count_tokens,
     ):
         stream = service.stream_responses(request)
         first_event = parse_response_events([next(stream)])
+        prepare_count_tokens.assert_not_called()
         count_tokens.assert_not_called()
         remaining_events = parse_response_events(stream)
 
@@ -256,6 +260,7 @@ def test_responses_created_event_precedes_prompt_token_counting():
     assert any(
         event["event"] == "response.reasoning_text.delta" for event in remaining_events
     )
+    prepare_count_tokens.assert_not_called()
     count_tokens.assert_called_once()
 
 

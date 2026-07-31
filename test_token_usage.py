@@ -3325,8 +3325,11 @@ def test_chat_stream_without_usage_skips_tokenizer_counting():
     with (
         patch("genai_proxy.services.genai.requests.post", return_value=upstream),
         patch(
-            "genai_proxy.services.genai.count_openai_request_tokens"
-        ) as count_request,
+            "genai_proxy.chat.preparation.count_openai_request_tokens"
+        ) as prepare_count_request,
+        patch(
+            "genai_proxy.chat.usage.count_openai_request_tokens"
+        ) as usage_count_request,
     ):
         body = "".join(
             service.stream_openai_completion(
@@ -3338,7 +3341,8 @@ def test_chat_stream_without_usage_skips_tokenizer_counting():
             )
         )
 
-    count_request.assert_not_called()
+    prepare_count_request.assert_not_called()
+    usage_count_request.assert_not_called()
     chunks = [
         json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: {")
     ]
@@ -3371,7 +3375,10 @@ def test_chat_stream_defers_requested_usage_until_after_first_delta():
     with (
         patch("genai_proxy.services.genai.requests.post", return_value=upstream),
         patch(
-            "genai_proxy.services.genai.count_openai_request_tokens",
+            "genai_proxy.chat.preparation.count_openai_request_tokens",
+        ) as prepare_count_request,
+        patch(
+            "genai_proxy.chat.usage.count_openai_request_tokens",
             return_value=13,
         ) as count_request,
     ):
@@ -3383,12 +3390,15 @@ def test_chat_stream_defers_requested_usage_until_after_first_delta():
                 "stream_options": {"include_usage": True},
             }
         )
+        prepare_count_request.assert_not_called()
         count_request.assert_not_called()
         first = next(stream)
+        prepare_count_request.assert_not_called()
         count_request.assert_not_called()
         remaining = "".join(stream)
 
     assert '"content": "first"' in first
+    prepare_count_request.assert_not_called()
     count_request.assert_called_once()
     assert '"usage"' in remaining
 
