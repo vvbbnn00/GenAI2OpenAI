@@ -1,4 +1,3 @@
-import hashlib
 import json
 import re
 import threading
@@ -68,7 +67,6 @@ from genai_proxy.retry import (
     schedule_retry,
     transient_upstream_error,
 )
-from genai_proxy.services.token_manager import is_genai_auth_failure, parse_jwt_payload
 from genai_proxy.token_usage import (
     count_openai_completion_tokens,
     count_openai_reasoning_tokens,
@@ -76,43 +74,22 @@ from genai_proxy.token_usage import (
     kimi_image_sizes_for_messages,
     tokenizer_family_for_model,
 )
+from genai_proxy.upstream import transport as upstream_transport
+from genai_proxy.upstream.auth import is_genai_auth_failure, parse_jwt_payload
+from genai_proxy.upstream.kimi_history import KimiHistoryCleanupMixin
 
-GENAI_URL = "https://genai.shanghaitech.edu.cn/htk/chat/start/chat"
-GENAI_BASE_HEADERS = {
-    "Accept": "*/*, text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "Content-Type": "application/json",
-    "Origin": "https://genai.shanghaitech.edu.cn",
-    "Referer": "https://genai.shanghaitech.edu.cn/dialogue",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-    ),
-    "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-}
+# Keep the former service-level constants available to existing callers.
+GENAI_BASE_HEADERS = upstream_transport.GENAI_BASE_HEADERS
+GENAI_CURRENT_USER_URL = upstream_transport.GENAI_CURRENT_USER_URL
+GENAI_HISTORY_DELETE_URL = upstream_transport.GENAI_HISTORY_DELETE_URL
+GENAI_HISTORY_LIST_URL = upstream_transport.GENAI_HISTORY_LIST_URL
+GENAI_HISTORY_TIMEOUT = upstream_transport.GENAI_HISTORY_TIMEOUT
+GENAI_STREAM_TIMEOUT = upstream_transport.GENAI_STREAM_TIMEOUT
+GENAI_URL = upstream_transport.GENAI_URL
+GENAI_USER_INFO_URL = upstream_transport.GENAI_USER_INFO_URL
 
-GENAI_USER_INFO_URL = "https://genai.shanghaitech.edu.cn/htk/ai-user-info/list"
-GENAI_CURRENT_USER_URL = "https://genai.shanghaitech.edu.cn/htk/user/info/{token}"
-GENAI_HISTORY_LIST_URL = (
-    "https://genai.shanghaitech.edu.cn/htk/ai/history/listByContentGroup"
-)
-GENAI_HISTORY_DELETE_URL = (
-    "https://genai.shanghaitech.edu.cn/htk/ai/history/delete/groupId"
-)
-GENAI_STREAM_TIMEOUT = (10, 90)
 GENAI_TIMEOUT_MAX_RETRIES = 1
-GENAI_HISTORY_TIMEOUT = (5, 15)
 KIMI_EMPTY_CURRENT_INPUT = "\u200b"
-KIMI_HISTORY_PAGE_SIZE = 200
-KIMI_HISTORY_MAX_PAGES = 50
-KIMI_HISTORY_POLL_ATTEMPTS = 20
-KIMI_HISTORY_POLL_INTERVAL = 0.25
 KIMI_TOOL_ATTEMPTS = 3
 REQUIRED_TOOL_ATTEMPTS = 3
 
@@ -149,13 +126,6 @@ class ResolvedModelContext:
     transport: str
     root_ai_type: str
     root_model_name: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class _KimiHistoryCleanup:
-    question: str
-    user_id: str
-    existing_group_ids: frozenset[str]
 
 
 class _ThinkTagDeltaParser:
@@ -236,7 +206,7 @@ class _ThinkTagDeltaParser:
         return 0
 
 
-class GenAIService:
+class GenAIService(KimiHistoryCleanupMixin):
     def __init__(
         self,
         logger,
@@ -1064,19 +1034,6 @@ class GenAIService:
         }
         return f"data: {json.dumps(chunk)}\n\n"
 
-    def _get_genai_headers(self, token: str | None = None):
-        headers = dict(GENAI_BASE_HEADERS)
-        headers["X-Access-Token"] = (
-            token if token is not None else self._token_manager.token
-        )
-        return headers
-
-    def _get_user_genai_headers(self, user_token: str):
-        return {
-            "Accept": "application/json",
-            "X-Access-Token": user_token,
-        }
-
     def _get_billing_user_id(self, token: str) -> str:
         if self._billing_user_id:
             return self._billing_user_id
@@ -1147,17 +1104,7 @@ class GenAIService:
 
     def _fetch_user_info_record(self, user_token: str, user_id: str):
         try:
-            response = requests.get(
-                GENAI_USER_INFO_URL,
-                params={
-                    "_t": int(time.time()),
-                    "pageNo": 1,
-                    "pageSize": 1,
-                    "userId": user_id,
-                },
-                headers=self._get_user_genai_headers(user_token),
-                timeout=30,
-            )
+            response = upstream_transport.fetch_user_info(user_token, user_id)
         except requests.RequestException as exc:
             self._logger.warning("Failed to fetch user billing info: %s", exc)
             raise transient_upstream_error(
@@ -1239,12 +1186,7 @@ class GenAIService:
 
     def _fetch_current_user_id(self, user_token: str) -> str:
         try:
-            response = requests.get(
-                GENAI_CURRENT_USER_URL.format(token=user_token),
-                params={"_t": int(time.time() * 1000)},
-                headers=self._get_user_genai_headers(user_token),
-                timeout=30,
-            )
+            response = upstream_transport.fetch_current_user(user_token)
         except requests.RequestException as exc:
             self._logger.warning("Failed to fetch current user info: %s", exc)
             raise transient_upstream_error(
@@ -1486,13 +1428,7 @@ class GenAIService:
             think_tag_parser = _ThinkTagDeltaParser()
             request_token = self._token_manager.token
             try:
-                response = requests.post(
-                    GENAI_URL,
-                    headers=self._get_genai_headers(request_token),
-                    json=genai_data,
-                    stream=True,
-                    timeout=GENAI_STREAM_TIMEOUT,
-                )
+                response = upstream_transport.post_chat(request_token, genai_data)
                 self._logger.debug("GenAI Response Status: %d", response.status_code)
 
                 if response.status_code != 200:
@@ -1545,33 +1481,12 @@ class GenAIService:
 
                 finished = False
                 line_count = 0
-                for line in response.iter_lines(chunk_size=1, decode_unicode=True):
+                for line_count, genai_json in upstream_transport.iter_sse_json(
+                    response,
+                    self._logger,
+                ):
                     if finished:
                         break
-
-                    if not line:
-                        continue
-
-                    line_str = line.decode("utf-8") if isinstance(line, bytes) else line
-                    if line_count < 5:
-                        self._logger.debug(
-                            "Raw line [%d]: %s", line_count, line_str[:300]
-                        )
-                    line_count += 1
-
-                    if line_str.startswith("data:"):
-                        line_str = line_str[5:].strip()
-
-                    if not line_str:
-                        continue
-
-                    try:
-                        genai_json = json.loads(line_str)
-                    except json.JSONDecodeError as exc:
-                        self._logger.debug(
-                            "JSON decode error: %s, line: %s", exc, line_str[:200]
-                        )
-                        continue
 
                     if is_genai_auth_failure(genai_json):
                         err_msg = genai_json.get("message", "Unknown upstream error")
@@ -1849,229 +1764,6 @@ class GenAIService:
             operation="GenAI chat request",
             reason=reason,
         )
-
-    def _acquire_kimi_history_lock(self, question: str):
-        key = hashlib.sha256(question.encode("utf-8")).digest()
-        with self._kimi_history_locks_guard:
-            entry = self._kimi_history_locks.get(key)
-            if entry is None:
-                entry = [threading.Lock(), 0]
-                self._kimi_history_locks[key] = entry
-            entry[1] += 1
-            lock = entry[0]
-        lock.acquire()
-        return key, lock
-
-    def _release_kimi_history_lock(self, key: bytes, lock) -> None:
-        lock.release()
-        with self._kimi_history_locks_guard:
-            entry = self._kimi_history_locks.get(key)
-            if entry is None or entry[0] is not lock:
-                return
-            entry[1] -= 1
-            if entry[1] == 0:
-                del self._kimi_history_locks[key]
-
-    def _prepare_kimi_history_cleanup(
-        self,
-        question: str,
-    ) -> _KimiHistoryCleanup | None:
-        try:
-
-            def fetch(token):
-                user_id = self._get_billing_user_id(token)
-                records = self._fetch_kimi_history_records(token, user_id)
-                return user_id, records
-
-            user_id, records = self._with_token_auth_retry(
-                "Kimi K3 history snapshot",
-                fetch,
-            )
-        except Exception as exc:
-            self._logger.warning(
-                "Kimi K3 history cleanup disabled for this request: %s",
-                exc,
-            )
-            return None
-
-        return _KimiHistoryCleanup(
-            question=question,
-            user_id=user_id,
-            existing_group_ids=frozenset(_history_group_ids(records)),
-        )
-
-    def _delete_completed_kimi_history(
-        self,
-        cleanup: _KimiHistoryCleanup,
-    ) -> None:
-        try:
-            candidates = []
-            for attempt in range(KIMI_HISTORY_POLL_ATTEMPTS):
-                records = self._with_token_auth_retry(
-                    "Kimi K3 history lookup",
-                    lambda token: self._fetch_kimi_history_records(
-                        token,
-                        cleanup.user_id,
-                    ),
-                )
-                candidates_by_id = {
-                    str(record["chatGroupId"]): record
-                    for record in records
-                    if isinstance(record, dict)
-                    and record.get("question") == cleanup.question
-                    and str(record.get("chatGroupId") or "")
-                    not in cleanup.existing_group_ids
-                    and record.get("chatGroupId")
-                }
-                candidates = list(candidates_by_id.values())
-                if candidates or attempt == KIMI_HISTORY_POLL_ATTEMPTS - 1:
-                    break
-                time.sleep(KIMI_HISTORY_POLL_INTERVAL)
-
-            if not candidates:
-                self._logger.warning(
-                    "Kimi K3 completed, but its history record was not found"
-                )
-                return
-            if len(candidates) != 1:
-                self._logger.warning(
-                    "Kimi K3 history cleanup found %d new matching records; "
-                    "skipping ambiguous deletion",
-                    len(candidates),
-                )
-                return
-
-            group_id = str(candidates[0]["chatGroupId"])
-            self._with_token_auth_retry(
-                "Kimi K3 history deletion",
-                lambda token: self._delete_kimi_history_group(token, group_id),
-            )
-            self._logger.debug("Deleted completed Kimi K3 history record")
-        except Exception as exc:
-            self._logger.warning("Failed to delete Kimi K3 history record: %s", exc)
-
-    def _fetch_kimi_history_records(
-        self,
-        token: str,
-        user_id: str,
-    ) -> list[dict]:
-        records = []
-        page_number = 1
-        page_count = 1
-        while page_number <= page_count:
-            try:
-                response = requests.get(
-                    GENAI_HISTORY_LIST_URL,
-                    params={
-                        "_t": int(time.time() * 1000),
-                        "pageNo": page_number,
-                        "pageSize": KIMI_HISTORY_PAGE_SIZE,
-                        "userId": user_id,
-                        "question": "",
-                    },
-                    headers=self._get_user_genai_headers(token),
-                    timeout=GENAI_HISTORY_TIMEOUT,
-                )
-            except requests.RequestException as exc:
-                raise transient_upstream_error(
-                    "Failed to fetch Kimi K3 history"
-                ) from exc
-
-            payload = self._decode_kimi_history_response(
-                response,
-                "fetch Kimi K3 history",
-            )
-            result = payload.get("result")
-            if not isinstance(result, dict) or not isinstance(
-                result.get("records"), list
-            ):
-                raise transient_upstream_error("Failed to fetch Kimi K3 history")
-            page_records = result["records"]
-            records.extend(page_records)
-
-            raw_page_count = result.get("pages", 1)
-            try:
-                reported_page_count = max(int(raw_page_count), 1)
-            except (TypeError, ValueError) as exc:
-                raise transient_upstream_error(
-                    "Failed to fetch Kimi K3 history"
-                ) from exc
-            if reported_page_count > KIMI_HISTORY_MAX_PAGES:
-                raise ProxyError(
-                    "Kimi K3 history is too large for safe cleanup",
-                    error_type="upstream_error",
-                    status=502,
-                )
-            page_count = max(page_count, reported_page_count)
-            page_number += 1
-
-        return records
-
-    def _delete_kimi_history_group(self, token: str, group_id: str) -> None:
-        try:
-            response = requests.get(
-                GENAI_HISTORY_DELETE_URL,
-                params={
-                    "_t": int(time.time() * 1000),
-                    "id": group_id,
-                },
-                headers=self._get_user_genai_headers(token),
-                timeout=GENAI_HISTORY_TIMEOUT,
-            )
-        except requests.RequestException as exc:
-            raise transient_upstream_error("Failed to delete Kimi K3 history") from exc
-
-        self._decode_kimi_history_response(
-            response,
-            "delete Kimi K3 history",
-        )
-
-    def _decode_kimi_history_response(self, response, operation: str) -> dict:
-        if response.status_code in (401, 403):
-            raise ProxyError(
-                "Upstream GenAI token is invalid or expired",
-                error_type="authentication_error",
-                code="upstream_auth_failed",
-                status=502,
-            )
-        if response.status_code != 200:
-            if is_retryable_status(response.status_code):
-                raise transient_upstream_error(f"Failed to {operation}")
-            raise ProxyError(
-                f"Failed to {operation}",
-                error_type="upstream_error",
-                status=502,
-            )
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise transient_upstream_error(f"Failed to {operation}") from exc
-
-        if not isinstance(payload, dict):
-            raise transient_upstream_error(f"Failed to {operation}")
-        raw_code = payload.get("code", 200)
-        try:
-            status_code = int(raw_code) if raw_code is not None else 200
-        except (TypeError, ValueError) as exc:
-            raise transient_upstream_error(f"Failed to {operation}") from exc
-        if is_genai_auth_failure(payload) or status_code in (401, 403):
-            raise ProxyError(
-                "Upstream GenAI token is invalid or expired",
-                error_type="authentication_error",
-                code="upstream_auth_failed",
-                status=502,
-            )
-        if status_code >= 400 or payload.get("success") is False:
-            message = payload.get("message") or payload.get("errMsg") or ""
-            if is_retryable_business_error(status_code, message):
-                raise transient_upstream_error(f"Failed to {operation}")
-            raise ProxyError(
-                f"Failed to {operation}",
-                error_type="upstream_error",
-                status=502,
-            )
-        return payload
 
     def _stream_genai_response_with_tools(
         self,
@@ -2778,14 +2470,6 @@ def _has_successful_finish_reason(payload) -> bool:
         if finish_reason is not None:
             return finish_reason != "error"
     return False
-
-
-def _history_group_ids(records: list[dict]) -> set[str]:
-    return {
-        str(record["chatGroupId"])
-        for record in records
-        if isinstance(record, dict) and record.get("chatGroupId")
-    }
 
 
 def _tool_start_tags_for_request(adapter: str, tools: list | None) -> tuple[str, ...]:

@@ -6,8 +6,8 @@ from genai_proxy.retry import DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BACKOFF
 from genai_proxy.routes.claude import bp as claude_bp
 from genai_proxy.routes.openai import bp as openai_bp
 from genai_proxy.services.genai import GenAIService
-from genai_proxy.services.models import ModelManager
-from genai_proxy.services.token_manager import TokenManager
+from genai_proxy.upstream.auth import TokenManager
+from genai_proxy.upstream.catalog import ModelManager
 
 
 def create_app(config, logger):
