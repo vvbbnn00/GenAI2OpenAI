@@ -2,6 +2,7 @@ import importlib
 import importlib.metadata
 import importlib.util
 import sys
+import tomllib
 from pathlib import Path
 
 import genai_proxy
@@ -42,3 +43,17 @@ def test_wsgi_module_builds_its_app_through_the_runtime_factory(monkeypatch):
         assert wsgi.app is sentinel
     finally:
         sys.modules.pop("genai_proxy.wsgi", None)
+
+
+def test_wiki_is_shipped_in_sdist_but_excluded_from_runtime_artifacts():
+    project_root = Path(__file__).resolve().parents[2]
+    project = tomllib.loads((project_root / "pyproject.toml").read_text())
+
+    assert "docs" in project["tool"]["hatch"]["build"]["targets"]["sdist"][
+        "include"
+    ]
+    assert project["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == [
+        "src/genai_proxy"
+    ]
+    assert "COPY docs" not in (project_root / "Dockerfile").read_text()
+    assert "docs" in (project_root / ".dockerignore").read_text().splitlines()

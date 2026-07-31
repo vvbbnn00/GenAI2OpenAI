@@ -45,6 +45,7 @@ packages = ["src/genai_proxy"]
 include = [
     "LICENSE",
     "README.md",
+    "docs",
     "main.py",
     "pyproject.toml",
     "src/genai_proxy",
