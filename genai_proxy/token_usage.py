@@ -1,33 +1,76 @@
 import base64
-import hashlib
 import io
 import ipaddress
 import json
-import logging
 import math
-import os
 import re
 import socket
-import sys
-import tempfile
-import threading
 import urllib.parse
 from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from types import MappingProxyType, ModuleType
+from types import MappingProxyType
 
 import requests
-import tiktoken
-from jinja2.exceptions import TemplateError
-from jinja2.sandbox import ImmutableSandboxedEnvironment
 from PIL import Image, ImageFile, UnidentifiedImageError
-from tiktoken.load import load_tiktoken_bpe
-from tokenizers import Tokenizer
 from urllib3 import HTTPConnectionPool, HTTPSConnectionPool, Timeout
 from urllib3.exceptions import HTTPError
 
 from genai_proxy.errors import ProxyError
+from genai_proxy.models.deepseek_v4.codec import (
+    DEEPSEEK_V4_FLASH_SPEC,
+    DEEPSEEK_V4_PRO_SPEC,
+    official_reasoning_prefix as _deepseek_reasoning_prefix,
+    official_tool_prompt as _deepseek_tool_prompt,
+    official_transport_messages as _deepseek_transport_messages,
+    serialize_completion as _serialize_deepseek_completion,
+)
+from genai_proxy.models.glm52.codec import (
+    GLM_5_1_SPEC,
+    GLM_5_2_SPEC,
+    official_tool_prompt as _glm_tool_prompt,
+    serialize_completion as _serialize_glm_completion,
+)
+from genai_proxy.models.hf_assets import (
+    Artifact,
+    ArtifactChecksumError,
+    HF_BASE_URL,
+    TOKENIZER_CACHE_ENV,
+    TokenizerSpec,
+    artifact_path as _artifact_path,
+    download_artifact as _download_artifact,
+    load_python_encoder as _load_python_encoder,
+    load_template as _load_template,
+    load_tokenizer as _load_hf_tokenizer,
+    sha256 as _sha256,
+    tokenizer_error as _tokenizer_error,
+)
+from genai_proxy.models.kimi_k3.codec import (
+    IMAGE_IN_PATCH_LIMIT as KIMI_IMAGE_IN_PATCH_LIMIT,
+    IMAGE_MERGE_KERNEL_SIZE as KIMI_IMAGE_MERGE_KERNEL_SIZE,
+    IMAGE_PATCH_LIMIT as KIMI_IMAGE_PATCH_LIMIT,
+    IMAGE_PATCH_SIZE as KIMI_IMAGE_PATCH_SIZE,
+    KIMI_K3_SPEC,
+    PATTERN as KIMI_PAT_STR,
+    SPECIAL_TOKEN_OVERRIDES as KIMI_SPECIAL_TOKEN_OVERRIDES,
+    build_tokenizer as _build_kimi_tokenizer,
+    image_token_count as _kimi_codec_image_token_count,
+)
+from genai_proxy.models.legacy.minimax_codec import (
+    MINIMAX_M2_7_SPEC,
+    official_default_system_prompt as _minimax_default_system_prompt,
+    official_tool_prompt as _minimax_tool_prompt,
+    serialize_completion as _serialize_minimax_completion,
+)
+from genai_proxy.models.qwen35.codec import (
+    IMAGE_MAX_ASPECT_RATIO as QWEN_IMAGE_MAX_ASPECT_RATIO,
+    IMAGE_MAX_PIXELS as QWEN_IMAGE_MAX_PIXELS,
+    IMAGE_MERGE_SIZE as QWEN_IMAGE_MERGE_SIZE,
+    IMAGE_MIN_PIXELS as QWEN_IMAGE_MIN_PIXELS,
+    IMAGE_PATCH_SIZE as QWEN_IMAGE_PATCH_SIZE,
+    QWEN_3_5_SPEC,
+    image_token_count as _qwen_codec_image_token_count,
+    official_tool_prompt as _qwen_tool_prompt,
+    serialize_completion as _serialize_qwen_completion,
+)
 from genai_proxy.models.registry import (
     DEEPSEEK_V4_FLASH_ADAPTER,
     DEEPSEEK_V4_PRO_ADAPTER,
@@ -37,172 +80,12 @@ from genai_proxy.models.registry import (
     MINIMAX_ADAPTER,
     QWEN_3_5_ADAPTER,
 )
-from genai_proxy.retry import (
-    DEFAULT_MAX_RETRIES,
-    DEFAULT_RETRY_BACKOFF,
-    is_retryable_status,
-    schedule_retry,
-)
 
-HF_BASE_URL = "https://huggingface.co"
-TOKENIZER_CACHE_ENV = "GENAI_TOKENIZER_CACHE"
 KIMI_IMAGE_MAX_BYTES = 50 * 1024 * 1024
-# Values from preprocessor_config.json at KIMI_K3_SPEC.revision.
-KIMI_IMAGE_PATCH_SIZE = 14
-KIMI_IMAGE_MERGE_KERNEL_SIZE = 2
-KIMI_IMAGE_PATCH_LIMIT = 512
-KIMI_IMAGE_IN_PATCH_LIMIT = 65536
 KIMI_IMAGE_MAX_REDIRECTS = 5
-# Values from Qwen3.5-397B-A17B preprocessor_config.json at
-# QWEN_3_5_SPEC.revision.
-QWEN_IMAGE_PATCH_SIZE = 16
-QWEN_IMAGE_MERGE_SIZE = 2
-QWEN_IMAGE_MIN_PIXELS = 65536
-QWEN_IMAGE_MAX_PIXELS = 16777216
-QWEN_IMAGE_MAX_ASPECT_RATIO = 200
 # Common fake-IP range used by transparent DNS proxies such as Mihomo.
 KIMI_IMAGE_TRANSPARENT_PROXY_NETWORKS = (ipaddress.ip_network("198.18.0.0/15"),)
-_logger = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True, slots=True)
-class Artifact:
-    path: str
-    sha256: str
-
-
-@dataclass(frozen=True, slots=True)
-class TokenizerSpec:
-    family: str
-    repository: str
-    revision: str
-    tokenizer: Artifact
-    template: Artifact | None = None
-    encoder: Artifact | None = None
-
-
-GLM_5_2_SPEC = TokenizerSpec(
-    family="glm_5_2",
-    repository="zai-org/GLM-5.2",
-    revision="b4734de4facf877f85769a911abafc5283eab3d9",
-    tokenizer=Artifact(
-        "tokenizer.json",
-        "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
-    ),
-    template=Artifact(
-        "chat_template.jinja",
-        "172dc74a35e1752df75ecfb2b2cf9326d2852bb1379868ebeec9571654489679",
-    ),
-)
-
-GLM_5_1_SPEC = TokenizerSpec(
-    family="glm_5_1",
-    repository="zai-org/GLM-5.1",
-    revision="26e1bd6e011feb778d25ae34b09b07074139d92d",
-    tokenizer=GLM_5_2_SPEC.tokenizer,
-    template=Artifact(
-        "chat_template.jinja",
-        "03b1bbff20331e54647c68167e8ac7f0b5b7ceb40ead372f44826624a9ad79cd",
-    ),
-)
-
-DEEPSEEK_V4_PRO_SPEC = TokenizerSpec(
-    family="deepseek_v4_pro",
-    repository="deepseek-ai/DeepSeek-V4-Pro",
-    revision="b5968e9190ef611bbf34a7229255be88a0e937c1",
-    tokenizer=Artifact(
-        "tokenizer.json",
-        "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
-    ),
-    encoder=Artifact(
-        "encoding/encoding_dsv4.py",
-        "bdbd57c132a1b3725042323d02b98b9d1df28e5f388f134399555d041f5055e0",
-    ),
-)
-
-DEEPSEEK_V4_FLASH_SPEC = TokenizerSpec(
-    family="deepseek_v4_flash",
-    repository="deepseek-ai/DeepSeek-V4-Flash",
-    revision="60d8d70770c6776ff598c94bb586a859a38244f1",
-    tokenizer=DEEPSEEK_V4_PRO_SPEC.tokenizer,
-    encoder=DEEPSEEK_V4_PRO_SPEC.encoder,
-)
-
-# The full MoE checkpoint is deliberately the canonical Qwen3.5 source. The
-# smaller checkpoints currently publish identical tokenizer assets, but they
-# are not used as the revision authority here.
-QWEN_3_5_SPEC = TokenizerSpec(
-    family="qwen_3_5",
-    repository="Qwen/Qwen3.5-397B-A17B",
-    revision="8472618112abcbd45acbcdc58436aff4233c23f7",
-    tokenizer=Artifact(
-        "tokenizer.json",
-        "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
-    ),
-    template=Artifact(
-        "chat_template.jinja",
-        "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
-    ),
-)
-
-MINIMAX_M2_7_SPEC = TokenizerSpec(
-    family="minimax_m2_7",
-    repository="MiniMaxAI/MiniMax-M2.7",
-    revision="d494266a4affc0d2995ba1fa35c8481cbd84294b",
-    tokenizer=Artifact(
-        "tokenizer.json",
-        "757622126525aeeb131756849d93298070ff3f0319c455ec8c5bb0f6b1cebbe8",
-    ),
-    template=Artifact(
-        "chat_template.jinja",
-        "893d908f7b5cc65fdde270dcae5ea1a99647c6a7ce572ae874a57b7160069566",
-    ),
-)
-
-KIMI_K3_SPEC = TokenizerSpec(
-    family="kimi_k3",
-    repository="moonshotai/Kimi-K3",
-    revision="9f62e4e9fffbd0a83ddd60e1c209d828994b3569",
-    tokenizer=Artifact(
-        "tiktoken.model",
-        "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103",
-    ),
-    encoder=Artifact(
-        "encoding_k3.py",
-        "b9cb7ae100fed34b9337f80dacee5abbf7e261fe9b74bc0e76366701d46f5333",
-    ),
-)
-
-KIMI_PAT_STR = "|".join(
-    [
-        r"[\p{Han}]+",
-        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
-        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
-        r"\p{N}{1,3}",
-        r" ?[^\s\p{L}\p{N}]+[\r\n]*",
-        r"\s*[\r\n]+",
-        r"\s+(?!\S)",
-        r"\s+",
-    ]
-)
-KIMI_SPECIAL_TOKEN_OVERRIDES = {
-    163584: "[BOS]",
-    163585: "[EOS]",
-    163586: "<|end_of_msg|>",
-    163587: "<|open|>",
-    163588: "<|close|>",
-    163589: "<|sep|>",
-    163590: "[start_header_id]",
-    163591: "[end_header_id]",
-    163593: "[EOT]",
-    163602: "<|media_begin|>",
-    163603: "<|media_content|>",
-    163604: "<|media_end|>",
-    163605: "<|media_pad|>",
-    163649: "<osagent_mode>",
-    163838: "[UNK]",
-    163839: "[PAD]",
-}
 
 SPECS = MappingProxyType(
     {
@@ -218,12 +101,6 @@ SPECS = MappingProxyType(
         )
     }
 )
-
-_cache_lock = threading.RLock()
-_tokenizers = {}
-_templates = {}
-_encoders = {}
-
 
 def tokenizer_family_for_model(
     model: str | None,
@@ -289,92 +166,22 @@ def official_tool_prompt_for_adapter(
             if adapter == DEEPSEEK_V4_PRO_ADAPTER
             else DEEPSEEK_V4_FLASH_SPEC
         )
-        encoder = _load_python_encoder(spec)
-        return encoder["render_tools"](
-            encoder["tools_from_openai_format"](function_tools)
-        )
-
-    spec = {
-        GLM_5_1_ADAPTER: GLM_5_1_SPEC,
-        GLM_5_2_ADAPTER: GLM_5_2_SPEC,
-        QWEN_3_5_ADAPTER: QWEN_3_5_SPEC,
-        MINIMAX_ADAPTER: MINIMAX_M2_7_SPEC,
-    }.get(adapter)
-    if spec is None:
-        return None
-
-    serialized_tools = json.dumps(
-        function_tools,
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    sentinel = "__GENAI2OPENAI_SYSTEM_SENTINEL__"
-    while sentinel in serialized_tools:
-        sentinel += "_"
-    messages = [
-        {"role": "system", "content": sentinel},
-        {"role": "user", "content": "__GENAI2OPENAI_USER_SENTINEL__"},
-    ]
-    template = _load_template(spec)
-    prompt = template.render(
-        messages=messages,
-        tools=function_tools,
-        add_generation_prompt=True,
-        enable_thinking=True,
-        clear_thinking=True,
-        add_vision_id=False,
-    )
-    try:
-        if adapter == QWEN_3_5_ADAPTER:
-            start_marker = "<|im_start|>system\n"
-            end_marker = f"\n\n{sentinel}<|im_end|>"
-            start = prompt.index(start_marker) + len(start_marker)
-            end = prompt.index(end_marker, start)
-            return prompt[start:end]
-
-        if adapter == MINIMAX_ADAPTER:
-            start_marker = f"]~!b[]~b]system\n{sentinel}\n\n"
-            start = prompt.index(start_marker) + len(start_marker)
-            end = prompt.index("[e~[\n", start)
-            return prompt[start:end]
-
-        system_marker = f"<|system|>{sentinel}"
-        end = prompt.index(system_marker)
-        baseline = template.render(
-            messages=messages,
-            tools=None,
-            add_generation_prompt=True,
-            enable_thinking=True,
-            clear_thinking=True,
-            add_vision_id=False,
-        )
-        baseline_prefix = baseline[: baseline.index(sentinel)]
-        if not prompt.startswith(baseline_prefix):
-            raise ValueError("official GLM tool prompt boundary changed")
-        return prompt[len(baseline_prefix) : end]
-    except ValueError as exc:
-        raise _tokenizer_error(spec, "extract official tool prompt", exc) from exc
+        return _deepseek_tool_prompt(spec, function_tools)
+    if adapter == GLM_5_1_ADAPTER:
+        return _glm_tool_prompt(GLM_5_1_SPEC, function_tools)
+    if adapter == GLM_5_2_ADAPTER:
+        return _glm_tool_prompt(GLM_5_2_SPEC, function_tools)
+    if adapter == QWEN_3_5_ADAPTER:
+        return _qwen_tool_prompt(function_tools)
+    if adapter == MINIMAX_ADAPTER:
+        return _minimax_tool_prompt(function_tools)
+    return None
 
 
 def official_default_system_prompt_for_adapter(adapter: str | None) -> str | None:
     if adapter != MINIMAX_ADAPTER:
         return None
-    prompt = _load_template(MINIMAX_M2_7_SPEC).render(
-        messages=[{"role": "user", "content": "__GENAI2OPENAI_USER_SENTINEL__"}],
-        tools=None,
-        add_generation_prompt=True,
-    )
-    start_marker = "]~!b[]~b]system\n"
-    try:
-        start = prompt.index(start_marker) + len(start_marker)
-        end = prompt.index("[e~[\n", start)
-        return prompt[start:end]
-    except ValueError as exc:
-        raise _tokenizer_error(
-            MINIMAX_M2_7_SPEC,
-            "extract official default system prompt",
-            exc,
-        ) from exc
+    return _minimax_default_system_prompt()
 
 
 def official_reasoning_prefix_for_adapter(
@@ -391,47 +198,7 @@ def official_reasoning_prefix_for_adapter(
         if adapter == DEEPSEEK_V4_PRO_ADAPTER
         else DEEPSEEK_V4_FLASH_SPEC
     )
-    return str(_load_python_encoder(spec)["REASONING_EFFORT_MAX"])
-
-
-def _normalize_deepseek_text_messages(messages) -> list[dict]:
-    normalized = []
-    for message in messages:
-        copied = dict(message)
-        content = copied.get("content")
-        if content is None or isinstance(content, str):
-            normalized.append(copied)
-            continue
-        if not isinstance(content, list):
-            raise ProxyError(
-                "DeepSeek V4 message content must be a string or text content parts",
-                error_type="invalid_request_error",
-                code="unsupported_content_type",
-                status=400,
-            )
-
-        text_parts = []
-        for part in content:
-            part_type = part.get("type") if isinstance(part, dict) else None
-            if part_type not in {"text", "input_text", "output_text"}:
-                raise ProxyError(
-                    "DeepSeek V4 accepts only text content parts",
-                    error_type="invalid_request_error",
-                    code="unsupported_content_type",
-                    status=400,
-                )
-            text = part.get("text")
-            if not isinstance(text, str):
-                raise ProxyError(
-                    "DeepSeek V4 text content parts require a string 'text' field",
-                    error_type="invalid_request_error",
-                    code="unsupported_content_type",
-                    status=400,
-                )
-            text_parts.append(text)
-        copied["content"] = "".join(text_parts)
-        normalized.append(copied)
-    return normalized
+    return _deepseek_reasoning_prefix(spec, effort)
 
 
 def official_deepseek_transport_messages(
@@ -450,108 +217,13 @@ def official_deepseek_transport_messages(
         if adapter == DEEPSEEK_V4_PRO_ADAPTER
         else DEEPSEEK_V4_FLASH_SPEC
     )
-    encoder = _load_python_encoder(spec)
-    function_tools = [
-        tool
-        for tool in tools or []
-        if isinstance(tool, dict) and tool.get("type") == "function"
-    ]
-    if not function_tools:
-        raise ProxyError(
-            "DeepSeek V4 requires at least one function tool",
-            error_type="invalid_request_error",
-            code="unsupported_tool_type",
-            status=400,
-        )
-    # Chat Completions clients such as OMP send attached text files as an
-    # array of text parts. DeepSeek's official encoder accepts OpenAI message
-    # objects but expects their ``content`` fields to be strings.
-    official_messages = _normalize_deepseek_text_messages(messages)
-    if official_messages and official_messages[0].get("role") in {
-        "system",
-        "developer",
-    }:
-        official_messages[0]["tools"] = function_tools
-    else:
-        official_messages.insert(
-            0,
-            {"role": "system", "content": "", "tools": function_tools},
-        )
-    if tool_choice_suffix:
-        official_messages.insert(
-            1,
-            {"role": "system", "content": tool_choice_suffix},
-        )
-
-    effort = (reasoning_config or {}).get("effort")
-    thinking = effort not in (None, "none")
-    reasoning_effort = effort if thinking else None
-    thinking_mode = "thinking" if thinking else "chat"
-    prompt = encoder["encode_messages"](
-        official_messages,
-        thinking_mode=thinking_mode,
-        drop_thinking=True,
-        add_default_bos_token=True,
-        reasoning_effort=reasoning_effort,
+    return _deepseek_transport_messages(
+        spec,
+        messages,
+        tools,
+        reasoning_config=reasoning_config,
+        tool_choice_suffix=tool_choice_suffix,
     )
-
-    processed = encoder["merge_tool_messages"](official_messages)
-    processed = encoder["sort_tool_results_by_call_order"](processed)
-    last_user_index = encoder["find_last_user_index"](processed)
-    if last_user_index != len(processed) - 1:
-        raise ProxyError(
-            "DeepSeek V4 tool transport requires the final message to be user or tool",
-            error_type="invalid_request_error",
-            code="unsupported_message_sequence",
-            status=400,
-        )
-
-    rendered_user = encoder["render_message"](
-        last_user_index,
-        processed,
-        thinking_mode=thinking_mode,
-        drop_thinking=False,
-        reasoning_effort=reasoning_effort,
-    )
-    user_prefix = str(encoder["USER_SP_TOKEN"])
-    assistant_suffix = str(encoder["ASSISTANT_SP_TOKEN"]) + str(
-        encoder["thinking_start_token"] if thinking else encoder["thinking_end_token"]
-    )
-    bos = str(encoder["bos_token"])
-    if (
-        not prompt.startswith(bos)
-        or not rendered_user.startswith(user_prefix)
-        or not rendered_user.endswith(assistant_suffix)
-        or not prompt.endswith(rendered_user)
-    ):
-        raise _tokenizer_error(
-            spec,
-            "construct official DeepSeek V4 transport",
-            ValueError("official encoder boundaries changed"),
-        )
-
-    prefix = prompt[len(bos) : -len(rendered_user)]
-    user_content = rendered_user[
-        len(user_prefix) : len(rendered_user) - len(assistant_suffix)
-    ]
-    transported = [
-        {"role": "system", "content": prefix},
-        {"role": "user", "content": user_content},
-    ]
-    verification = encoder["encode_messages"](
-        transported,
-        thinking_mode=thinking_mode,
-        drop_thinking=True,
-        add_default_bos_token=True,
-        reasoning_effort=None,
-    )
-    if verification != prompt:
-        raise _tokenizer_error(
-            spec,
-            "verify official DeepSeek V4 transport",
-            ValueError("transport rendering differs from official prompt"),
-        )
-    return transported
 
 
 def count_openai_request_tokens(
@@ -1081,28 +753,7 @@ def _invalid_image(message: str) -> ProxyError:
 
 
 def _kimi_image_token_count(width: int, height: int) -> int:
-    scale = min(
-        1.0,
-        math.sqrt(
-            KIMI_IMAGE_IN_PATCH_LIMIT
-            / (
-                max(1.0, width // KIMI_IMAGE_PATCH_SIZE)
-                * max(1.0, height // KIMI_IMAGE_PATCH_SIZE)
-            )
-        ),
-        KIMI_IMAGE_PATCH_LIMIT * KIMI_IMAGE_PATCH_SIZE / width,
-        KIMI_IMAGE_PATCH_LIMIT * KIMI_IMAGE_PATCH_SIZE / height,
-    )
-    new_width = min(
-        max(1, int(width * scale)),
-        KIMI_IMAGE_PATCH_LIMIT * KIMI_IMAGE_PATCH_SIZE,
-    )
-    new_height = min(
-        max(1, int(height * scale)),
-        KIMI_IMAGE_PATCH_LIMIT * KIMI_IMAGE_PATCH_SIZE,
-    )
-    factor = KIMI_IMAGE_MERGE_KERNEL_SIZE * KIMI_IMAGE_PATCH_SIZE
-    return math.ceil(new_width / factor) * math.ceil(new_height / factor)
+    return _kimi_codec_image_token_count(width, height)
 
 
 def _qwen_image_token_count(width: int, height: int) -> int:
@@ -1110,28 +761,7 @@ def _qwen_image_token_count(width: int, height: int) -> int:
     if max(width, height) / min(width, height) > QWEN_IMAGE_MAX_ASPECT_RATIO:
         raise _invalid_image("Qwen 3.5 image aspect ratio must not exceed 200:1")
 
-    factor = QWEN_IMAGE_PATCH_SIZE * QWEN_IMAGE_MERGE_SIZE
-    resized_height = round(height / factor) * factor
-    resized_width = round(width / factor) * factor
-    resized_pixels = resized_height * resized_width
-    if resized_pixels > QWEN_IMAGE_MAX_PIXELS:
-        beta = math.sqrt((height * width) / QWEN_IMAGE_MAX_PIXELS)
-        resized_height = max(
-            factor,
-            math.floor(height / beta / factor) * factor,
-        )
-        resized_width = max(
-            factor,
-            math.floor(width / beta / factor) * factor,
-        )
-    elif resized_pixels < QWEN_IMAGE_MIN_PIXELS:
-        beta = math.sqrt(QWEN_IMAGE_MIN_PIXELS / (height * width))
-        resized_height = math.ceil(height * beta / factor) * factor
-        resized_width = math.ceil(width * beta / factor) * factor
-
-    grid_height = resized_height // QWEN_IMAGE_PATCH_SIZE
-    grid_width = resized_width // QWEN_IMAGE_PATCH_SIZE
-    return grid_height * grid_width // (QWEN_IMAGE_MERGE_SIZE**2)
+    return _qwen_codec_image_token_count(width, height)
 
 
 def estimate_token_by_model(model: str | None, text: str) -> int:
@@ -1177,149 +807,8 @@ def estimate_claude_request_tokens(
 
 
 def _load_tokenizer(spec: TokenizerSpec):
-    with _cache_lock:
-        tokenizer = _tokenizers.get(spec.tokenizer.sha256)
-        if tokenizer is None:
-            path = _artifact_path(spec, spec.tokenizer)
-            try:
-                if spec.family == KIMI_K3_SPEC.family:
-                    mergeable_ranks = load_tiktoken_bpe(str(path))
-                    base_tokens = len(mergeable_ranks)
-                    special_tokens = {
-                        KIMI_SPECIAL_TOKEN_OVERRIDES.get(
-                            token_id, f"<|reserved_token_{token_id}|>"
-                        ): token_id
-                        for token_id in range(base_tokens, base_tokens + 256)
-                    }
-                    tokenizer = tiktoken.Encoding(
-                        name=path.name,
-                        pat_str=KIMI_PAT_STR,
-                        mergeable_ranks=mergeable_ranks,
-                        special_tokens=special_tokens,
-                    )
-                else:
-                    tokenizer = Tokenizer.from_file(str(path))
-            except Exception as exc:
-                raise _tokenizer_error(spec, "load tokenizer", exc) from exc
-            _tokenizers[spec.tokenizer.sha256] = tokenizer
-        return tokenizer
-
-
-def _load_template(spec: TokenizerSpec):
-    with _cache_lock:
-        template = _templates.get(spec.family)
-        if template is None:
-            if spec.template is None:
-                raise _tokenizer_error(spec, "load missing chat template")
-            source = _artifact_path(spec, spec.template).read_text(encoding="utf-8")
-            environment = ImmutableSandboxedEnvironment(
-                trim_blocks=True,
-                lstrip_blocks=True,
-                autoescape=False,
-                extensions=["jinja2.ext.loopcontrols"],
-            )
-            environment.filters["tojson"] = _tojson
-            environment.globals["raise_exception"] = _raise_template_exception
-            environment.globals["strftime_now"] = _strftime_now
-            template = environment.from_string(source)
-            _templates[spec.family] = template
-        return template
-
-
-def _load_python_encoder(spec: TokenizerSpec):
-    with _cache_lock:
-        cache_key = spec.encoder.sha256 if spec.encoder else spec.family
-        encoder = _encoders.get(cache_key)
-        if encoder is None:
-            if spec.encoder is None:
-                raise _tokenizer_error(spec, "load missing message encoder")
-            path = _artifact_path(spec, spec.encoder)
-            module_name = f"_genai_{spec.family}_encoding"
-            module = ModuleType(module_name)
-            module.__file__ = str(path)
-            namespace = module.__dict__
-            try:
-                sys.modules[module_name] = module
-                source = path.read_text(encoding="utf-8")
-                exec(compile(source, str(path), "exec"), namespace)
-                encoder = namespace
-            except Exception as exc:
-                sys.modules.pop(module_name, None)
-                raise _tokenizer_error(spec, "load message encoder", exc) from exc
-            _encoders[cache_key] = encoder
-        return encoder
-
-
-def _artifact_path(spec: TokenizerSpec, artifact: Artifact) -> Path:
-    cache_dir = Path(
-        os.environ.get(TOKENIZER_CACHE_ENV)
-        or Path.home() / ".cache" / "genai2openai" / "tokenizers"
-    )
-    filename = f"{artifact.sha256[:12]}-{Path(artifact.path).name}"
-    destination = cache_dir / filename
-
-    with _cache_lock:
-        if destination.is_file() and _sha256(destination) == artifact.sha256:
-            return destination
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        url = f"{HF_BASE_URL}/{spec.repository}/resolve/{spec.revision}/{artifact.path}"
-        retry_count = 0
-        while True:
-            try:
-                _download_artifact(url, cache_dir, destination, artifact.sha256)
-                return destination
-            except Exception as exc:
-                status_code = getattr(
-                    getattr(exc, "response", None), "status_code", None
-                )
-                retryable = (
-                    isinstance(exc, requests.RequestException)
-                    and (status_code is None or is_retryable_status(status_code))
-                ) or isinstance(exc, ArtifactChecksumError)
-                if retryable and schedule_retry(
-                    _logger,
-                    max_retries=DEFAULT_MAX_RETRIES,
-                    backoff=DEFAULT_RETRY_BACKOFF,
-                    retry_count=retry_count,
-                    operation=f"tokenizer artifact download for {spec.repository}",
-                    reason=str(exc),
-                ):
-                    retry_count += 1
-                    continue
-                raise _tokenizer_error(spec, f"download {artifact.path}", exc) from exc
-
-
-class ArtifactChecksumError(ValueError):
-    pass
-
-
-def _download_artifact(
-    url: str,
-    cache_dir: Path,
-    destination: Path,
-    expected_sha256: str,
-) -> None:
-    temporary_path = None
-    response = None
-    try:
-        response = requests.get(url, stream=True, timeout=(10, 120))
-        response.raise_for_status()
-        with tempfile.NamedTemporaryFile(dir=cache_dir, delete=False) as temporary:
-            temporary_path = Path(temporary.name)
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    temporary.write(chunk)
-        if _sha256(temporary_path) != expected_sha256:
-            raise ArtifactChecksumError("downloaded artifact checksum mismatch")
-        temporary_path.replace(destination)
-    finally:
-        if response is not None:
-            try:
-                response.close()
-            except Exception:
-                pass
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+    factory = _build_kimi_tokenizer if spec.family == KIMI_K3_SPEC.family else None
+    return _load_hf_tokenizer(spec, factory=factory)
 
 
 def _count_encoded(family: str, text: str) -> int:
@@ -1377,50 +866,6 @@ def _split_whitespace_runs(text: str, maximum: int):
                 start = index
                 run_length = 1
     yield text[start:]
-
-
-def _tokenizer_error(
-    spec: TokenizerSpec, operation: str, exc: Exception | None = None
-) -> ProxyError:
-    detail = f": {exc}" if exc else ""
-    return ProxyError(
-        f"Unable to {operation} for {spec.repository}{detail}",
-        error_type="api_error",
-        code="tokenizer_unavailable",
-        status=503,
-    )
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _tojson(
-    value,
-    ensure_ascii=False,
-    indent=None,
-    separators=None,
-    sort_keys=False,
-):
-    return json.dumps(
-        value,
-        ensure_ascii=ensure_ascii,
-        indent=indent,
-        separators=separators,
-        sort_keys=sort_keys,
-    )
-
-
-def _raise_template_exception(message):
-    raise TemplateError(message)
-
-
-def _strftime_now(format_string):
-    return datetime.now().strftime(format_string)
 
 
 def _normalize_messages(messages, *, parse_tool_arguments: bool) -> list[dict]:
@@ -1494,135 +939,26 @@ def _serialized_completion(
             str(reasoning).strip() if family == QWEN_3_5_SPEC.family else str(reasoning)
         )
 
-    include_end_token = finish_reason != "length"
-
     if family.startswith("deepseek_v4"):
-        parts = (
-            [str(content)]
-            if thinking is False
-            else [str(reasoning), "</think>", str(content)]
+        return _serialize_deepseek_completion(
+            message,
+            finish_reason=finish_reason,
+            thinking=thinking,
         )
-        if tool_calls:
-            parts.append(_deepseek_tool_calls(tool_calls))
-        if include_end_token:
-            parts.append("<｜end▁of▁sentence｜>")
-        return "".join(parts)
 
     if family in (GLM_5_1_SPEC.family, GLM_5_2_SPEC.family):
-        rendered_content = (
-            "None"
-            if "content" in message and message.get("content") is None
-            else str(content).strip()
-        )
-        parts = [str(reasoning), "</think>", rendered_content]
-        parts.extend(_glm_tool_call(call) for call in tool_calls)
-        return "".join(parts)
+        return _serialize_glm_completion(message)
 
     if family == MINIMAX_M2_7_SPEC.family:
-        parts = [str(reasoning)]
-        if content or tool_calls or include_end_token:
-            parts.extend(
-                (
-                    "\n</think>\n\n" if reasoning else "</think>\n\n",
-                    str(content),
-                )
-            )
-        if tool_calls:
-            parts.append(_minimax_tool_calls(tool_calls))
-        if include_end_token:
-            parts.append("[e~[\n")
-        return "".join(parts)
-
-    rendered_content = str(content).strip()
-    parts = [str(reasoning).strip(), "\n</think>\n\n", rendered_content]
-    for index, call in enumerate(tool_calls):
-        if index == 0:
-            parts.append("\n\n" if rendered_content else "")
-        else:
-            parts.append("\n")
-        parts.append(_qwen_tool_call(call))
-    if include_end_token:
-        parts.append("<|im_end|>\n")
-    return "".join(parts)
-
-
-def _deepseek_tool_calls(tool_calls) -> str:
-    calls = []
-    for call in tool_calls:
-        function = call.get("function") or {}
-        arguments = _json_arguments(function.get("arguments"))
-        parameters = []
-        for key, value in arguments.items():
-            is_string = isinstance(value, str)
-            rendered = value if is_string else json.dumps(value, ensure_ascii=False)
-            parameters.append(
-                f'<｜DSML｜parameter name="{key}" string="{str(is_string).lower()}">'
-                f"{rendered}</｜DSML｜parameter>"
-            )
-        calls.append(
-            f'<｜DSML｜invoke name="{function.get("name", "")}">\n'
-            + "\n".join(parameters)
-            + "\n</｜DSML｜invoke>"
+        return _serialize_minimax_completion(
+            message,
+            finish_reason=finish_reason,
         )
-    return "\n\n<｜DSML｜tool_calls>\n" + "\n".join(calls) + "\n</｜DSML｜tool_calls>"
 
-
-def _glm_tool_call(call) -> str:
-    function = call.get("function") or {}
-    arguments = _json_arguments(function.get("arguments"))
-    rendered = "".join(
-        f"<arg_key>{key}</arg_key><arg_value>"
-        f"{value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)}"
-        "</arg_value>"
-        for key, value in arguments.items()
+    return _serialize_qwen_completion(
+        message,
+        finish_reason=finish_reason,
     )
-    return f"<tool_call>{function.get('name', '')}{rendered}</tool_call>"
-
-
-def _minimax_tool_calls(tool_calls) -> str:
-    invocations = []
-    for call in tool_calls:
-        function = call.get("function") or {}
-        arguments = _json_arguments(function.get("arguments"))
-        parameters = "".join(
-            f'\n<parameter name="{key}">'
-            f"{value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)}"
-            "</parameter>"
-            for key, value in arguments.items()
-        )
-        invocations.append(
-            f'<invoke name="{function.get("name", "")}">{parameters}\n</invoke>'
-        )
-    return "\n<minimax:tool_call>\n" + "\n".join(invocations) + "\n</minimax:tool_call>"
-
-
-def _qwen_tool_call(call) -> str:
-    function = call.get("function") or {}
-    arguments = _json_arguments(function.get("arguments"))
-    parameters = "".join(
-        f"<parameter={key}>\n{_qwen_argument_value(value)}\n</parameter>\n"
-        for key, value in arguments.items()
-    )
-    return (
-        f"<tool_call>\n<function={function.get('name', '')}>\n"
-        f"{parameters}</function>\n</tool_call>"
-    )
-
-
-def _qwen_argument_value(value) -> str:
-    if isinstance(value, (dict, list, tuple)):
-        return json.dumps(value, ensure_ascii=False)
-    return str(value)
-
-
-def _json_arguments(value) -> dict:
-    if isinstance(value, dict):
-        return value
-    try:
-        parsed = json.loads(value or "{}")
-    except (TypeError, json.JSONDecodeError):
-        return {"arguments": str(value or "")}
-    return parsed if isinstance(parsed, dict) else {"arguments": parsed}
 
 
 def _completion_text(message: dict) -> str:

@@ -228,6 +228,24 @@ def test_qwen_uses_full_model_as_revision_authority():
     assert QWEN_3_5_SPEC.revision == "8472618112abcbd45acbcdc58436aff4233c23f7"
 
 
+def test_token_usage_facade_reexports_family_codec_specs():
+    from genai_proxy.models.deepseek_v4.codec import DEEPSEEK_V4_PRO_SPEC as deepseek
+    from genai_proxy.models.glm52.codec import GLM_5_2_SPEC as glm
+    from genai_proxy.models.hf_assets import Artifact as artifact_type
+    from genai_proxy.models.hf_assets import TokenizerSpec as spec_type
+    from genai_proxy.models.kimi_k3.codec import KIMI_K3_SPEC as kimi
+    from genai_proxy.models.legacy.minimax_codec import MINIMAX_M2_7_SPEC as minimax
+    from genai_proxy.models.qwen35.codec import QWEN_3_5_SPEC as qwen
+
+    assert Artifact is artifact_type
+    assert TokenizerSpec is spec_type
+    assert DEEPSEEK_V4_PRO_SPEC is deepseek
+    assert GLM_5_2_SPEC is glm
+    assert KIMI_K3_SPEC is kimi
+    assert MINIMAX_M2_7_SPEC is minimax
+    assert QWEN_3_5_SPEC is qwen
+
+
 def test_glm51_and_minimax_use_pinned_official_assets():
     assert GLM_5_1_SPEC.repository == "zai-org/GLM-5.1"
     assert GLM_5_1_SPEC.revision == "26e1bd6e011feb778d25ae34b09b07074139d92d"
@@ -379,8 +397,14 @@ def test_tokenizer_artifact_download_retries_transient_failure(tmp_path):
 
     with (
         patch.dict("os.environ", {"GENAI_TOKENIZER_CACHE": str(tmp_path)}),
-        patch("genai_proxy.token_usage._download_artifact", side_effect=download),
-        patch("genai_proxy.token_usage.schedule_retry", return_value=True) as retry,
+        patch(
+            "genai_proxy.models.hf_assets.download_artifact",
+            side_effect=download,
+        ),
+        patch(
+            "genai_proxy.models.hf_assets.schedule_retry",
+            return_value=True,
+        ) as retry,
     ):
         path = _artifact_path(spec, spec.tokenizer)
 
