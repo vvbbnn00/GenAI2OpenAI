@@ -563,6 +563,244 @@ def test_glm52_required_tool_choice_accepts_xml_tool_call():
     assert first_tool_call(response)["function"]["name"] == "get_weather"
 
 
+def test_required_tool_choice_retries_discarded_prose_without_leaking_it():
+    responses = iter(
+        [
+            FakeResponse(
+                [
+                    sse_line({"content": "I will call the tool now."}),
+                    sse_line({}, "stop"),
+                ]
+            ),
+            FakeResponse(
+                [
+                    sse_line(
+                        {
+                            "content": (
+                                "<tool_call>get_weather"
+                                "<arg_key>location</arg_key>"
+                                "<arg_value>Beijing</arg_value>"
+                                "</tool_call>"
+                            )
+                        }
+                    ),
+                    sse_line({}, "stop"),
+                ]
+            ),
+        ]
+    )
+    captured = []
+
+    def fake_post(_url, **kwargs):
+        captured.append(kwargs["json"])
+        return next(responses)
+
+    service, _unused, _unused_post = make_service([])
+    request = {
+        "model": "chatglm",
+        "messages": [{"role": "user", "content": "Use a weather tool."}],
+        "tools": [OPENAI_WEATHER_TOOL],
+        "tool_choice": "required",
+    }
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        response = service.build_openai_completion(request)
+
+    message = response["choices"][0]["message"]
+    assert first_tool_call(response)["function"]["name"] == "get_weather"
+    assert "I will call the tool now" not in str(message)
+    assert len(captured) == 2
+    assert captured[0]["messages"][-1]["content"] == "Use a weather tool."
+    assert "explicit tool_choice" in captured[1]["messages"][-1]["content"]
+    assert request["messages"] == [
+        {"role": "user", "content": "Use a weather tool."}
+    ]
+
+
+def test_required_tool_retry_follows_the_latest_tool_result():
+    responses = iter(
+        [
+            FakeResponse(
+                [sse_line({"content": "Not yet."}), sse_line({}, "stop")]
+            ),
+            FakeResponse(
+                [
+                    sse_line(
+                        {
+                            "content": (
+                                "<tool_call>get_weather"
+                                "<arg_key>location</arg_key>"
+                                "<arg_value>Beijing</arg_value>"
+                                "</tool_call>"
+                            )
+                        }
+                    ),
+                    sse_line({}, "stop"),
+                ]
+            ),
+        ]
+    )
+    captured = []
+
+    def fake_post(_url, **kwargs):
+        captured.append(kwargs["json"])
+        return next(responses)
+
+    service, _unused, _unused_post = make_service([])
+    prior_call = {
+        "id": "call_prior",
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "arguments": '{"location":"Shanghai"}',
+        },
+    }
+    request = {
+        "model": "chatglm",
+        "messages": [
+            {"role": "user", "content": "Check two cities."},
+            {"role": "assistant", "content": None, "tool_calls": [prior_call]},
+            {
+                "role": "tool",
+                "tool_call_id": "call_prior",
+                "content": "Shanghai is sunny.",
+            },
+        ],
+        "tools": [OPENAI_WEATHER_TOOL],
+        "tool_choice": "required",
+    }
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        response = service.build_openai_completion(request)
+
+    assert first_tool_call(response)["function"]["name"] == "get_weather"
+    assert captured[1]["messages"][-2] == request["messages"][-1]
+    assert captured[1]["messages"][-1]["role"] == "user"
+    assert "explicit tool_choice" in captured[1]["messages"][-1]["content"]
+
+
+def test_named_tool_choice_retries_a_different_valid_tool_call():
+    responses = iter(
+        [
+            FakeResponse(
+                [
+                    sse_line(
+                        {
+                            "content": (
+                                "<tool_call>Bash"
+                                "<arg_key>command</arg_key>"
+                                "<arg_value>pwd</arg_value>"
+                                "</tool_call>"
+                            )
+                        }
+                    ),
+                    sse_line({}, "stop"),
+                ]
+            ),
+            FakeResponse(
+                [
+                    sse_line(
+                        {
+                            "content": (
+                                "<tool_call>get_weather"
+                                "<arg_key>location</arg_key>"
+                                "<arg_value>Shanghai</arg_value>"
+                                "</tool_call>"
+                            )
+                        }
+                    ),
+                    sse_line({}, "stop"),
+                ]
+            ),
+        ]
+    )
+    captured = []
+
+    def fake_post(_url, **kwargs):
+        captured.append(kwargs["json"])
+        return next(responses)
+
+    service, _unused, _unused_post = make_service([])
+    request = {
+        "model": "chatglm",
+        "messages": [{"role": "user", "content": "Use get_weather."}],
+        "tools": [OPENAI_WEATHER_TOOL, OPENAI_BASH_TOOL],
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "get_weather"},
+        },
+    }
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        response = service.build_openai_completion(request)
+
+    assert first_tool_call(response)["function"]["name"] == "get_weather"
+    assert len(captured) == 2
+    assert 'Call exactly the function "get_weather"' in (
+        captured[1]["messages"][-1]["content"]
+    )
+
+
+def test_required_tool_stream_does_not_retry_after_reasoning_is_visible():
+    captured = []
+
+    def fake_post(_url, **kwargs):
+        captured.append(kwargs["json"])
+        return FakeResponse(
+            [
+                sse_line({"reasoning_content": "I should choose a tool."}),
+                sse_line({"content": "I cannot decide."}),
+                sse_line({}, "stop"),
+            ]
+        )
+
+    service, _unused, _unused_post = make_service([])
+    request = {
+        "model": "chatglm",
+        "messages": [{"role": "user", "content": "Use a weather tool."}],
+        "tools": [OPENAI_WEATHER_TOOL],
+        "tool_choice": "required",
+        "stream": True,
+    }
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        rendered = "".join(service.stream_openai_completion(request))
+
+    assert len(captured) == 1
+    assert "I should choose a tool." in rendered
+    assert "Upstream did not return the required tool call" in rendered
+    assert "I cannot decide." not in rendered
+
+
+def test_required_tool_choice_exhaustion_returns_an_error_not_prose():
+    captured = []
+
+    def fake_post(_url, **kwargs):
+        captured.append(kwargs["json"])
+        return FakeResponse(
+            [
+                sse_line({"content": "I will not call a tool."}),
+                sse_line({}, "stop"),
+            ]
+        )
+
+    service, _unused, _unused_post = make_service([])
+    request = {
+        "model": "chatglm",
+        "messages": [{"role": "user", "content": "Use a weather tool."}],
+        "tools": [OPENAI_WEATHER_TOOL],
+        "tool_choice": "required",
+    }
+
+    with (
+        patch("genai_proxy.services.genai.requests.post", fake_post),
+        pytest.raises(ProxyError, match="required tool call"),
+    ):
+        service.build_openai_completion(request)
+
+    assert len(captured) == 3
+
+
 def test_glm52_tool_choice_none_does_not_return_tool_calls():
     service, captured, fake_post = make_service(
         [

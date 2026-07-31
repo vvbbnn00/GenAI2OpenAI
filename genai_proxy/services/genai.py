@@ -114,6 +114,7 @@ KIMI_HISTORY_MAX_PAGES = 50
 KIMI_HISTORY_POLL_ATTEMPTS = 20
 KIMI_HISTORY_POLL_INTERVAL = 0.25
 KIMI_TOOL_ATTEMPTS = 3
+REQUIRED_TOOL_ATTEMPTS = 3
 
 
 @dataclass(slots=True)
@@ -2141,9 +2142,12 @@ class GenAIService:
         choice_satisfied = False
         final_response = False
         invalid_syntax = False
-        max_attempts = (
-            KIMI_TOOL_ATTEMPTS if prepared.tool_adapter == KIMI_K3_ADAPTER else 1
-        )
+        if prepared.tool_adapter == KIMI_K3_ADAPTER:
+            max_attempts = KIMI_TOOL_ATTEMPTS
+        elif _tool_choice_requires_call(prepared.tool_choice):
+            max_attempts = REQUIRED_TOOL_ATTEMPTS
+        else:
+            max_attempts = 1
         attempt_messages = prepared.messages
         for attempt_index in range(max_attempts):
             attempt = None
@@ -2200,12 +2204,9 @@ class GenAIService:
             invalid_syntax = (
                 any(tag in content for tag in open_tags) and not tool_calls
             ) or (final_marker and not final_response)
-            choice_satisfied = bool(tool_calls) and (
-                prepared.tool_adapter != KIMI_K3_ADAPTER
-                or _tool_calls_satisfy_choice(
-                    tool_calls,
-                    prepared.tool_choice,
-                )
+            choice_satisfied = bool(tool_calls) and _tool_calls_satisfy_choice(
+                tool_calls,
+                prepared.tool_choice,
             )
             protocol_missing = (
                 prepared.tool_adapter == KIMI_K3_ADAPTER
@@ -2228,19 +2229,31 @@ class GenAIService:
                 )
                 or not should_retry
                 or attempt_index == max_attempts - 1
+                or (
+                    prepared.tool_adapter != KIMI_K3_ADAPTER
+                    and sent_role
+                )
             ):
                 break
-            attempt_messages = kimi_tool_retry_messages(
-                prepared.messages,
-                tool_choice=prepared.tool_choice,
-                force_action=(
-                    _tool_choice_requires_call(prepared.tool_choice)
-                    or (protocol_missing and not invalid_syntax)
-                ),
-            )
+            if prepared.tool_adapter == KIMI_K3_ADAPTER:
+                attempt_messages = kimi_tool_retry_messages(
+                    prepared.messages,
+                    tool_choice=prepared.tool_choice,
+                    force_action=(
+                        _tool_choice_requires_call(prepared.tool_choice)
+                        or (protocol_missing and not invalid_syntax)
+                    ),
+                )
+                warning = "Kimi K3 did not produce a valid client response"
+            else:
+                attempt_messages = _required_tool_retry_messages(
+                    prepared.messages,
+                    prepared.tool_choice,
+                )
+                warning = "Upstream did not satisfy the explicit tool choice"
             self._logger.warning(
-                "Kimi K3 did not produce a valid client response; retrying "
-                "(attempt %d/%d)",
+                "%s; retrying (attempt %d/%d)",
+                warning,
                 attempt_index + 2,
                 max_attempts,
             )
@@ -2306,9 +2319,7 @@ class GenAIService:
             )
             return
 
-        if prepared.tool_adapter == KIMI_K3_ADAPTER and _tool_choice_requires_call(
-            prepared.tool_choice
-        ):
+        if _tool_choice_requires_call(prepared.tool_choice):
             yield make_error_chunk(
                 "Upstream did not return the required tool call",
                 prepared.model,
@@ -2810,6 +2821,39 @@ def _request_tool_specs(tools: list | None) -> dict[str, list[str]]:
                 list(properties.keys()) if isinstance(properties, dict) else []
             )
     return specs
+
+
+def _required_tool_retry_messages(messages: list[dict], tool_choice) -> list[dict]:
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        function = tool_choice.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+    else:
+        name = None
+    requirement = (
+        f"Call exactly the function {json.dumps(name, ensure_ascii=False)}."
+        if name
+        else "Call at least one of the available functions."
+    )
+    reminder = (
+        "The previous response was discarded because it did not satisfy the "
+        f"client's explicit tool_choice. {requirement} Use the tool-call format "
+        "already defined in this conversation and do not answer in prose."
+    )
+
+    retried = [dict(message) for message in messages]
+    if retried and retried[-1].get("role") == "user":
+        content = retried[-1].get("content")
+        if isinstance(content, str):
+            retried[-1]["content"] = f"{content}\n\n{reminder}"
+        elif isinstance(content, list):
+            retried[-1]["content"] = [
+                *content,
+                {"type": "text", "text": f"\n\n{reminder}"},
+            ]
+        else:
+            retried[-1]["content"] = reminder
+        return retried
+    return [*retried, {"role": "user", "content": reminder}]
 
 
 def _tool_choice_is_none(tool_choice) -> bool:
