@@ -224,13 +224,14 @@ GenAI 的模型名并不总是直接等于上游模型名，代理会结合 `/v1
 |-------------|----------------|------|----------|
 | `deepseek-chat` | DeepSeek V4 Flash / DeepSeek V4 | Xinference | DeepSeek V4 官方 DSML `<｜DSML｜tool_calls>` 注入与解析，兼容旧 `<｜DSML｜function_calls>` |
 | `deepseek-pro` | DeepSeek V4 Pro / DeepSeek V4 | Xinference | DeepSeek V4 官方 DSML `<｜DSML｜tool_calls>` 注入与解析，兼容旧 `<｜DSML｜function_calls>` |
-| `MiniMax-M1` | MiniMax 2.7 | Xinference | MiniMax-M2.7 官方 `<minimax:tool_call>` 注入与解析，兼容 XML/JSON-ish 变体和 `<think>` 过滤 |
-| `chatglm` | GLM 5.2；旧记录中也可能出现 GLM 5.1 | Xinference | GLM-5.2 官方 `Reasoning Effort`、`<tools>`、`<tool_call>name<arg_key>...<arg_value>...` 注入与解析；GLM-5.1 记录会回落到 5.1 模板 |
+| `MiniMax-M1` | MiniMax 2.7 | Xinference | 保留 MiniMax-M2.7 官方模板兼容代码；当前上游已移除该模型，不进入故障回退目录或在线测试 |
+| `chatglm` | GLM 5.2；旧记录中也可能出现 GLM 5.1 | Xinference | GLM-5.2/5.1 官方 `<tools>`、`<tool_call>name<arg_key>...<arg_value>...` 提示与解析；5.2 使用上游模板自己的默认 `Reasoning Effort: Max` |
+| `qwen-instruct` | Qwen 3.5 / Qwen3.5-397B-A17B | Xinference | Qwen3.5 官方 `<tool_call><function=...><parameter=...>` 提示、历史序列化与解析 |
 | `kimi-k3` | Kimi-K3 | Xinference | 官方 `encoding_k3.py` 文本/视觉编码、视觉 token 计算和 XTML 解析；当前 GenAI 传输不支持官方工具声明 |
 
 DeepSeek 同厂不同版本不会共用同一个 adapter：`deepseek-chat` 使用 `deepseek_v4_flash`，`deepseek-pro` 使用 `deepseek_v4_pro`，旧 DeepSeek 名称使用 `deepseek_legacy`。V4 初始工具提示词按 DeepSeek V4 Pro `encoding_dsv4.py` / `encoding/tests` 的 `## Tools`、`<｜DSML｜tool_calls>`、`### Available Tool Schemas` 结构生成；MiniMax 和 GLM 分别按官方 `chat_template.jinja` 的 `<minimax:tool_call>` 与 `<tool_call>...<arg_key>...` 结构生成。`chatglm` 没有明确版本线索时按 GLM-5.2 处理。
 
-GLM-5.2 和 DeepSeek V4 的推理等级统一为 `high`、`max`：`high` 保持为 `high`，`max` 保持为 `max`，`none`、`minimal`、`low`、`medium`、`xhigh` 等其他已支持输入统一映射到 `max`。DeepSeek V4 的 `max` 会把官方 `REASONING_EFFORT_MAX` 文本放在首条消息最前面；`high` 不添加该前缀。未传推理等级时，GLM-5.2 保持现有的 `max` 默认值，DeepSeek V4 不额外添加等级前缀。
+GLM-5.2 官方模板有 `high`、`max` 两档，但 GenAI 网页接口没有暴露该模板的 `reasoning_effort` 参数；因此实际可用的只有模板默认 `max`。代理把所有显式等级归一到 `max`，也不会再向 system 重复注入 `Reasoning Effort`，避免出现两个 `Max` 或 `Max`/`High` 冲突。DeepSeek V4 同样只有两档 effort，但 GenAI 另有明确的顶层 `thinking` 开关：`none` 和未传 reasoning 时发送 `thinking: false`；`minimal`、`low`、`medium`、`high` 映射到 `thinking: true` + `high`；`xhigh`、`max` 映射到 `thinking: true` + `max`。Claude Messages 的 `thinking.enabled`/`thinking.adaptive` 会开启该开关，未给 `output_config.effort` 时按 Anthropic 默认 `high`；`thinking.disabled` 会关闭它。只有 `max` 会把官方 `REASONING_EFFORT_MAX` 文本放在首条消息最前面。聊天请求仍不发送 `chatGroupId`。
 
 Kimi-K3 始终启用 thinking。GenAI 网页通道没有独立的 thinking effort 字段，因此所有 OpenAI 推理等级都使用上游默认的 `max`，保证实际提示词与 token 计数一致。
 
@@ -240,7 +241,9 @@ GenAI 网页通道 `/htk/chat/start/chat` 不会把 Kimi-K3 的顶层 `tools/too
 
 Kimi-K3 还有一项 GenAI 通道限制：最后一条用户输入必须放在非空 `chatInfo`，否则上游会追加一个缺少 `content` 的用户消息并拒绝请求。GenAI 会把每个非空 `chatInfo` 写入历史记录，而其他模型可以把完整消息放在 `messages` 并保持 `chatInfo` 为空，所以该现象只在 Kimi-K3 上明显。代理从不在聊天请求中发送 `chatGroupId`；该分组 ID 由 GenAI 服务端生成。Kimi-K3 成功生成完整响应后，代理会在返回结束 chunk 前从历史接口精确找出本次新增的分组并删除。定位不到唯一记录、生成失败或删除接口异常时会安全跳过，不会误删其他记录，也不会破坏模型响应。工具 schema 和桥接指令只放在 `messages`，不会写入历史问题正文。
 
-DeepSeek V4 Pro/Flash、GLM-5.2 和完整 `Qwen/Qwen3.5-397B-A17B` 使用固定 revision 的 Hugging Face `tokenizer.json` 与官方消息模板精确计数。Kimi-K3 使用固定 revision 的官方 `tiktoken.model` 与 `encoding_k3.py`，视觉 token 按官方 resize、patch 和 merge 规则计算。首次使用会下载并校验资源，之后复用本地缓存；无需安装 `transformers` 或 PyTorch。OpenAI `POST /v1/responses/input_tokens` 与 Anthropic `POST /v1/messages/count_tokens` 会走同一套模型解析和官方模板；Kimi-K3 工具请求会计算实际桥接 system 正文，生成用量按上游实际输出的 `<k3_action>` 文本计算，不按转换后的 XTML 或 OpenAI JSON 反推。
+DeepSeek V4 Pro/Flash、GLM-5.2、GLM-5.1、`Qwen/Qwen3.5-397B-A17B` 和 MiniMax-M2.7 都使用各自官方 Hugging Face 仓库的固定 revision、`tokenizer.json` 与消息模板精确计数；DeepSeek 的 chat/thinking 序列会跟随实际发送的 `thinking` 布尔值，Qwen3.5 图像输入还会按同一 revision 的官方 resize、patch 和 merge 规则展开视觉占位 token。代理实际注入的非 K3 工具声明不是另外维护的手写副本，而是由固定 revision 的官方 `chat_template.jinja` 或 Python encoder 直接渲染。Qwen、GLM 和 MiniMax 保留标准 `assistant.tool_calls`、`tool` 与 reasoning 历史，交给上游模型模板编码。GenAI 会忽略 DeepSeek 的顶层结构化 `tools`，因此 DeepSeek V4 改由官方 `encoding_dsv4.py` 一次性渲染完整多轮 prompt，再无损装入 GenAI 支持的 system/user 消息外壳；差分测试同时覆盖 chat、thinking high、thinking max、历史 tool call 与 tool result，并要求桥接前后逐字节相等。只有官方模板未表达的 `tool_choice` 约束会作为普通 system 内容追加，整个结果仍由同一官方模板编码，并接受逐字一致性测试。Kimi-K3 使用固定 revision 的官方 `tiktoken.model` 与 `encoding_k3.py`，视觉 token 按官方 resize、patch 和 merge 规则计算。首次使用会下载并校验资源，之后复用本地缓存；无需安装 `transformers` 或 PyTorch。OpenAI `POST /v1/responses/input_tokens` 与 Anthropic `POST /v1/messages/count_tokens` 会走同一套模型解析和官方模板；Kimi-K3 工具请求会计算实际桥接 system 正文，生成用量按上游实际输出的 `<k3_action>` 文本计算，不按转换后的 XTML 或 OpenAI JSON 反推。没有官方 Hugging Face 仓库的闭源或非 Xinference 模型只能使用兼容估算，不能伪装成官方 tokenizer 计数。
+
+上游 SSE 使用单字节增量读取，避免 `requests` 默认块大小延迟短 reasoning 片段；代理同时识别 `reasoning_content`、`reasoning` 和跨 chunk 的 `<think>...</think>`，并分别转换为 OpenAI `reasoning_content`、Responses 完整 reasoning item（added、content part、delta、done）与 Claude `thinking_delta`。Responses 事件携带一致的 `item_id`、`output_index`、`content_index` 和连续 `sequence_number`，严格客户端不需要猜测增量属于哪个输出项。SSE 响应设置 `X-Accel-Buffering: no` 和 `no-transform`，降低反向代理再次缓冲的风险。Responses 流式请求以及请求了 `stream_options.include_usage` 的 Chat Completions 都把精确 usage 计算延后到结束事件，不让 tokenizer 计算阻塞首个正文或 reasoning 增量。上游连续 90 秒没有任何字节时会按停滞处理，且只在尚未向客户端发送数据时重试一次；该窗口覆盖已实测超过 25 秒的冷启动，同时仍远短于旧的 600 秒超时和通用重试上限。
 
 对于支持工具适配的模型，代理会优先保留 Claude Code 请求中 `Bash`、`Glob`、`Read`、`Edit`、`Write` 等精确工具名，并兼容模型偶发输出的 `Bash<arg_key>`、`<arg_value>`、`Bash\nIN\n...`、`Globpattern: ...`、DSML、MiniMax XML 和 JSON-ish 工具块。工具结果后的多轮会话会继续保留工具定义，允许模型按需继续调用工具；显式 `tool_choice: "none"` 时才禁止工具调用。
 
@@ -333,13 +336,24 @@ uv run python -m compileall genai_proxy test_tool_adapters.py test_allowed_model
 uv run python test_tool_adapters.py
 ```
 
-使用 `docker-deploy.keystore` 对 DeepSeek V4 Flash、DeepSeek V4 Pro、MiniMax 2.7、GLM-5.2、Kimi-K3 做 20 轮变体集成测试：
+使用 `docker-deploy.keystore` 对 DeepSeek V4 Flash、DeepSeek V4 Pro、GLM-5.2、Qwen3.5、Kimi-K3 做 20 轮变体集成测试：
 
 ```bash
-uv run python test_allowed_models_integration.py --repeat 20 --models deepseek-chat deepseek-pro MiniMax-M1 chatglm kimi-k3
+uv run python test_allowed_models_integration.py --repeat 20 --models deepseek-chat deepseek-pro chatglm qwen-instruct kimi-k3
 ```
 
-该集成测试只允许调用 `deepseek-chat`、`deepseek-pro`、`MiniMax-M1`、`chatglm`、`kimi-k3`。前四个模型覆盖 OpenAI 和 Claude Messages 两种调用风格下的非流式工具调用、流式工具调用、Claude Code 风格 `Bash` 工具、工具结果回合和无需工具的普通回答。Kimi-K3 覆盖 OpenAI/Claude 文本、OpenAI/Responses/Claude 视觉、token usage，以及外部操作桥接的 OpenAI 非流式和流式工具调用、Claude 流式工具调用和 Responses 长历史三轮工具链；三轮链路会验证空白续轮仍能流式调用下一项工具，最后再正常收敛。为限制 Kimi-K3 实时测试流量，其默认只执行 1 轮，不跟随通用 `--repeat`；确需重复时显式传入 `--kimi-repeat N`。成功完成的 Kimi-K3 测试历史会自动清理。
+该集成测试只允许调用 `deepseek-chat`、`deepseek-pro`、`chatglm`、`qwen-instruct`、`kimi-k3`。前四个模型覆盖 OpenAI 和 Claude Messages 两种调用风格下的非流式工具调用、流式工具调用、Claude Code 风格 `Bash` 工具、工具结果回合和无需工具的普通回答；支持 reasoning 流的模型还会验证 OpenAI `reasoning_content` 与 Responses 完整 reasoning item 事件链。Kimi-K3 覆盖 OpenAI/Claude 文本、OpenAI/Responses/Claude 视觉、token usage，以及外部操作桥接的 OpenAI 非流式和流式工具调用、Claude 流式工具调用和 Responses 长历史三轮工具链；三轮链路会验证空白续轮仍能流式调用下一项工具，最后再正常收敛。为限制 Kimi-K3 实时测试流量，其默认只执行 1 轮，不跟随通用 `--repeat`；确需重复时显式传入 `--kimi-repeat N`。成功完成的 Kimi-K3 测试历史会自动清理。
+
+对 GLM-5.2、DeepSeek V4 Flash 和 DeepSeek V4 Pro 做隔离的 OMP 长上下文工具链测试：
+
+```bash
+uv run python test_omp_long_context_integration.py \
+  --models chatglm deepseek-chat deepseek-pro \
+  --min-context-tokens 150000 \
+  --stages 12
+```
+
+该 runner 使用临时 OMP 配置、临时工作区和随机本地端口，不读取现有 OMP profile、规则、技能、扩展或项目 MCP 配置。它通过本地 keystore 启动代理，生成至少 15 万官方 tokenizer token 的上下文，并要求模型逐步读取 12 个带未知下一跳的文件。验证项包括首轮实际 input token、reasoning/tool-call/text 流增量、DeepSeek 每个工具回合的 reasoning 历史、全部阶段文件覆盖、工具执行错误、三个长上下文哨兵、最终 JSON 和完成标记。聊天请求仍不发送 `chatGroupId`。
 
 ## 项目结构
 
