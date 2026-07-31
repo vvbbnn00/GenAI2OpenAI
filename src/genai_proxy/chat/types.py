@@ -20,6 +20,7 @@ class PreparedChatRequest:
     token_reasoning_config: dict | None
     thinking: bool | None
     image_sizes: tuple[tuple[int, int], ...] | None
+    kimi_completed_actions: tuple[tuple[str, str, str], ...]
     generated_usage: dict | None = None
 
 

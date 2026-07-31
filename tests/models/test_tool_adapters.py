@@ -23,8 +23,11 @@ from genai_proxy.models.deepseek_v4.tooling import (
 )
 from genai_proxy.models.glm52.tooling import inject_glm_tool_prompt
 from genai_proxy.models.kimi_k3.tooling import (
+    collect_kimi_completed_actions,
     extract_kimi_final_response,
     inject_kimi_tool_prompt,
+    kimi_action_repeats_completed,
+    kimi_duplicate_retry_messages,
     kimi_tool_retry_messages,
 )
 from genai_proxy.models.legacy.minimax import inject_minimax_tool_prompt
@@ -844,6 +847,87 @@ def test_kimi_retry_is_structural_and_task_agnostic():
     assert "任意长会话" not in retry_prompt
     assert "still need" not in retry_prompt
     assert "pending" not in retry_prompt
+
+
+def test_kimi_completed_action_signatures_normalize_arguments_and_scope():
+    messages = [
+        {"role": "user", "content": "Inspect in stages."},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "arguments": '{"query":"project","num_results":2}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_search",
+            "content": "Search complete.",
+        },
+        {"role": "user", "content": "Continue."},
+    ]
+
+    completed = collect_kimi_completed_actions(messages)
+
+    assert completed == (
+        (
+            "call_search",
+            "search",
+            '{"num_results":2,"query":"project"}',
+        ),
+    )
+    assert kimi_action_repeats_completed(
+        [
+            {
+                "function": {
+                    "name": "search",
+                    "arguments": '{"num_results":2,"query":"project"}',
+                }
+            }
+        ],
+        completed,
+    )
+    assert not kimi_action_repeats_completed(
+        [
+            {
+                "function": {
+                    "name": "search",
+                    "arguments": '{"num_results":3,"query":"project"}',
+                }
+            }
+        ],
+        completed,
+    )
+    assert collect_kimi_completed_actions(messages[:-2]) == ()
+    assert collect_kimi_completed_actions(
+        [*messages, {"role": "assistant", "content": "Done."}]
+    ) == ()
+
+
+def test_kimi_duplicate_retry_prompt_is_fixed_and_does_not_echo_client_data():
+    messages = [
+        {"role": "system", "content": "# Client response protocol"},
+        {
+            "role": "user",
+            "content": "SENSITIVE_TASK_TEXT_AND_ARGUMENTS",
+        },
+    ]
+
+    retried = kimi_duplicate_retry_messages(messages)
+    retry_prompt = retried[-2]["content"]
+
+    assert retried[-1] == messages[-1]
+    assert retried[-2]["role"] == "system"
+    assert "repeated a client action marked complete" in retry_prompt
+    assert "rerun or poll" in retry_prompt
+    assert "SENSITIVE_TASK_TEXT_AND_ARGUMENTS" not in retry_prompt
+    assert "<k3_action>" not in retry_prompt
 
 
 def test_kimi_structure_detection_does_not_use_tool_name_text_heuristics():

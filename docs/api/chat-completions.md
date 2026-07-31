@@ -66,8 +66,12 @@ OpenAI reasoning effort 接受 `none`、`minimal`、`low`、`medium`、`high`、
 正文位于 `choices[0].delta.content`。上游也可能使用 `reasoning` 或 `<think>` 标签，
 代理会统一解析为 `reasoning_content`。
 
-无工具请求的推理和正文会尽快转发。工具请求中的推理仍实时转发，但候选工具正文会
-等到完整解析后再发送，防止客户端收到半截工具 JSON。
+无工具请求的推理和正文会尽快转发。工具请求中的推理通常仍实时转发，但候选工具
+正文会等到完整解析后再发送，防止客户端收到半截工具 JSON。
+
+Kimi K3 带最近已完成动作的续轮是一个例外：代理会按上游尝试暂存 reasoning，先
+排除同名同参的意外重复 action，再释放最终接受尝试。被丢弃尝试的 reasoning 不会
+出现在客户端流中；普通 Kimi 首轮和其他模型不受影响。
 
 需要最终 usage 时设置：
 

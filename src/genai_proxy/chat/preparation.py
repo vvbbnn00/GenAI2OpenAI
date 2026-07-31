@@ -12,6 +12,7 @@ from genai_proxy.models import (
     GLM_5_2_ADAPTER,
     KIMI_K3_ADAPTER,
     KIMI_TOOL_TRANSPORT_ERROR,
+    collect_kimi_completed_actions,
     inject_deepseek_reasoning_prompt,
     inject_glm_reasoning_prompt,
     inject_kimi_tool_prompt,
@@ -129,6 +130,11 @@ class ChatPreparationMixin:
             tool_adapter, reasoning_config
         )
         thinking = deepseek_thinking_enabled(tool_adapter, reasoning_config)
+        kimi_completed_actions = (
+            collect_kimi_completed_actions(messages)
+            if tool_adapter == KIMI_K3_ADAPTER
+            else ()
+        )
 
         requested_tools = bool(tools)
         has_tools = requested_tools and not _tool_choice_is_none(tool_choice)
@@ -204,6 +210,7 @@ class ChatPreparationMixin:
             token_reasoning_config=token_reasoning_config,
             thinking=thinking,
             image_sizes=image_sizes,
+            kimi_completed_actions=kimi_completed_actions,
         )
 
     def _extract_last_user_message(self, messages):

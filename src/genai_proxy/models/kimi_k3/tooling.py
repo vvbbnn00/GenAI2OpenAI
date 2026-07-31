@@ -110,6 +110,29 @@ def kimi_tool_retry_messages(
     ]
 
 
+def kimi_duplicate_retry_messages(messages: list[dict]) -> list[dict]:
+    if not messages:
+        return messages
+
+    retry_prompt = (
+        "The previous response exactly repeated a client action marked complete "
+        "by the latest continuation checkpoint, so it was withheld to avoid "
+        "duplicate side effects. Re-evaluate the latest completed result. Return "
+        "the first unfinished action, or a final response if the task is complete, "
+        "using the client response envelopes already defined. Return the same "
+        "action again only when the latest result explicitly requires a rerun or "
+        "poll. Do not use Markdown."
+    )
+    insert_at = len(messages)
+    if messages[-1].get("role") == "user":
+        insert_at -= 1
+    return [
+        *messages[:insert_at],
+        {"role": "system", "content": retry_prompt},
+        *messages[insert_at:],
+    ]
+
+
 def extract_kimi_tool_calls(
     content,
     *,
@@ -261,7 +284,7 @@ def _bridge_tool_history(messages) -> list[dict]:
         ),
         default=-1,
     )
-    completed_actions = _latest_completed_actions(messages, latest_tool_index)
+    completed_actions = collect_kimi_completed_actions(messages, latest_tool_index)
     for message in messages:
         role = message.get("role")
         if role == "assistant":
@@ -331,7 +354,8 @@ def _bridge_tool_history(messages) -> list[dict]:
                 "These client actions have completed and must not be repeated "
                 "unless their result explicitly reports failure:",
                 (
-                    f"{KIMI_COMPLETED_OPEN}{_bridge_json(completed_actions)}"
+                    f"{KIMI_COMPLETED_OPEN}"
+                    f"{_bridge_json(_completed_action_checkpoint(completed_actions))}"
                     f"{KIMI_COMPLETED_CLOSE}"
                 ),
                 "Resume after all listed actions and continue with the first "
@@ -349,15 +373,25 @@ def _bridge_tool_history(messages) -> list[dict]:
     return transformed
 
 
-def _latest_completed_actions(
-    messages: list[dict], latest_tool_index: int
-) -> list[dict]:
+def collect_kimi_completed_actions(
+    messages: list[dict],
+    latest_tool_index: int | None = None,
+) -> tuple[tuple[str, str, str], ...]:
+    if latest_tool_index is None:
+        latest_tool_index = max(
+            (
+                index
+                for index, message in enumerate(messages)
+                if message.get("role") == "assistant" and message.get("tool_calls")
+            ),
+            default=-1,
+        )
     if latest_tool_index < 0:
-        return []
+        return ()
 
     continuation = messages[latest_tool_index + 1 :]
     if any(message.get("role") == "assistant" for message in continuation):
-        return []
+        return ()
 
     completed_ids = {
         str(message.get("tool_call_id"))
@@ -371,8 +405,46 @@ def _latest_completed_actions(
         name = function.get("name")
         if call_id is None or str(call_id) not in completed_ids or not name:
             continue
-        completed.append({"id": str(call_id), "name": name})
-    return completed
+        arguments = _bridge_arguments(function.get("arguments"))
+        completed.append(
+            (
+                str(call_id),
+                str(name),
+                _bridge_json(arguments, sort_keys=True),
+            )
+        )
+    return tuple(completed)
+
+
+def kimi_action_repeats_completed(
+    tool_calls: list[dict],
+    completed_actions: tuple[tuple[str, str, str], ...],
+) -> bool:
+    completed_signatures = {
+        (name, arguments) for _call_id, name, arguments in completed_actions
+    }
+    for tool_call in tool_calls:
+        function = tool_call.get("function") or {}
+        name = function.get("name")
+        if not isinstance(name, str):
+            continue
+        try:
+            arguments = _bridge_arguments(function.get("arguments"))
+        except ProxyError:
+            continue
+        signature = (name, _bridge_json(arguments, sort_keys=True))
+        if signature in completed_signatures:
+            return True
+    return False
+
+
+def _completed_action_checkpoint(
+    completed_actions: tuple[tuple[str, str, str], ...],
+) -> list[dict]:
+    return [
+        {"id": call_id, "name": name}
+        for call_id, name, _arguments in completed_actions
+    ]
 
 
 def _bridge_arguments(value) -> dict:

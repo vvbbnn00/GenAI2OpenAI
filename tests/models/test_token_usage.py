@@ -1769,6 +1769,241 @@ def test_kimi_bridge_retries_required_tool_choice_twice():
     assert post.call_count == 3
 
 
+def _kimi_two_stage_continuation_request():
+    return {
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "user", "content": "Complete both project stages."},
+            {
+                "role": "assistant",
+                "reasoning_content": "Run stage one, then stage two.",
+                "tool_calls": [
+                    {
+                        "id": "call_stage_one",
+                        "type": "function",
+                        "function": {
+                            "name": "get_stage_one",
+                            "arguments": '{"marker":"alpha"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_stage_one",
+                "content": "STAGE_ONE_OK. The returned value is beta.",
+            },
+            {"role": "user", "content": "\u200b"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_stage_one",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"marker": {"type": "string"}},
+                        "required": ["marker"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_stage_two",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                },
+            },
+        ],
+    }
+
+
+def test_kimi_repeated_completed_action_is_withheld_before_next_action():
+    repeated = fake_completion(
+        (
+            '<k3_action>{"name":"get_stage_one",'
+            '"arguments":{"marker":"alpha"}}</k3_action>'
+        ),
+        reasoning="REJECTED_REPEAT_REASONING",
+    )
+    next_action = fake_completion(
+        (
+            '<k3_action>{"name":"get_stage_two",'
+            '"arguments":{"value":"beta"}}</k3_action>'
+        ),
+        reasoning="ACCEPTED_NEXT_REASONING",
+    )
+    request = {**_kimi_two_stage_continuation_request(), "stream": True}
+    app = _app()
+
+    with patch(
+        "genai_proxy.upstream.transport.requests.post",
+        side_effect=[repeated, next_action],
+    ) as post:
+        body = "".join(
+            app.extensions["genai_service"].stream_openai_completion(request)
+        )
+
+    events = [
+        json.loads(line[6:])
+        for line in body.splitlines()
+        if line.startswith("data: {")
+    ]
+    deltas = [
+        choice.get("delta", {})
+        for event in events
+        for choice in event.get("choices", [])
+    ]
+    reasoning_indexes = [
+        index
+        for index, delta in enumerate(deltas)
+        if delta.get("reasoning_content")
+    ]
+    tool_indexes = [
+        index for index, delta in enumerate(deltas) if delta.get("tool_calls")
+    ]
+    tool_calls = [
+        tool_call
+        for delta in deltas
+        for tool_call in delta.get("tool_calls", [])
+    ]
+
+    assert post.call_count == 2
+    assert "REJECTED_REPEAT_REASONING" not in body
+    assert "ACCEPTED_NEXT_REASONING" in body
+    assert reasoning_indexes and tool_indexes
+    assert max(reasoning_indexes) < min(tool_indexes)
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "get_stage_two"
+    retry_prompt = post.call_args_list[1].kwargs["json"]["messages"][-1]["content"]
+    assert "repeated a client action marked complete" in retry_prompt
+    assert "get_stage_one" not in retry_prompt
+    assert "alpha" not in retry_prompt
+    assert "beta" not in retry_prompt
+
+
+def test_kimi_held_continuation_reasoning_keeps_network_retry_safe():
+    class InterruptedReasoning(FakeResponse):
+        def iter_lines(self, *args, **kwargs):
+            yield json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "reasoning_content": "INTERRUPTED_REASONING"
+                            }
+                        }
+                    ]
+                }
+            ).encode()
+            raise requests.ConnectionError("stream interrupted")
+
+    interrupted = InterruptedReasoning([])
+    success = fake_completion(
+        (
+            '<k3_action>{"name":"get_stage_two",'
+            '"arguments":{"value":"beta"}}</k3_action>'
+        ),
+        reasoning="RECOVERED_REASONING",
+    )
+    request = {**_kimi_two_stage_continuation_request(), "stream": True}
+    app = _app()
+
+    with patch(
+        "genai_proxy.upstream.transport.requests.post",
+        side_effect=[interrupted, success],
+    ) as post:
+        body = "".join(
+            app.extensions["genai_service"].stream_openai_completion(request)
+        )
+
+    assert post.call_count == 2
+    assert "INTERRUPTED_REASONING" not in body
+    assert "RECOVERED_REASONING" in body
+    assert '"name": "get_stage_two"' in body
+
+
+def test_kimi_same_tool_with_different_arguments_is_not_withheld():
+    next_action = fake_completion(
+        (
+            '<k3_action>{"name":"get_stage_one",'
+            '"arguments":{"marker":"gamma"}}</k3_action>'
+        ),
+        reasoning="Different arguments are new work.",
+    )
+    request = _kimi_two_stage_continuation_request()
+
+    with patch(
+        "genai_proxy.upstream.transport.requests.post",
+        return_value=next_action,
+    ) as post:
+        response = _app().test_client().post("/v1/chat/completions", json=request)
+
+    assert response.status_code == 200
+    message = response.get_json()["choices"][0]["message"]
+    assert post.call_count == 1
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+        "marker": "gamma"
+    }
+    assert message["reasoning_content"] == "Different arguments are new work."
+
+
+def test_kimi_persistent_completed_action_repeat_is_bounded_and_released():
+    raw_content = (
+        '<k3_action>{"name":"get_stage_one",'
+        '"arguments":{"marker":"alpha"}}</k3_action>'
+    )
+    attempts = [
+        fake_completion(
+            raw_content,
+            reasoning=f"ATTEMPT_{index}_REASONING",
+        )
+        for index in range(1, 4)
+    ]
+    request = _kimi_two_stage_continuation_request()
+    app = _app()
+
+    with patch(
+        "genai_proxy.upstream.transport.requests.post",
+        side_effect=attempts,
+    ) as post:
+        response = app.test_client().post("/v1/chat/completions", json=request)
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    message = payload["choices"][0]["message"]
+    assert post.call_count == 3
+    assert message["tool_calls"][0]["function"]["name"] == "get_stage_one"
+    assert message["reasoning_content"] == "ATTEMPT_3_REASONING"
+    prepared = app.extensions["genai_service"]._prepare_chat_request(request)
+    expected_tokens = count_openai_completion_tokens(
+        {
+            "role": "assistant",
+            "reasoning_content": "ATTEMPT_3_REASONING",
+            "content": raw_content,
+        },
+        "kimi-k3",
+        model_record=FakeModelManager.records["kimi-k3"],
+        tool_adapter="kimi_k3",
+        prompt_messages=prepared.messages,
+    )
+    assert payload["usage"]["completion_tokens"] == expected_tokens
+
+
+def test_non_kimi_request_never_collects_kimi_completed_actions():
+    request = _kimi_two_stage_continuation_request()
+    request["model"] = "chatglm"
+    service = _app().extensions["genai_service"]
+
+    prepared = service._prepare_chat_request(request, count_usage=False)
+
+    assert prepared.kimi_completed_actions == ()
+
+
 def test_kimi_auto_accepts_explicit_final_after_tool_result():
     upstream = fake_completion(
         "<k3_final>Inspection returned beta; the task is complete.</k3_final>",

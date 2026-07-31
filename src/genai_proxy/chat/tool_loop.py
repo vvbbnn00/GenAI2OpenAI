@@ -25,6 +25,8 @@ from genai_proxy.models import (
     KIMI_FINAL_OPEN,
     KIMI_K3_ADAPTER,
     extract_kimi_final_response,
+    kimi_action_repeats_completed,
+    kimi_duplicate_retry_messages,
     kimi_tool_retry_messages,
     tool_start_tags,
 )
@@ -110,6 +112,10 @@ class ToolLoopMixin:
         choice_satisfied = False
         final_response = False
         invalid_syntax = False
+        hold_attempt_reasoning = (
+            prepared.tool_adapter == KIMI_K3_ADAPTER
+            and bool(prepared.kimi_completed_actions)
+        )
         if prepared.tool_adapter == KIMI_K3_ADAPTER:
             max_attempts = KIMI_TOOL_ATTEMPTS
         elif _tool_choice_requires_call(prepared.tool_choice):
@@ -119,13 +125,19 @@ class ToolLoopMixin:
         attempt_messages = prepared.messages
         for attempt_index in range(max_attempts):
             attempt = None
+            attempt_reasoning_deltas = []
             try:
                 for event_type, value in self._iter_tool_attempt_events(
                     prepared,
                     attempt_messages,
-                    stream_reasoning=stream_reasoning,
+                    stream_reasoning=(
+                        stream_reasoning and not hold_attempt_reasoning
+                    ),
                 ):
                     if event_type == "reasoning":
+                        if hold_attempt_reasoning:
+                            attempt_reasoning_deltas.append(value)
+                            continue
                         delta = {"reasoning_content": value}
                         visible_reasoning += value
                         if not sent_role:
@@ -177,6 +189,15 @@ class ToolLoopMixin:
                 and not tool_calls
                 and not final_response
             )
+            duplicate_requires_confirmation = (
+                prepared.tool_adapter == KIMI_K3_ADAPTER
+                and bool(tool_calls)
+                and kimi_action_repeats_completed(
+                    tool_calls,
+                    prepared.kimi_completed_actions,
+                )
+                and attempt_index < max_attempts - 1
+            )
             should_retry = (
                 invalid_syntax
                 or (
@@ -184,9 +205,10 @@ class ToolLoopMixin:
                     and not choice_satisfied
                 )
                 or protocol_missing
+                or duplicate_requires_confirmation
             )
-            if (
-                choice_satisfied
+            stop_attempting = (
+                (choice_satisfied and not duplicate_requires_confirmation)
                 or (
                     final_response
                     and not _tool_choice_requires_call(prepared.tool_choice)
@@ -197,9 +219,25 @@ class ToolLoopMixin:
                     prepared.tool_adapter != KIMI_K3_ADAPTER
                     and sent_role
                 )
-            ):
+            )
+            if stop_attempting:
+                accepted_attempt = choice_satisfied or (
+                    final_response
+                    and not _tool_choice_requires_call(prepared.tool_choice)
+                )
+                if hold_attempt_reasoning and accepted_attempt:
+                    for reasoning_delta in attempt_reasoning_deltas:
+                        delta = {"reasoning_content": reasoning_delta}
+                        visible_reasoning += reasoning_delta
+                        if not sent_role:
+                            delta["role"] = "assistant"
+                            sent_role = True
+                        yield make_chunk(delta)
                 break
-            if prepared.tool_adapter == KIMI_K3_ADAPTER:
+            if duplicate_requires_confirmation:
+                attempt_messages = kimi_duplicate_retry_messages(prepared.messages)
+                warning = "Kimi K3 repeated a completed client action"
+            elif prepared.tool_adapter == KIMI_K3_ADAPTER:
                 attempt_messages = kimi_tool_retry_messages(
                     prepared.messages,
                     tool_choice=prepared.tool_choice,
