@@ -200,7 +200,14 @@ def response_input_tokens():
 def list_models():
     model_manager = current_app.extensions["model_manager"]
     try:
-        return jsonify({"object": "list", "data": model_manager.list_openai_models()})
+        response = jsonify(
+            {"object": "list", "data": model_manager.list_openai_models()}
+        )
+        response.headers["Cache-Control"] = (
+            "private, max-age=60, stale-while-revalidate=300, "
+            "stale-if-error=86400"
+        )
+        return response
     except ProxyError as exc:
         return openai_error(
             exc.message,

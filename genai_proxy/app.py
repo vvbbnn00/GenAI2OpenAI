@@ -27,7 +27,15 @@ def create_app(config, logger):
         token_manager,
         max_retries=max_retries,
         retry_backoff=retry_backoff,
+        cache_path=getattr(config, "genai_model_cache", None),
+        fallback_model_ids=(
+            getattr(config, "claude_haiku_model", None),
+            getattr(config, "claude_sonnet_model", None),
+            getattr(config, "claude_opus_model", None),
+        ),
     )
+    if getattr(config, "genai_model_cache", None):
+        model_manager.refresh_in_background()
     genai_service = GenAIService(
         logger,
         token_manager,

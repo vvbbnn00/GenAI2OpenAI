@@ -704,7 +704,7 @@ class AuthRefreshTests(unittest.TestCase):
         self.assertEqual(mocked_get.call_count, 1)
         self.assertIn("/htk/ai-user-info/list", mocked_get.call_args.args[0])
 
-    def test_model_list_result_null_raises_proxy_error_instead_of_attribute_error(self):
+    def test_model_list_result_null_uses_fallback_instead_of_502(self):
         token_manager = FakeTokenManager()
         manager = ModelManager(self.logger, token_manager, max_retries=0)
 
@@ -712,10 +712,9 @@ class AuthRefreshTests(unittest.TestCase):
             "genai_proxy.services.models.requests.get",
             return_value=FakeResponse({"success": True, "code": 200, "result": None}),
         ):
-            with self.assertRaises(ProxyError) as raised:
-                manager.list_genai_models(force_refresh=True)
+            models = manager.list_genai_models(force_refresh=True)
 
-        self.assertEqual(raised.exception.error_type, "upstream_error")
+        self.assertIn("GPT-4.1", {model["aiType"] for model in models})
 
     def test_refresh_after_auth_failure_deletes_cache_and_forces_refresh(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,6 +1,10 @@
+import json
+import os
+import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from pathlib import Path
 
 import requests
 
@@ -23,6 +27,16 @@ GENAI_MODEL_LIST_URL = (
 DEFAULT_MODEL = "GPT-4.1"
 EXCLUDED_MODEL_IDS = {"gpt-image-1.5"}
 MODEL_CACHE_TTL = 300
+MODEL_REFRESH_FAILURE_COOLDOWN = 30
+MODEL_CACHE_VERSION = 1
+DEFAULT_FALLBACK_MODEL_IDS = (
+    DEFAULT_MODEL,
+    "deepseek-chat",
+    "deepseek-pro",
+    "MiniMax-M1",
+    "chatglm",
+    "kimi-k3",
+)
 
 
 class ModelManager:
@@ -33,14 +47,33 @@ class ModelManager:
         *,
         max_retries: int = DEFAULT_MAX_RETRIES,
         retry_backoff: float = DEFAULT_RETRY_BACKOFF,
+        cache_path: str | None = None,
+        fallback_model_ids=(),
     ):
         self._logger = logger
         self._token_manager = token_manager
         self._max_retries = max(0, int(max_retries))
         self._retry_backoff = max(0.0, float(retry_backoff))
-        self._models_cache = None
-        self._models_cache_at = 0.0
+        self._models_cache_path = (
+            Path(cache_path).expanduser() if cache_path else None
+        )
         self._models_cache_lock = threading.Lock()
+        self._models_refresh_lock = threading.Lock()
+        self._models_refreshing = False
+        self._models_refresh_after = 0.0
+        self._fallback_models = _fallback_model_records(
+            [
+                *DEFAULT_FALLBACK_MODEL_IDS,
+                *(fallback_model_ids or ()),
+            ]
+        )
+
+        cached = self._load_persistent_cache()
+        if cached is None:
+            self._models_cache = list(self._fallback_models)
+            self._models_cache_at = 0.0
+        else:
+            self._models_cache, self._models_cache_at = cached
 
     def resolve_model(self, model: str) -> str:
         requested = model or DEFAULT_MODEL
@@ -83,37 +116,149 @@ class ModelManager:
         return models
 
     def list_genai_models(self, force_refresh: bool = False) -> list[dict]:
-        if self._has_fresh_cache(force_refresh):
-            return self._models_cache
+        if force_refresh:
+            return self._refresh_models()
 
         with self._models_cache_lock:
-            if self._has_fresh_cache(force_refresh):
-                return self._models_cache
-            try:
-                models = self._fetch_models()
-            except ProxyError as exc:
-                if (
-                    exc.code != TRANSIENT_UPSTREAM_ERROR_CODE
-                    or self._models_cache is None
-                    or force_refresh
-                ):
-                    raise
-                self._logger.warning(
-                    "Using stale GenAI model cache after upstream refresh failed"
-                )
-                self._models_cache_at = time.time()
-                return self._models_cache
-
-            self._models_cache = models
-            self._models_cache_at = time.time()
+            models = self._models_cache
+            if not self._cache_refresh_due_locked():
+                return models
+            self._start_background_refresh_locked()
             return models
 
-    def _has_fresh_cache(self, force_refresh: bool) -> bool:
-        return (
-            not force_refresh
-            and self._models_cache is not None
-            and time.time() - self._models_cache_at < MODEL_CACHE_TTL
+    def refresh_in_background(self) -> None:
+        with self._models_cache_lock:
+            if self._cache_refresh_due_locked():
+                self._start_background_refresh_locked()
+
+    def _cache_refresh_due_locked(self) -> bool:
+        now = time.time()
+        return now >= max(
+            self._models_cache_at + MODEL_CACHE_TTL,
+            self._models_refresh_after,
         )
+
+    def _start_background_refresh_locked(self) -> None:
+        if self._models_refreshing:
+            return
+        self._models_refreshing = True
+        threading.Thread(
+            target=self._refresh_models_in_background,
+            name="genai-model-refresh",
+            daemon=True,
+        ).start()
+
+    def _refresh_models_in_background(self) -> None:
+        try:
+            self._refresh_models()
+        finally:
+            with self._models_cache_lock:
+                self._models_refreshing = False
+
+    def _refresh_models(self) -> list[dict]:
+        with self._models_refresh_lock:
+            try:
+                models = _normalize_model_records(self._fetch_models())
+                if not models:
+                    raise ValueError("refresh returned no usable models")
+            except Exception as exc:
+                with self._models_cache_lock:
+                    self._models_refresh_after = (
+                        time.time() + MODEL_REFRESH_FAILURE_COOLDOWN
+                    )
+                    cached = self._models_cache or list(self._fallback_models)
+                    self._models_cache = cached
+                if isinstance(exc, ProxyError):
+                    self._logger.warning(
+                        "Using cached GenAI models after refresh failed: %s",
+                        exc.message,
+                    )
+                else:
+                    self._logger.exception(
+                        "Using cached GenAI models after unexpected refresh failure"
+                    )
+                return cached
+
+            cached_at = time.time()
+            with self._models_cache_lock:
+                self._models_cache = models
+                self._models_cache_at = cached_at
+                self._models_refresh_after = 0.0
+            self._write_persistent_cache(models, cached_at)
+            return models
+
+    def _load_persistent_cache(self) -> tuple[list[dict], float] | None:
+        if self._models_cache_path is None:
+            return None
+        try:
+            with self._models_cache_path.open(encoding="utf-8") as cache_file:
+                payload = json.load(cache_file)
+            if (
+                not isinstance(payload, dict)
+                or payload.get("version") != MODEL_CACHE_VERSION
+            ):
+                raise ValueError("unsupported cache format")
+            models = _normalize_model_records(payload.get("models"))
+            if not models:
+                raise ValueError("cache contains no models")
+            cached_at = min(float(payload.get("fetched_at") or 0), time.time())
+        except FileNotFoundError:
+            return None
+        except (OSError, TypeError, ValueError) as exc:
+            self._logger.warning(
+                "Ignoring invalid GenAI model cache %s: %s",
+                self._models_cache_path,
+                exc,
+            )
+            return None
+
+        self._logger.info(
+            "Loaded %d GenAI models from persistent cache",
+            len(models),
+        )
+        return models, max(0.0, cached_at)
+
+    def _write_persistent_cache(
+        self,
+        models: list[dict],
+        cached_at: float,
+    ) -> None:
+        if self._models_cache_path is None:
+            return
+        temporary_path = None
+        try:
+            self._models_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": MODEL_CACHE_VERSION,
+                "fetched_at": cached_at,
+                "models": models,
+            }
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self._models_cache_path.parent,
+                prefix=f".{self._models_cache_path.name}.",
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                json.dump(
+                    payload,
+                    temporary,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            temporary_path.replace(self._models_cache_path)
+        except (OSError, TypeError, ValueError) as exc:
+            self._logger.warning(
+                "Failed to persist GenAI model cache %s: %s",
+                self._models_cache_path,
+                exc,
+            )
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def _fetch_models(self) -> list[dict]:
         return self._fetch_models_with_retry()
@@ -147,7 +292,7 @@ class ModelManager:
                 raise
 
     def _fetch_models_once(self, token: str | None) -> list[dict]:
-        url = GENAI_MODEL_LIST_URL.format(timestamp=int(time.time()))
+        url = GENAI_MODEL_LIST_URL.format(timestamp=int(time.time() * 1000))
         try:
             response = requests.get(
                 url,
@@ -201,20 +346,17 @@ class ModelManager:
             self._logger.warning("GenAI model list response missing result object: %s", payload)
             raise transient_upstream_error("Failed to fetch GenAI models")
 
-        records = result.get("records") or []
-        models = []
-        seen = set()
-
-        for record in records:
-            ai_type = record.get("aiType")
-            if not ai_type:
-                continue
-            if ai_type.lower() in EXCLUDED_MODEL_IDS:
-                continue
-            if ai_type in seen:
-                continue
-            seen.add(ai_type)
-            models.append(record)
+        records = result.get("records")
+        if not isinstance(records, list):
+            self._logger.warning(
+                "GenAI model list response missing records array: %s",
+                payload,
+            )
+            raise transient_upstream_error("Failed to fetch GenAI models")
+        models = _normalize_model_records(records)
+        if not models:
+            self._logger.warning("GenAI model list response contained no usable models")
+            raise transient_upstream_error("Failed to fetch GenAI models")
 
         self._logger.debug(
             "Fetched %d GenAI models from upstream: %s",
@@ -224,13 +366,62 @@ class ModelManager:
         return models
 
 
+def _normalize_model_records(records) -> list[dict]:
+    if not isinstance(records, list):
+        raise TypeError("models must be a list")
+
+    models = []
+    seen = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        ai_type = record.get("aiType")
+        if not isinstance(ai_type, str) or not ai_type:
+            continue
+        model_key = ai_type.casefold()
+        if model_key in EXCLUDED_MODEL_IDS or model_key in seen:
+            continue
+        seen.add(model_key)
+        models.append(record)
+    return models
+
+
+def _fallback_model_records(model_ids) -> list[dict]:
+    records = []
+    seen = set()
+    for model_id in model_ids:
+        if not isinstance(model_id, str) or not model_id.strip():
+            continue
+        model_id = model_id.strip()
+        model_key = model_id.casefold()
+        if model_key in EXCLUDED_MODEL_IDS or model_key in seen:
+            continue
+        seen.add(model_key)
+        records.append(
+            {
+                "aiType": model_id,
+                "aiName": model_id,
+                "rootAiType": (
+                    "azure"
+                    if model_key.startswith(("gpt-", "o1", "o3", "o4"))
+                    else "xinference"
+                ),
+            }
+        )
+    return records
+
+
 def _parse_created_timestamp(value) -> int:
     if not value:
         return 0
 
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
-            return int(datetime.strptime(str(value), fmt).replace(tzinfo=timezone.utc).timestamp())
+            return int(
+                datetime.strptime(str(value), fmt)
+                .replace(tzinfo=UTC)
+                .timestamp()
+            )
         except ValueError:
             continue
     return 0

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 from genai_proxy.retry import DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BACKOFF
 
+DEFAULT_MODEL_CACHE_PATH = "~/.cache/genai2openai/models.json"
+
 
 @dataclass(slots=True)
 class AppConfig:
@@ -18,6 +20,7 @@ class AppConfig:
     claude_opus_model: str
     genai_max_retries: int = DEFAULT_MAX_RETRIES
     genai_retry_backoff: float = DEFAULT_RETRY_BACKOFF
+    genai_model_cache: str | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -70,6 +73,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Initial retry delay in seconds; later delays double up to 5 seconds",
     )
     parser.add_argument(
+        "--genai-model-cache",
+        type=str,
+        default=(
+            os.environ.get("GENAI_MODEL_CACHE")
+            or DEFAULT_MODEL_CACHE_PATH
+        ),
+        help="Persistent cache file for the last valid GenAI model list",
+    )
+    parser.add_argument(
         "--claude-haiku-model",
         type=str,
         default=os.environ.get("CLAUDE_HAIKU_MODEL", "deepseek-chat"),
@@ -115,4 +127,5 @@ def parse_args(argv: list[str] | None = None) -> AppConfig:
         claude_opus_model=args.claude_opus_model,
         genai_max_retries=args.genai_max_retries,
         genai_retry_backoff=args.genai_retry_backoff,
+        genai_model_cache=args.genai_model_cache or None,
     )

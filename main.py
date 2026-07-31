@@ -1,7 +1,11 @@
 import os
 
 from genai_proxy.app import create_app
-from genai_proxy.config import AppConfig, parse_args
+from genai_proxy.config import (
+    DEFAULT_MODEL_CACHE_PATH,
+    AppConfig,
+    parse_args,
+)
 from genai_proxy.logging_utils import setup_logging
 from genai_proxy.retry import DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BACKOFF
 
@@ -36,6 +40,10 @@ def _config_from_env() -> AppConfig:
             0.0,
             _float_env("GENAI_RETRY_BACKOFF", DEFAULT_RETRY_BACKOFF),
         ),
+        genai_model_cache=(
+            os.environ.get("GENAI_MODEL_CACHE")
+            or DEFAULT_MODEL_CACHE_PATH
+        ),
     )
 
 
@@ -67,6 +75,10 @@ def _log_startup(config: AppConfig, logger) -> None:
         "GenAI upstream retries: %d, initial backoff: %.2f seconds",
         config.genai_max_retries,
         config.genai_retry_backoff,
+    )
+    logger.info(
+        "GenAI model cache: %s",
+        config.genai_model_cache or "memory only",
     )
 
 

@@ -1,10 +1,14 @@
 import json
 import logging
 import os
+import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
 import requests
+from flask import Flask
 
 from genai_proxy.config import parse_args
 from genai_proxy.errors import ProxyError
@@ -13,6 +17,7 @@ from genai_proxy.retry import (
     is_retryable_business_error,
     retry_delay,
 )
+from genai_proxy.routes.openai import bp as openai_bp
 from genai_proxy.services.genai import GenAIService
 from genai_proxy.services.models import ModelManager
 
@@ -383,7 +388,7 @@ class GenAIRetryTests(unittest.TestCase):
                 success,
             ],
         ) as get:
-            models = manager.list_genai_models()
+            models = manager.list_genai_models(force_refresh=True)
 
         self.assertEqual(get.call_count, 3)
         self.assertEqual(models, [{"aiType": "chatglm"}])
@@ -402,12 +407,12 @@ class GenAIRetryTests(unittest.TestCase):
             "genai_proxy.services.models.requests.get",
             side_effect=requests.ConnectionError("connection reset"),
         ) as get:
-            models = manager.list_genai_models()
+            models = manager.list_genai_models(force_refresh=True)
 
         self.assertEqual(get.call_count, 2)
         self.assertEqual(models, [{"aiType": "cached-model"}])
 
-    def test_model_list_does_not_hide_auth_failure_with_stale_cache(self):
+    def test_model_list_uses_stale_cache_after_auth_refresh_fails(self):
         manager = ModelManager(
             logging.getLogger("test_genai_retry.models"),
             FakeTokenManager(),
@@ -421,10 +426,182 @@ class GenAIRetryTests(unittest.TestCase):
             "genai_proxy.services.models.requests.get",
             return_value=FakeResponse(status_code=401),
         ):
-            with self.assertRaises(ProxyError) as raised:
-                manager.list_genai_models()
+            models = manager.list_genai_models(force_refresh=True)
 
-        self.assertEqual(raised.exception.code, "upstream_auth_failed")
+        self.assertEqual(models, [{"aiType": "cached-model"}])
+
+    def test_stale_model_cache_returns_before_background_refresh_finishes(self):
+        manager = ModelManager(
+            logging.getLogger("test_genai_retry.models"),
+            FakeTokenManager(),
+            max_retries=0,
+            retry_backoff=0,
+        )
+        manager._models_cache = [{"aiType": "cached-model"}]
+        manager._models_cache_at = 0
+        refresh_started = threading.Event()
+        allow_refresh = threading.Event()
+
+        def fetch():
+            refresh_started.set()
+            allow_refresh.wait(timeout=2)
+            return [{"aiType": "fresh-model"}]
+
+        with patch.object(manager, "_fetch_models", side_effect=fetch) as mocked:
+            models = manager.list_genai_models()
+            self.assertEqual(models, [{"aiType": "cached-model"}])
+            self.assertTrue(refresh_started.wait(timeout=1))
+
+            for _ in range(10):
+                self.assertEqual(
+                    manager.list_genai_models(),
+                    [{"aiType": "cached-model"}],
+                )
+            self.assertEqual(mocked.call_count, 1)
+
+            allow_refresh.set()
+            for _ in range(100):
+                if not manager._models_refreshing:
+                    break
+                time.sleep(0.01)
+
+        self.assertFalse(manager._models_refreshing)
+        self.assertEqual(manager.list_genai_models(), [{"aiType": "fresh-model"}])
+
+    def test_persistent_model_cache_survives_restart_and_upstream_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = os.path.join(temp_dir, "models.json")
+            first = ModelManager(
+                logging.getLogger("test_genai_retry.models"),
+                FakeTokenManager(),
+                max_retries=0,
+                retry_backoff=0,
+                cache_path=cache_path,
+            )
+            with patch.object(
+                first,
+                "_fetch_models",
+                return_value=[{"aiType": "persisted-model"}],
+            ):
+                self.assertEqual(
+                    first.list_genai_models(force_refresh=True),
+                    [{"aiType": "persisted-model"}],
+                )
+
+            restarted = ModelManager(
+                logging.getLogger("test_genai_retry.models"),
+                FakeTokenManager(),
+                max_retries=0,
+                retry_backoff=0,
+                cache_path=cache_path,
+            )
+            with patch.object(
+                restarted,
+                "_fetch_models",
+                side_effect=ProxyError(
+                    "offline",
+                    error_type="upstream_error",
+                    status=502,
+                ),
+            ) as fetch:
+                self.assertEqual(
+                    restarted.list_genai_models(force_refresh=True),
+                    [{"aiType": "persisted-model"}],
+                )
+                self.assertEqual(fetch.call_count, 1)
+
+    def test_corrupt_persistent_model_cache_falls_back_without_502(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = os.path.join(temp_dir, "models.json")
+            with open(cache_path, "w", encoding="utf-8") as cache_file:
+                cache_file.write("{broken")
+
+            manager = ModelManager(
+                logging.getLogger("test_genai_retry.models"),
+                FakeTokenManager(),
+                max_retries=0,
+                retry_backoff=0,
+                cache_path=cache_path,
+            )
+            with patch.object(
+                manager,
+                "_fetch_models",
+                side_effect=ProxyError(
+                    "offline",
+                    error_type="upstream_error",
+                    status=502,
+                ),
+            ):
+                models = manager.list_genai_models(force_refresh=True)
+
+        self.assertIn("GPT-4.1", {model["aiType"] for model in models})
+
+    def test_failed_background_refresh_obeys_cooldown(self):
+        manager = ModelManager(
+            logging.getLogger("test_genai_retry.models"),
+            FakeTokenManager(),
+            max_retries=0,
+            retry_backoff=0,
+        )
+        with patch.object(
+            manager,
+            "_fetch_models",
+            side_effect=ProxyError(
+                "offline",
+                error_type="upstream_error",
+                status=502,
+            ),
+        ) as fetch:
+            manager.list_genai_models()
+            for _ in range(100):
+                if not manager._models_refreshing:
+                    break
+                time.sleep(0.01)
+            manager.list_genai_models()
+
+        self.assertEqual(fetch.call_count, 1)
+        self.assertGreater(manager._models_refresh_after, time.time())
+
+    def test_models_endpoint_serves_fallback_with_http_cache_policy(self):
+        manager = ModelManager(
+            logging.getLogger("test_genai_retry.models"),
+            FakeTokenManager(),
+            max_retries=0,
+            retry_backoff=0,
+        )
+        manager._models_cache_at = time.time()
+        app = Flask(__name__)
+        app.extensions["model_manager"] = manager
+        app.register_blueprint(openai_bp)
+
+        with patch.object(
+            manager,
+            "_fetch_models",
+            side_effect=ProxyError(
+                "offline",
+                error_type="upstream_error",
+                status=502,
+            ),
+        ):
+            manager._models_cache_at = 0
+            response = app.test_client().get("/v1/models")
+            for _ in range(100):
+                if not manager._models_refreshing:
+                    break
+                time.sleep(0.01)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            "GPT-4.1",
+            {model["id"] for model in response.get_json()["data"]},
+        )
+        self.assertEqual(
+            response.headers["Cache-Control"],
+            (
+                "private, max-age=60, stale-while-revalidate=300, "
+                "stale-if-error=86400"
+            ),
+        )
 
     def test_retry_settings_are_available_as_cli_options(self):
         config = parse_args(
@@ -440,3 +617,4 @@ class GenAIRetryTests(unittest.TestCase):
 
         self.assertEqual(config.genai_max_retries, 10)
         self.assertEqual(config.genai_retry_backoff, 0.25)
+        self.assertTrue(config.genai_model_cache.endswith("models.json"))
