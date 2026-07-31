@@ -84,21 +84,38 @@ class ProgramVersionTests(unittest.TestCase):
                 environ={
                     "GENAI_BUILD_COMMIT": "B" * 40,
                     "GENAI_BUILD_COMMIT_TIME": "2026-07-31T03:04:05Z",
+                    "GENAI_BUILD_DIRTY": "true",
                 },
             )
             payload = json.loads(output_path.read_text(encoding="utf-8"))
 
         self.assertEqual(version.commit, "b" * 40)
         self.assertEqual(version.source, "build-args")
+        self.assertTrue(version.dirty)
         self.assertEqual(
             payload,
             {
                 "version": 1,
                 "commit": "b" * 40,
                 "committed_at": "2026-07-31T03:04:05Z",
-                "dirty": False,
+                "dirty": True,
             },
         )
+
+    def test_invalid_dirty_build_argument_falls_back_to_local_dev(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "version.json"
+            version = write_build_metadata(
+                output_path,
+                source_root=temp_dir,
+                environ={
+                    "GENAI_BUILD_COMMIT": "b" * 40,
+                    "GENAI_BUILD_COMMIT_TIME": "2026-07-31T03:04:05Z",
+                    "GENAI_BUILD_DIRTY": "invalid",
+                },
+            )
+
+        self.assertTrue(version.is_local_dev)
 
     def test_local_dev_metadata_is_valid_image_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:

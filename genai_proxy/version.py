@@ -67,11 +67,15 @@ def write_build_metadata(
     environ: dict[str, str] | None = None,
 ) -> ProgramVersion:
     environment = os.environ if environ is None else environ
-    version = _version_from_values(
-        environment.get("GENAI_BUILD_COMMIT"),
-        environment.get("GENAI_BUILD_COMMIT_TIME"),
-        source="build-args",
-    )
+    dirty = _parse_build_dirty(environment.get("GENAI_BUILD_DIRTY"))
+    version = None
+    if dirty is not None:
+        version = _version_from_values(
+            environment.get("GENAI_BUILD_COMMIT"),
+            environment.get("GENAI_BUILD_COMMIT_TIME"),
+            source="build-args",
+            dirty=dirty,
+        )
     if version is None:
         version = _read_git_version(Path(source_root))
     if version is None:
@@ -206,6 +210,19 @@ def _version_from_values(
     if parsed_time.tzinfo is None:
         return None
     return ProgramVersion(commit, committed_at, source, dirty)
+
+
+def _parse_build_dirty(value) -> bool | None:
+    if value is None:
+        return False
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold()
+    if normalized in {"", "0", "false", "no"}:
+        return False
+    if normalized in {"1", "true", "yes"}:
+        return True
+    return None
 
 
 def _main() -> None:

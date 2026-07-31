@@ -55,4 +55,14 @@ COPY pyproject.toml uv.lock README.md ./
 COPY genai_proxy ./genai_proxy
 COPY main.py ./
 
+ARG GENAI_BUILD_COMMIT=""
+ARG GENAI_BUILD_COMMIT_TIME=""
+ARG GENAI_BUILD_DIRTY="0"
+RUN GENAI_BUILD_COMMIT="${GENAI_BUILD_COMMIT}" \
+    GENAI_BUILD_COMMIT_TIME="${GENAI_BUILD_COMMIT_TIME}" \
+    GENAI_BUILD_DIRTY="${GENAI_BUILD_DIRTY}" \
+    python -m genai_proxy.version \
+        --output ./genai_proxy/_build_version.json \
+        --source-root /app
+
 EXPOSE 5000

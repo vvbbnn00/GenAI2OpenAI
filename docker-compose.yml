@@ -3,6 +3,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        GENAI_BUILD_COMMIT: ${GENAI_BUILD_COMMIT:-}
+        GENAI_BUILD_COMMIT_TIME: ${GENAI_BUILD_COMMIT_TIME:-}
+        GENAI_BUILD_DIRTY: ${GENAI_BUILD_DIRTY:-0}
     restart: unless-stopped
     init: true
     stop_grace_period: 45s

@@ -46,7 +46,7 @@ APP_DEBUG=0
 3. 构建并启动服务：
 
 ```bash
-docker compose up -d --build
+./scripts/docker-compose.sh up -d --build
 ```
 
 4. 查看日志：
@@ -54,6 +54,17 @@ docker compose up -d --build
 ```bash
 docker compose logs -f
 ```
+
+启动日志会输出镜像对应的完整 Git commit hash 和提交时间，例如
+`Program version: commit=<hash> committed_at=<ISO 8601> source=image`。
+包装脚本只在宿主机读取 Git，然后把 hash、提交时间和脏工作区状态作为三个
+短构建参数传给 Docker。`.git` 完全排除在构建上下文和镜像之外。
+在 CI 或源码归档中也可以直接设置 `GENAI_BUILD_COMMIT`、
+`GENAI_BUILD_COMMIT_TIME` 和 `GENAI_BUILD_DIRTY`。没有这些参数时，直接执行
+`docker compose up -d --build` 仍能构建，但版本显示为
+`Program version: local-dev`。
+如果参与镜像运行的源码尚未提交，日志还会追加 `dirty=true`，避免把脏工作区
+误认为该 commit 的完整内容。
 
 5. 停止服务：
 
@@ -68,6 +79,9 @@ docker compose down
 | `GENAI_TOKEN` | GenAI 平台 JWT；和 `KEYSTORE_PATH` 二选一或同时提供 | 空 |
 | `KEYSTORE_PATH` | 容器内的 keystore 路径，用于 passkey 自动登录/刷新 | 空 |
 | `KEYSTORE_HOST_PATH` | 宿主机上的 keystore 文件路径，会挂载到容器内 | `./docker-deploy.keystore` |
+| `GENAI_BUILD_COMMIT` | Docker 镜像对应的完整 Git commit hash，包装脚本自动设置 | 空 |
+| `GENAI_BUILD_COMMIT_TIME` | Docker 镜像对应的 Git commit 时间，包装脚本自动设置 | 空 |
+| `GENAI_BUILD_DIRTY` | 构建源码是否包含未提交改动，包装脚本自动设置 | `0` |
 | `TOKEN_CHECK_INTERVAL` | 后台检查 token 过期时间并同步共享缓存的间隔秒数；`0` 表示关闭 | `60` |
 | `GENAI_MAX_RETRIES` | GenAI 聊天、模型列表和计费请求遇到临时网络故障、HTTP 408/425/429/500/502/503/504、无效响应或意外断流时的最大重试次数；`0` 表示关闭 | `10` |
 | `GENAI_RETRY_BACKOFF` | 首次重试等待秒数，后续每次翻倍并封顶 5 秒；`0` 表示立即重试 | `0.5` |
@@ -102,6 +116,11 @@ uv run main.py --keystore <path/to/ids-passkey.keystore> --token-check-interval 
 uv run main.py --keystore <path/to/ids-passkey.keystore> --genai-max-retries 10 --genai-retry-backoff 0.5
 uv run main.py --token <token> --claude-opus-model chatglm --claude-sonnet-model chatglm --claude-haiku-model deepseek-chat
 ```
+
+直接运行源码时，启动日志中的版本信息来自当前仓库的最后一次提交，格式为
+`Program version: commit=<hash> committed_at=<ISO 8601> source=git`。无法读取 Git
+元数据时显示 `Program version: local-dev`。
+源码有未提交改动时同样会追加 `dirty=true`。
 
 认证参数说明：
 
