@@ -18,9 +18,14 @@ from genai_proxy.compat.responses import (
     convert_responses_to_openai_request,
     make_message_added_item,
     make_message_item,
+    make_reasoning_added_item,
+    make_reasoning_item,
     make_response_id,
+    make_response_tool_added_item,
     make_response_tool_item,
     response_completed_event,
+    response_content_part_added,
+    response_content_part_done,
     response_created_event,
     response_custom_tool_call_input_delta,
     response_failed_event,
@@ -28,7 +33,9 @@ from genai_proxy.compat.responses import (
     response_output_item_done,
     response_output_text,
     response_output_text_delta,
+    response_output_text_done,
     response_reasoning_text_delta,
+    response_reasoning_text_done,
 )
 from genai_proxy.errors import ProxyError
 from genai_proxy.optimizations import (
@@ -47,6 +54,7 @@ from genai_proxy.optimizations import (
     tool_start_tags,
 )
 from genai_proxy.reasoning import (
+    deepseek_thinking_enabled,
     normalize_reasoning_for_adapter,
     parse_reasoning_config,
 )
@@ -96,7 +104,8 @@ GENAI_HISTORY_LIST_URL = (
 GENAI_HISTORY_DELETE_URL = (
     "https://genai.shanghaitech.edu.cn/htk/ai/history/delete/groupId"
 )
-GENAI_STREAM_TIMEOUT = (10, 600)
+GENAI_STREAM_TIMEOUT = (10, 90)
+GENAI_TIMEOUT_MAX_RETRIES = 1
 GENAI_HISTORY_TIMEOUT = (5, 15)
 KIMI_EMPTY_CURRENT_INPUT = "\u200b"
 KIMI_HISTORY_PAGE_SIZE = 200
@@ -120,6 +129,7 @@ class PreparedChatRequest:
     include_usage: bool
     prompt_tokens: int | None
     token_reasoning_config: dict | None
+    thinking: bool | None
     image_sizes: tuple[tuple[int, int], ...] | None
     generated_usage: dict | None = None
 
@@ -129,6 +139,84 @@ class _KimiHistoryCleanup:
     question: str
     user_id: str
     existing_group_ids: frozenset[str]
+
+
+class _ThinkTagDeltaParser:
+    _OPEN = "<think>"
+    _CLOSE = "</think>"
+
+    def __init__(self):
+        self._buffer = ""
+        self._in_reasoning = False
+        self._can_open = True
+
+    def disable(self):
+        if not self._in_reasoning:
+            self._can_open = False
+
+    def feed(self, text: str | None) -> tuple[str, str]:
+        if not text:
+            return "", ""
+
+        source = self._buffer + str(text)
+        self._buffer = ""
+
+        if self._in_reasoning:
+            return self._feed_reasoning(source)
+        if not self._can_open:
+            return source, ""
+
+        open_at = source.find(self._OPEN)
+        if open_at >= 0:
+            prefix = source[:open_at]
+            if prefix.strip():
+                self._can_open = False
+                return source, ""
+            self._in_reasoning = True
+            content, reasoning = self._feed_reasoning(
+                source[open_at + len(self._OPEN) :]
+            )
+            return prefix + content, reasoning
+
+        suffix_length = self._partial_tag_suffix_length(source, self._OPEN)
+        remainder = source[:-suffix_length] if suffix_length else source
+        if remainder.strip():
+            self._can_open = False
+            return source, ""
+        if suffix_length:
+            self._buffer = source[-suffix_length:]
+        return remainder, ""
+
+    def finish(self) -> tuple[str, str]:
+        pending = self._buffer
+        self._buffer = ""
+        if not pending:
+            return "", ""
+        return ("", pending) if self._in_reasoning else (pending, "")
+
+    def _feed_reasoning(self, source: str) -> tuple[str, str]:
+        close_at = source.find(self._CLOSE)
+        if close_at >= 0:
+            reasoning = source[:close_at]
+            content = source[close_at + len(self._CLOSE) :]
+            self._in_reasoning = False
+            self._can_open = False
+            return content, reasoning
+
+        suffix_length = self._partial_tag_suffix_length(source, self._CLOSE)
+        if suffix_length:
+            self._buffer = source[-suffix_length:]
+            source = source[:-suffix_length]
+        return "", source
+
+    @staticmethod
+    def _partial_tag_suffix_length(text: str, tag: str) -> int:
+        maximum = min(len(text), len(tag) - 1)
+        for length in range(maximum, 0, -1):
+            suffix = text[-length:]
+            if tag.startswith(suffix):
+                return length
+        return 0
 
 
 class GenAIService:
@@ -214,18 +302,144 @@ class GenAIService:
         model = openai_request.get("model", "unknown")
         response_id = make_response_id()
         created = int(datetime.now().timestamp())
-        output_items = []
+        output_items_by_index = {}
         output_text = ""
         output_reasoning = ""
         tool_call_deltas = []
         message_item_id = None
-        prepared = self._prepare_chat_request(openai_request)
+        message_output_index = None
+        reasoning_item_id = None
+        reasoning_output_index = None
+        next_output_index = 0
+        sequence_number = 0
+
+        def take_sequence_number():
+            nonlocal sequence_number
+            current = sequence_number
+            sequence_number += 1
+            return current
+
+        def start_reasoning_item():
+            nonlocal next_output_index, reasoning_item_id
+            nonlocal reasoning_output_index
+            if reasoning_item_id is not None:
+                return
+            reasoning_item_id = f"rs_{uuid.uuid4().hex[:24]}"
+            reasoning_output_index = next_output_index
+            next_output_index += 1
+            yield response_output_item_added(
+                make_reasoning_added_item(reasoning_item_id),
+                output_index=reasoning_output_index,
+                sequence_number=take_sequence_number(),
+            )
+            yield response_content_part_added(
+                {"type": "reasoning_text", "text": ""},
+                item_id=reasoning_item_id,
+                output_index=reasoning_output_index,
+                sequence_number=take_sequence_number(),
+            )
+
+        def finish_reasoning_item():
+            if (
+                reasoning_item_id is None
+                or reasoning_output_index is None
+                or reasoning_output_index in output_items_by_index
+            ):
+                return
+            part = {"type": "reasoning_text", "text": output_reasoning}
+            yield response_reasoning_text_done(
+                output_reasoning,
+                item_id=reasoning_item_id,
+                output_index=reasoning_output_index,
+                sequence_number=take_sequence_number(),
+            )
+            yield response_content_part_done(
+                part,
+                item_id=reasoning_item_id,
+                output_index=reasoning_output_index,
+                sequence_number=take_sequence_number(),
+            )
+            item = make_reasoning_item(output_reasoning, reasoning_item_id)
+            output_items_by_index[reasoning_output_index] = item
+            yield response_output_item_done(
+                item,
+                output_index=reasoning_output_index,
+                sequence_number=take_sequence_number(),
+            )
+
+        def start_message_item():
+            nonlocal message_item_id, message_output_index, next_output_index
+            if message_item_id is not None:
+                return
+            message_item_id = f"msg_{uuid.uuid4().hex[:24]}"
+            message_output_index = next_output_index
+            next_output_index += 1
+            yield response_output_item_added(
+                make_message_added_item(message_item_id),
+                output_index=message_output_index,
+                sequence_number=take_sequence_number(),
+            )
+            yield response_content_part_added(
+                {"type": "output_text", "text": "", "annotations": []},
+                item_id=message_item_id,
+                output_index=message_output_index,
+                sequence_number=take_sequence_number(),
+            )
+
+        def finish_message_item(*, force: bool):
+            if message_item_id is None:
+                if not force:
+                    return
+                yield from start_message_item()
+            if (
+                message_item_id is None
+                or message_output_index is None
+                or message_output_index in output_items_by_index
+            ):
+                return
+            part = {
+                "type": "output_text",
+                "text": output_text,
+                "annotations": [],
+            }
+            yield response_output_text_done(
+                output_text,
+                item_id=message_item_id,
+                output_index=message_output_index,
+                sequence_number=take_sequence_number(),
+            )
+            yield response_content_part_done(
+                part,
+                item_id=message_item_id,
+                output_index=message_output_index,
+                sequence_number=take_sequence_number(),
+            )
+            item = make_message_item(output_text, message_item_id)
+            output_items_by_index[message_output_index] = item
+            yield response_output_item_done(
+                item,
+                output_index=message_output_index,
+                sequence_number=take_sequence_number(),
+            )
+
+        def completed_output_items():
+            return [item for _index, item in sorted(output_items_by_index.items())]
+
+        # Responses always reports exact usage, but prompt tokenization does
+        # not need to delay the upstream request or the first streamed event.
+        # _usage() fills it lazily once the model has finished.
+        prepared = self._prepare_chat_request(openai_request, count_usage=False)
         openai_stream = self._stream_prepared_openai_completion(
             prepared,
             buffer_until_complete=buffer_upstream,
         )
 
-        yield response_created_event(response_id, model, created)
+        yield response_created_event(
+            response_id,
+            model,
+            created,
+            sequence_number=take_sequence_number(),
+        )
 
         try:
             for payload in openai_stream:
@@ -249,35 +463,51 @@ class GenAIService:
 
                     reasoning = delta.get("reasoning_content")
                     if reasoning:
+                        yield from start_reasoning_item()
                         output_reasoning += reasoning
-                        yield response_reasoning_text_delta(reasoning)
+                        yield response_reasoning_text_delta(
+                            reasoning,
+                            item_id=reasoning_item_id,
+                            output_index=reasoning_output_index,
+                            sequence_number=take_sequence_number(),
+                        )
 
                     content = delta.get("content")
                     if content:
-                        if message_item_id is None:
-                            message_item_id = f"msg_{uuid.uuid4().hex[:24]}"
-                            yield response_output_item_added(
-                                make_message_added_item(message_item_id)
-                            )
+                        yield from start_message_item()
                         output_text += content
-                        yield response_output_text_delta(content)
+                        yield response_output_text_delta(
+                            content,
+                            item_id=message_item_id,
+                            output_index=message_output_index,
+                            sequence_number=take_sequence_number(),
+                        )
 
                     for tool_call in delta.get("tool_calls") or []:
                         tool_call_deltas.append(_normalize_stream_tool_call(tool_call))
 
                     if finish_reason == "error":
                         message = _strip_error_prefix(content or "Upstream error")
-                        yield response_failed_event(response_id, message)
+                        yield response_failed_event(
+                            response_id,
+                            message,
+                            sequence_number=take_sequence_number(),
+                        )
                         return
 
                     if finish_reason == "tool_calls":
                         merged_tool_calls = _merge_tool_call_deltas(tool_call_deltas)
-                        if output_text:
-                            item = make_message_item(output_text, message_item_id)
-                            output_items.append(item)
-                            yield response_output_item_done(item)
+                        yield from finish_reasoning_item()
+                        yield from finish_message_item(force=False)
                         for tool_call in merged_tool_calls:
                             item = make_response_tool_item(tool_call, context.tool_map)
+                            output_index = next_output_index
+                            next_output_index += 1
+                            yield response_output_item_added(
+                                make_response_tool_added_item(item),
+                                output_index=output_index,
+                                sequence_number=take_sequence_number(),
+                            )
                             if item.get("type") == "custom_tool_call":
                                 item_id = (
                                     item.get("id") or item.get("call_id") or response_id
@@ -286,13 +516,19 @@ class GenAIService:
                                     item_id,
                                     item.get("call_id") or item_id,
                                     item.get("input") or "",
+                                    output_index=output_index,
+                                    sequence_number=take_sequence_number(),
                                 )
-                            output_items.append(item)
-                            yield response_output_item_done(item)
+                            output_items_by_index[output_index] = item
+                            yield response_output_item_done(
+                                item,
+                                output_index=output_index,
+                                sequence_number=take_sequence_number(),
+                            )
                         yield response_completed_event(
                             response_id,
                             model=model,
-                            output=output_items,
+                            output=completed_output_items(),
                             end_turn=False,
                             created=created,
                             usage=_responses_usage(
@@ -308,22 +544,17 @@ class GenAIService:
                                     finish_reason="tool_calls",
                                 )
                             ),
+                            sequence_number=take_sequence_number(),
                         )
                         return
 
                     if finish_reason is not None:
-                        if message_item_id is None:
-                            message_item_id = f"msg_{uuid.uuid4().hex[:24]}"
-                            yield response_output_item_added(
-                                make_message_added_item(message_item_id)
-                            )
-                        item = make_message_item(output_text, message_item_id)
-                        output_items.append(item)
-                        yield response_output_item_done(item)
+                        yield from finish_reasoning_item()
+                        yield from finish_message_item(force=True)
                         yield response_completed_event(
                             response_id,
                             model=model,
-                            output=output_items,
+                            output=completed_output_items(),
                             end_turn=True,
                             created=created,
                             usage=_responses_usage(
@@ -338,15 +569,22 @@ class GenAIService:
                                     finish_reason=finish_reason,
                                 )
                             ),
+                            sequence_number=take_sequence_number(),
                         )
                         return
 
             yield response_failed_event(
                 response_id,
                 "Responses stream ended without response.completed",
+                sequence_number=take_sequence_number(),
             )
         except ProxyError as exc:
-            yield response_failed_event(response_id, exc.message, code=exc.code)
+            yield response_failed_event(
+                response_id,
+                exc.message,
+                code=exc.code,
+                sequence_number=take_sequence_number(),
+            )
 
     def fetch_openai_billing_subscription(self):
         def fetch(token):
@@ -553,6 +791,7 @@ class GenAIService:
         reasoning_config = normalize_reasoning_for_adapter(
             tool_adapter, reasoning_config
         )
+        thinking = deepseek_thinking_enabled(tool_adapter, reasoning_config)
 
         requested_tools = bool(tools)
         has_tools = requested_tools and not _tool_choice_is_none(tool_choice)
@@ -602,13 +841,14 @@ class GenAIService:
         family = tokenizer_family_for_model(model, model_record, tool_adapter)
         if family == "kimi_k3":
             image_sizes = kimi_image_sizes_for_messages(messages)
-        if count_usage or include_usage:
+        if count_usage:
             prompt_tokens = count_openai_request_tokens(
                 messages,
                 model,
                 model_record=model_record,
                 tool_adapter=tool_adapter,
                 reasoning_config=token_reasoning_config,
+                thinking=thinking,
                 image_sizes=image_sizes,
             )
 
@@ -625,6 +865,7 @@ class GenAIService:
             include_usage=include_usage,
             prompt_tokens=prompt_tokens,
             token_reasoning_config=token_reasoning_config,
+            thinking=thinking,
             image_sizes=image_sizes,
         )
 
@@ -642,6 +883,7 @@ class GenAIService:
             tool_adapter=prepared.tool_adapter,
             prompt_messages=prepared.messages,
             reasoning_config=prepared.token_reasoning_config,
+            thinking=prepared.thinking,
             finish_reason=finish_reason,
             image_sizes=prepared.image_sizes,
         )
@@ -654,7 +896,15 @@ class GenAIService:
         finish_reason: str = "stop",
     ) -> dict:
         if prepared.prompt_tokens is None:
-            raise RuntimeError("Completion usage was requested without prompt counting")
+            prepared.prompt_tokens = count_openai_request_tokens(
+                prepared.messages,
+                prepared.model,
+                model_record=prepared.model_record,
+                tool_adapter=prepared.tool_adapter,
+                reasoning_config=prepared.token_reasoning_config,
+                thinking=prepared.thinking,
+                image_sizes=prepared.image_sizes,
+            )
         completion_tokens = self._completion_tokens(
             prepared,
             message,
@@ -667,6 +917,7 @@ class GenAIService:
             tool_adapter=prepared.tool_adapter,
             prompt_messages=prepared.messages,
             reasoning_config=prepared.token_reasoning_config,
+            thinking=prepared.thinking,
             image_sizes=prepared.image_sizes,
         )
         return {
@@ -778,7 +1029,9 @@ class GenAIService:
             if "choices" in response_data and response_data["choices"]:
                 delta = response_data["choices"][0].get("delta", {})
                 content = delta.get("content") or None
-                reasoning = delta.get("reasoning_content") or None
+                reasoning = (
+                    delta.get("reasoning_content") or delta.get("reasoning") or None
+                )
                 tool_calls = delta.get("tool_calls") or None
                 return content, reasoning, tool_calls
         except (KeyError, IndexError, TypeError):
@@ -1002,10 +1255,7 @@ class GenAIService:
         buffer_until_complete=False,
         stream_reasoning=False,
     ):
-        if (
-            prepared.tool_adapter != KIMI_K3_ADAPTER
-            or not self._cleanup_kimi_history
-        ):
+        if prepared.tool_adapter != KIMI_K3_ADAPTER or not self._cleanup_kimi_history:
             return self._stream_genai_response_raw(
                 prepared,
                 messages=messages,
@@ -1090,6 +1340,8 @@ class GenAIService:
             "maxToken": prepared.max_tokens or 30000,
         }
         genai_data.update(image_fields)
+        if prepared.thinking is not None:
+            genai_data["thinking"] = prepared.thinking
         if prepared.root_model_name:
             genai_data["rootModelName"] = prepared.root_model_name
 
@@ -1124,6 +1376,7 @@ class GenAIService:
             attempt_reasoning = ""
             attempt_tool_calls = []
             received_any_chunk = False
+            think_tag_parser = _ThinkTagDeltaParser()
             request_token = self._token_manager.token
             try:
                 response = requests.post(
@@ -1185,7 +1438,7 @@ class GenAIService:
 
                 finished = False
                 line_count = 0
-                for line in response.iter_lines():
+                for line in response.iter_lines(chunk_size=1, decode_unicode=True):
                     if finished:
                         break
 
@@ -1291,6 +1544,17 @@ class GenAIService:
                     content, reasoning, tool_calls = self._extract_delta_from_genai(
                         genai_json
                     )
+                    if reasoning:
+                        think_tag_parser.disable()
+                    content, tagged_reasoning = think_tag_parser.feed(content)
+                    if tagged_reasoning:
+                        reasoning = (reasoning or "") + tagged_reasoning
+                    if finish_reason is not None:
+                        flush_content, flush_reasoning = think_tag_parser.finish()
+                        if flush_content:
+                            content = (content or "") + flush_content
+                        if flush_reasoning:
+                            reasoning = (reasoning or "") + flush_reasoning
                     delta = {}
                     if content:
                         delta["content"] = content
@@ -1360,7 +1624,7 @@ class GenAIService:
                             terminal_message["tool_calls"] = _merge_tool_call_deltas(
                                 attempt_tool_calls
                             )
-                        if prepared.prompt_tokens is not None:
+                        if prepared.prompt_tokens is not None or prepared.include_usage:
                             self._record_usage(
                                 prepared,
                                 terminal_message,
@@ -1420,6 +1684,11 @@ class GenAIService:
                     network_retry_count,
                     str(exc),
                     sent_any_chunk=sent_any_chunk,
+                    max_retries=(
+                        GENAI_TIMEOUT_MAX_RETRIES
+                        if isinstance(exc, requests.Timeout)
+                        else None
+                    ),
                 ):
                     network_retry_count += 1
                     continue
@@ -1455,13 +1724,19 @@ class GenAIService:
         reason: str,
         *,
         sent_any_chunk: bool,
+        max_retries: int | None = None,
     ) -> bool:
-        if sent_any_chunk or retry_count >= self._max_retries:
+        retry_limit = (
+            self._max_retries
+            if max_retries is None
+            else min(self._max_retries, max(0, int(max_retries)))
+        )
+        if sent_any_chunk or retry_count >= retry_limit:
             return False
 
         return schedule_retry(
             self._logger,
-            max_retries=self._max_retries,
+            max_retries=retry_limit,
             backoff=self._retry_backoff,
             retry_count=retry_count,
             operation="GenAI chat request",
@@ -1495,6 +1770,7 @@ class GenAIService:
         question: str,
     ) -> _KimiHistoryCleanup | None:
         try:
+
             def fetch(token):
                 user_id = self._get_billing_user_id(token)
                 records = self._fetch_kimi_history_records(token, user_id)
@@ -1602,9 +1878,7 @@ class GenAIService:
             if not isinstance(result, dict) or not isinstance(
                 result.get("records"), list
             ):
-                raise transient_upstream_error(
-                    "Failed to fetch Kimi K3 history"
-                )
+                raise transient_upstream_error("Failed to fetch Kimi K3 history")
             page_records = result["records"]
             records.extend(page_records)
 
@@ -1638,9 +1912,7 @@ class GenAIService:
                 timeout=GENAI_HISTORY_TIMEOUT,
             )
         except requests.RequestException as exc:
-            raise transient_upstream_error(
-                "Failed to delete Kimi K3 history"
-            ) from exc
+            raise transient_upstream_error("Failed to delete Kimi K3 history") from exc
 
         self._decode_kimi_history_response(
             response,
@@ -1816,12 +2088,8 @@ class GenAIService:
                 tool_calls = tool_calls or []
             reasoning_content = attempt.get("reasoning_content") or ""
 
-            final_marker = (
-                prepared.tool_adapter == KIMI_K3_ADAPTER
-                and (
-                    KIMI_FINAL_OPEN in content
-                    or KIMI_FINAL_CLOSE in content
-                )
+            final_marker = prepared.tool_adapter == KIMI_K3_ADAPTER and (
+                KIMI_FINAL_OPEN in content or KIMI_FINAL_CLOSE in content
             )
             invalid_syntax = (
                 any(tag in content for tag in open_tags) and not tool_calls
@@ -1942,10 +2210,7 @@ class GenAIService:
             )
             return
 
-        if (
-            prepared.tool_adapter == KIMI_K3_ADAPTER
-            and not final_response
-        ):
+        if prepared.tool_adapter == KIMI_K3_ADAPTER and not final_response:
             yield make_error_chunk(
                 "Upstream returned neither a valid client action nor a final response",
                 prepared.model,
@@ -2087,9 +2352,7 @@ def _normalize_kimi_messages_for_transport(messages: list[dict]) -> list[dict]:
                 status=400,
             )
     messages = [
-        {**message, "content": ""}
-        if message.get("content") is None
-        else message
+        {**message, "content": ""} if message.get("content") is None else message
         for message in messages
     ]
     if not messages or not any(message.get("role") == "user" for message in messages):
@@ -2258,14 +2521,20 @@ def _normalize_messages_for_model_template(
     tool_adapter: str,
 ) -> list[dict]:
     family = tokenizer_family_for_model(model, model_record, tool_adapter)
-    if family not in {"glm_5_2", "qwen_3_5", "kimi_k3"}:
+    if family not in {
+        "glm_5_1",
+        "glm_5_2",
+        "qwen_3_5",
+        "minimax_m2_7",
+        "kimi_k3",
+    }:
         return messages
 
     normalized = [
         {**message, "role": "system"} if message.get("role") == "developer" else message
         for message in messages
     ]
-    if family != "qwen_3_5":
+    if family not in {"qwen_3_5", "minimax_m2_7"}:
         return normalized
 
     system_messages = [
@@ -2347,11 +2616,7 @@ def _structured_upstream_error(payload):
         error_type = "upstream_error"
         raw_code = None
 
-    status = (
-        raw_code
-        if isinstance(raw_code, int) and 400 <= raw_code < 500
-        else 502
-    )
+    status = raw_code if isinstance(raw_code, int) and 400 <= raw_code < 500 else 502
     code = raw_code if isinstance(raw_code, str) else None
     return str(message), str(error_type), code, status
 

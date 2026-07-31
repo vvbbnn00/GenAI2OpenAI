@@ -15,7 +15,6 @@ from genai_proxy.compat.responses import convert_responses_to_openai_request
 from genai_proxy.errors import ProxyError
 from genai_proxy.routes import prime_stream
 
-
 bp = Blueprint("openai", __name__)
 
 
@@ -79,9 +78,10 @@ def chat_completions():
                 ),
                 mimetype="text/event-stream",
                 headers={
-                    "Cache-Control": "no-cache",
+                    "Cache-Control": "no-cache, no-transform",
                     "Connection": "keep-alive",
                     "Content-Type": "text/event-stream",
+                    "X-Accel-Buffering": "no",
                 },
             )
 
@@ -138,9 +138,10 @@ def responses():
                 ),
                 mimetype="text/event-stream",
                 headers={
-                    "Cache-Control": "no-cache",
+                    "Cache-Control": "no-cache, no-transform",
                     "Connection": "keep-alive",
                     "Content-Type": "text/event-stream",
+                    "X-Accel-Buffering": "no",
                 },
             )
 
@@ -204,8 +205,7 @@ def list_models():
             {"object": "list", "data": model_manager.list_openai_models()}
         )
         response.headers["Cache-Control"] = (
-            "private, max-age=60, stale-while-revalidate=300, "
-            "stale-if-error=86400"
+            "private, max-age=60, stale-while-revalidate=300, stale-if-error=86400"
         )
         return response
     except ProxyError as exc:

@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "flask>=3.1.2",
     "flask-cors>=4.0.0",
+    "jinja2>=3.1.6,<4",
     "pillow>=11.3.0,<13",
     "requests>=2.32.5",
     "shanghaitech-ids-passkey>=0.1.0",

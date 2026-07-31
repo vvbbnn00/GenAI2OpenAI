@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from genai_proxy.errors import ProxyError
-from genai_proxy.optimizations.registry import KIMI_K3_ADAPTER, select_tool_adapter
+from genai_proxy.optimizations.registry import (
+    KIMI_K3_ADAPTER,
+    QWEN_3_5_ADAPTER,
+    select_tool_adapter,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,9 +43,9 @@ def convert_responses_to_openai_request(
     request_tools.extend(_additional_tools_from_input(input_items))
     openai_tools, tool_map = _convert_responses_tools(request_tools)
     model = req_data.get("model", "GPT-4.1")
-    is_kimi_k3 = (
-        isinstance(model, str) and select_tool_adapter(model) == KIMI_K3_ADAPTER
-    )
+    adapter = select_tool_adapter(model) if isinstance(model, str) else None
+    is_kimi_k3 = adapter == KIMI_K3_ADAPTER
+    preserve_images = adapter in {KIMI_K3_ADAPTER, QWEN_3_5_ADAPTER}
     tool_choice = req_data.get("tool_choice")
     if tool_choice is None and _input_has_tool_output(input_items) and not is_kimi_k3:
         tool_choice = "none"
@@ -55,7 +59,7 @@ def convert_responses_to_openai_request(
         _convert_response_input_items(
             input_items,
             tool_map,
-            preserve_images=is_kimi_k3,
+            preserve_images=preserve_images,
         )
     )
 
@@ -97,76 +101,209 @@ def make_event(event_name: str, payload: dict) -> str:
 
 
 def response_created_event(
-    response_id: str, model: str, created: int | None = None
+    response_id: str,
+    model: str,
+    created: int | None = None,
+    *,
+    sequence_number: int | None = None,
 ) -> str:
     created_at = int(created or datetime.now().timestamp())
+    payload = {
+        "type": "response.created",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": "in_progress",
+            "model": model,
+        },
+    }
+    _set_sequence_number(payload, sequence_number)
     return make_event(
         "response.created",
-        {
-            "type": "response.created",
-            "response": {
-                "id": response_id,
-                "object": "response",
-                "created_at": created_at,
-                "status": "in_progress",
-                "model": model,
-            },
-        },
+        payload,
     )
 
 
-def response_output_text_delta(delta: str) -> str:
+def response_output_text_delta(
+    delta: str,
+    *,
+    item_id: str | None = None,
+    output_index: int = 0,
+    content_index: int = 0,
+    sequence_number: int | None = None,
+) -> str:
+    payload = {
+        "type": "response.output_text.delta",
+        "delta": delta,
+        "output_index": output_index,
+        "content_index": content_index,
+    }
+    if item_id is not None:
+        payload["item_id"] = item_id
+    _set_sequence_number(payload, sequence_number)
     return make_event(
         "response.output_text.delta",
-        {
-            "type": "response.output_text.delta",
-            "delta": delta,
-        },
+        payload,
     )
 
 
-def response_reasoning_text_delta(delta: str, content_index: int = 0) -> str:
+def response_output_text_done(
+    text: str,
+    *,
+    item_id: str,
+    output_index: int,
+    content_index: int = 0,
+    sequence_number: int | None = None,
+) -> str:
+    payload = {
+        "type": "response.output_text.done",
+        "item_id": item_id,
+        "output_index": output_index,
+        "content_index": content_index,
+        "text": text,
+    }
+    _set_sequence_number(payload, sequence_number)
+    return make_event("response.output_text.done", payload)
+
+
+def response_reasoning_text_delta(
+    delta: str,
+    *,
+    item_id: str | None = None,
+    output_index: int = 0,
+    content_index: int = 0,
+    sequence_number: int | None = None,
+) -> str:
+    payload = {
+        "type": "response.reasoning_text.delta",
+        "delta": delta,
+        "output_index": output_index,
+        "content_index": content_index,
+    }
+    if item_id is not None:
+        payload["item_id"] = item_id
+    _set_sequence_number(payload, sequence_number)
     return make_event(
         "response.reasoning_text.delta",
-        {
-            "type": "response.reasoning_text.delta",
-            "delta": delta,
-            "content_index": content_index,
-        },
+        payload,
     )
+
+
+def response_reasoning_text_done(
+    text: str,
+    *,
+    item_id: str,
+    output_index: int,
+    content_index: int = 0,
+    sequence_number: int | None = None,
+) -> str:
+    payload = {
+        "type": "response.reasoning_text.done",
+        "item_id": item_id,
+        "output_index": output_index,
+        "content_index": content_index,
+        "text": text,
+    }
+    _set_sequence_number(payload, sequence_number)
+    return make_event("response.reasoning_text.done", payload)
+
+
+def response_content_part_added(
+    part: dict,
+    *,
+    item_id: str,
+    output_index: int,
+    content_index: int = 0,
+    sequence_number: int | None = None,
+) -> str:
+    payload = {
+        "type": "response.content_part.added",
+        "item_id": item_id,
+        "output_index": output_index,
+        "content_index": content_index,
+        "part": part,
+    }
+    _set_sequence_number(payload, sequence_number)
+    return make_event("response.content_part.added", payload)
+
+
+def response_content_part_done(
+    part: dict,
+    *,
+    item_id: str,
+    output_index: int,
+    content_index: int = 0,
+    sequence_number: int | None = None,
+) -> str:
+    payload = {
+        "type": "response.content_part.done",
+        "item_id": item_id,
+        "output_index": output_index,
+        "content_index": content_index,
+        "part": part,
+    }
+    _set_sequence_number(payload, sequence_number)
+    return make_event("response.content_part.done", payload)
 
 
 def response_custom_tool_call_input_delta(
-    item_id: str, call_id: str, delta: str
+    item_id: str,
+    call_id: str,
+    delta: str,
+    *,
+    output_index: int = 0,
+    sequence_number: int | None = None,
 ) -> str:
+    payload = {
+        "type": "response.custom_tool_call_input.delta",
+        "item_id": item_id,
+        "call_id": call_id,
+        "output_index": output_index,
+        "delta": delta,
+    }
+    _set_sequence_number(payload, sequence_number)
     return make_event(
         "response.custom_tool_call_input.delta",
-        {
-            "type": "response.custom_tool_call_input.delta",
-            "item_id": item_id,
-            "call_id": call_id,
-            "delta": delta,
-        },
+        payload,
     )
 
 
-def response_output_item_done(item: dict) -> str:
+def response_output_item_done(
+    item: dict,
+    *,
+    output_index: int | None = None,
+    sequence_number: int | None = None,
+) -> str:
+    payload = {
+        "type": "response.output_item.done",
+        "item": item,
+    }
+    if output_index is not None:
+        payload["output_index"] = output_index
+    _set_sequence_number(payload, sequence_number)
     return make_event(
         "response.output_item.done",
-        {
-            "type": "response.output_item.done",
-            "item": item,
-        },
+        payload,
     )
 
 
-def response_output_item_added(item: dict) -> str:
+def response_output_item_added(
+    item: dict,
+    *,
+    output_index: int | None = None,
+    sequence_number: int | None = None,
+) -> str:
+    payload = {
+        "type": "response.output_item.added",
+        "item": item,
+    }
+    if output_index is not None:
+        payload["output_index"] = output_index
+    _set_sequence_number(payload, sequence_number)
     return make_event(
         "response.output_item.added",
-        {
-            "type": "response.output_item.added",
-            "item": item,
-        },
+        payload,
     )
 
 
@@ -178,6 +315,7 @@ def response_completed_event(
     end_turn: bool,
     created: int | None = None,
     usage: dict | None = None,
+    sequence_number: int | None = None,
 ) -> str:
     response = {
         "id": response_id,
@@ -190,32 +328,40 @@ def response_completed_event(
     }
     if usage is not None:
         response["usage"] = usage
+    payload = {
+        "type": "response.completed",
+        "response": response,
+    }
+    _set_sequence_number(payload, sequence_number)
     return make_event(
         "response.completed",
-        {
-            "type": "response.completed",
-            "response": response,
-        },
+        payload,
     )
 
 
 def response_failed_event(
-    response_id: str, message: str, *, code: str | None = None
+    response_id: str,
+    message: str,
+    *,
+    code: str | None = None,
+    sequence_number: int | None = None,
 ) -> str:
-    return make_event(
-        "response.failed",
-        {
-            "type": "response.failed",
-            "response": {
-                "id": response_id,
-                "object": "response",
-                "status": "failed",
-                "error": {
-                    "code": code or "upstream_error",
-                    "message": message,
-                },
+    payload = {
+        "type": "response.failed",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "status": "failed",
+            "error": {
+                "code": code or "upstream_error",
+                "message": message,
             },
         },
+    }
+    _set_sequence_number(payload, sequence_number)
+    return make_event(
+        "response.failed",
+        payload,
     )
 
 
@@ -223,7 +369,14 @@ def make_message_item(text: str, item_id: str | None = None) -> dict:
     item = {
         "type": "message",
         "role": "assistant",
-        "content": [{"type": "output_text", "text": text}],
+        "status": "completed",
+        "content": [
+            {
+                "type": "output_text",
+                "text": text,
+                "annotations": [],
+            }
+        ],
     }
     if item_id:
         item["id"] = item_id
@@ -235,7 +388,28 @@ def make_message_added_item(item_id: str) -> dict:
         "id": item_id,
         "type": "message",
         "role": "assistant",
+        "status": "in_progress",
         "content": [],
+    }
+
+
+def make_reasoning_added_item(item_id: str) -> dict:
+    return {
+        "id": item_id,
+        "type": "reasoning",
+        "summary": [],
+        "content": [],
+        "status": "in_progress",
+    }
+
+
+def make_reasoning_item(text: str, item_id: str) -> dict:
+    return {
+        "id": item_id,
+        "type": "reasoning",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": text}],
+        "status": "completed",
     }
 
 
@@ -254,6 +428,7 @@ def make_response_tool_item(
 
     if mapping.kind == "custom":
         return {
+            "id": f"ctc_{uuid.uuid4().hex[:24]}",
             "type": "custom_tool_call",
             "call_id": call_id,
             "name": mapping.response_name,
@@ -262,6 +437,7 @@ def make_response_tool_item(
 
     if mapping.kind == "tool_search":
         return {
+            "id": f"ts_{uuid.uuid4().hex[:24]}",
             "type": "tool_search_call",
             "call_id": call_id,
             "status": "completed",
@@ -270,14 +446,29 @@ def make_response_tool_item(
         }
 
     item = {
+        "id": f"fc_{uuid.uuid4().hex[:24]}",
         "type": "function_call",
         "name": mapping.response_name,
         "arguments": arguments,
         "call_id": call_id,
+        "status": "completed",
     }
     if mapping.namespace:
         item["namespace"] = mapping.namespace
     return item
+
+
+def make_response_tool_added_item(item: dict) -> dict:
+    added = dict(item)
+    item_type = added.get("type")
+    if item_type == "function_call":
+        added["arguments"] = ""
+        added["status"] = "in_progress"
+    elif item_type == "custom_tool_call":
+        added["input"] = ""
+    elif item_type == "tool_search_call":
+        added["status"] = "in_progress"
+    return added
 
 
 def response_output_text(response_items: list[dict]) -> str:
@@ -289,6 +480,11 @@ def response_output_text(response_items: list[dict]) -> str:
             if isinstance(content, dict) and content.get("type") == "output_text":
                 parts.append(str(content.get("text") or ""))
     return "".join(parts)
+
+
+def _set_sequence_number(payload: dict, sequence_number: int | None) -> None:
+    if sequence_number is not None:
+        payload["sequence_number"] = sequence_number
 
 
 def _normalize_input(input_data) -> list:
@@ -472,9 +668,7 @@ def _content_to_chat_content(content):
         elif item_type == "input_image":
             image_url = item.get("image_url")
             if not image_url:
-                raise ProxyError(
-                    "Kimi K3 Responses image inputs require 'image_url'"
-                )
+                raise ProxyError("Responses image inputs require 'image_url'")
             if isinstance(image_url, str):
                 image_url = {"url": image_url}
             elif isinstance(image_url, dict):

@@ -31,8 +31,11 @@ from genai_proxy.errors import ProxyError
 from genai_proxy.optimizations.registry import (
     DEEPSEEK_V4_FLASH_ADAPTER,
     DEEPSEEK_V4_PRO_ADAPTER,
+    GLM_5_1_ADAPTER,
     GLM_5_2_ADAPTER,
     KIMI_K3_ADAPTER,
+    MINIMAX_ADAPTER,
+    QWEN_3_5_ADAPTER,
 )
 from genai_proxy.retry import (
     DEFAULT_MAX_RETRIES,
@@ -50,6 +53,13 @@ KIMI_IMAGE_MERGE_KERNEL_SIZE = 2
 KIMI_IMAGE_PATCH_LIMIT = 512
 KIMI_IMAGE_IN_PATCH_LIMIT = 65536
 KIMI_IMAGE_MAX_REDIRECTS = 5
+# Values from Qwen3.5-397B-A17B preprocessor_config.json at
+# QWEN_3_5_SPEC.revision.
+QWEN_IMAGE_PATCH_SIZE = 16
+QWEN_IMAGE_MERGE_SIZE = 2
+QWEN_IMAGE_MIN_PIXELS = 65536
+QWEN_IMAGE_MAX_PIXELS = 16777216
+QWEN_IMAGE_MAX_ASPECT_RATIO = 200
 # Common fake-IP range used by transparent DNS proxies such as Mihomo.
 KIMI_IMAGE_TRANSPARENT_PROXY_NETWORKS = (ipaddress.ip_network("198.18.0.0/15"),)
 _logger = logging.getLogger(__name__)
@@ -82,6 +92,17 @@ GLM_5_2_SPEC = TokenizerSpec(
     template=Artifact(
         "chat_template.jinja",
         "172dc74a35e1752df75ecfb2b2cf9326d2852bb1379868ebeec9571654489679",
+    ),
+)
+
+GLM_5_1_SPEC = TokenizerSpec(
+    family="glm_5_1",
+    repository="zai-org/GLM-5.1",
+    revision="26e1bd6e011feb778d25ae34b09b07074139d92d",
+    tokenizer=GLM_5_2_SPEC.tokenizer,
+    template=Artifact(
+        "chat_template.jinja",
+        "03b1bbff20331e54647c68167e8ac7f0b5b7ceb40ead372f44826624a9ad79cd",
     ),
 )
 
@@ -121,6 +142,20 @@ QWEN_3_5_SPEC = TokenizerSpec(
     template=Artifact(
         "chat_template.jinja",
         "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    ),
+)
+
+MINIMAX_M2_7_SPEC = TokenizerSpec(
+    family="minimax_m2_7",
+    repository="MiniMaxAI/MiniMax-M2.7",
+    revision="d494266a4affc0d2995ba1fa35c8481cbd84294b",
+    tokenizer=Artifact(
+        "tokenizer.json",
+        "757622126525aeeb131756849d93298070ff3f0319c455ec8c5bb0f6b1cebbe8",
+    ),
+    template=Artifact(
+        "chat_template.jinja",
+        "893d908f7b5cc65fdde270dcae5ea1a99647c6a7ce572ae874a57b7160069566",
     ),
 )
 
@@ -173,10 +208,12 @@ SPECS = MappingProxyType(
     {
         spec.family: spec
         for spec in (
+            GLM_5_1_SPEC,
             GLM_5_2_SPEC,
             DEEPSEEK_V4_PRO_SPEC,
             DEEPSEEK_V4_FLASH_SPEC,
             QWEN_3_5_SPEC,
+            MINIMAX_M2_7_SPEC,
             KIMI_K3_SPEC,
         )
     }
@@ -193,6 +230,8 @@ def tokenizer_family_for_model(
     model_record: dict | None = None,
     tool_adapter: str | None = None,
 ) -> str | None:
+    if tool_adapter == GLM_5_1_ADAPTER:
+        return GLM_5_1_SPEC.family
     if tool_adapter == GLM_5_2_ADAPTER:
         return GLM_5_2_SPEC.family
     if tool_adapter == DEEPSEEK_V4_PRO_ADAPTER:
@@ -201,6 +240,10 @@ def tokenizer_family_for_model(
         return DEEPSEEK_V4_FLASH_SPEC.family
     if tool_adapter == KIMI_K3_ADAPTER:
         return KIMI_K3_SPEC.family
+    if tool_adapter == QWEN_3_5_ADAPTER:
+        return QWEN_3_5_SPEC.family
+    if tool_adapter == MINIMAX_ADAPTER:
+        return MINIMAX_M2_7_SPEC.family
 
     text = _model_text(model, model_record)
     if _contains_kimi_k3_version(text):
@@ -209,6 +252,14 @@ def tokenizer_family_for_model(
         return QWEN_3_5_SPEC.family
     if _contains_version(text, "glm", "5", "2"):
         return GLM_5_2_SPEC.family
+    if _contains_version(text, "glm", "5", "1"):
+        return GLM_5_1_SPEC.family
+    if (
+        "minimax-m1" in text
+        or "minimax m1" in text
+        or _contains_version(text, "minimax", "2", "7")
+    ):
+        return MINIMAX_M2_7_SPEC.family
     if "deepseek-pro" in text or "deepseek v4 pro" in text or "deepseek-v4-pro" in text:
         return DEEPSEEK_V4_PRO_SPEC.family
     if (
@@ -220,6 +271,289 @@ def tokenizer_family_for_model(
     return None
 
 
+def official_tool_prompt_for_adapter(
+    adapter: str | None,
+    tools,
+) -> str | None:
+    function_tools = [
+        tool
+        for tool in tools or []
+        if isinstance(tool, dict) and tool.get("type") == "function"
+    ]
+    if not function_tools:
+        return None
+
+    if adapter in (DEEPSEEK_V4_FLASH_ADAPTER, DEEPSEEK_V4_PRO_ADAPTER):
+        spec = (
+            DEEPSEEK_V4_PRO_SPEC
+            if adapter == DEEPSEEK_V4_PRO_ADAPTER
+            else DEEPSEEK_V4_FLASH_SPEC
+        )
+        encoder = _load_python_encoder(spec)
+        return encoder["render_tools"](
+            encoder["tools_from_openai_format"](function_tools)
+        )
+
+    spec = {
+        GLM_5_1_ADAPTER: GLM_5_1_SPEC,
+        GLM_5_2_ADAPTER: GLM_5_2_SPEC,
+        QWEN_3_5_ADAPTER: QWEN_3_5_SPEC,
+        MINIMAX_ADAPTER: MINIMAX_M2_7_SPEC,
+    }.get(adapter)
+    if spec is None:
+        return None
+
+    serialized_tools = json.dumps(
+        function_tools,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    sentinel = "__GENAI2OPENAI_SYSTEM_SENTINEL__"
+    while sentinel in serialized_tools:
+        sentinel += "_"
+    messages = [
+        {"role": "system", "content": sentinel},
+        {"role": "user", "content": "__GENAI2OPENAI_USER_SENTINEL__"},
+    ]
+    template = _load_template(spec)
+    prompt = template.render(
+        messages=messages,
+        tools=function_tools,
+        add_generation_prompt=True,
+        enable_thinking=True,
+        clear_thinking=True,
+        add_vision_id=False,
+    )
+    try:
+        if adapter == QWEN_3_5_ADAPTER:
+            start_marker = "<|im_start|>system\n"
+            end_marker = f"\n\n{sentinel}<|im_end|>"
+            start = prompt.index(start_marker) + len(start_marker)
+            end = prompt.index(end_marker, start)
+            return prompt[start:end]
+
+        if adapter == MINIMAX_ADAPTER:
+            start_marker = f"]~!b[]~b]system\n{sentinel}\n\n"
+            start = prompt.index(start_marker) + len(start_marker)
+            end = prompt.index("[e~[\n", start)
+            return prompt[start:end]
+
+        system_marker = f"<|system|>{sentinel}"
+        end = prompt.index(system_marker)
+        baseline = template.render(
+            messages=messages,
+            tools=None,
+            add_generation_prompt=True,
+            enable_thinking=True,
+            clear_thinking=True,
+            add_vision_id=False,
+        )
+        baseline_prefix = baseline[: baseline.index(sentinel)]
+        if not prompt.startswith(baseline_prefix):
+            raise ValueError("official GLM tool prompt boundary changed")
+        return prompt[len(baseline_prefix) : end]
+    except ValueError as exc:
+        raise _tokenizer_error(spec, "extract official tool prompt", exc) from exc
+
+
+def official_default_system_prompt_for_adapter(adapter: str | None) -> str | None:
+    if adapter != MINIMAX_ADAPTER:
+        return None
+    prompt = _load_template(MINIMAX_M2_7_SPEC).render(
+        messages=[{"role": "user", "content": "__GENAI2OPENAI_USER_SENTINEL__"}],
+        tools=None,
+        add_generation_prompt=True,
+    )
+    start_marker = "]~!b[]~b]system\n"
+    try:
+        start = prompt.index(start_marker) + len(start_marker)
+        end = prompt.index("[e~[\n", start)
+        return prompt[start:end]
+    except ValueError as exc:
+        raise _tokenizer_error(
+            MINIMAX_M2_7_SPEC,
+            "extract official default system prompt",
+            exc,
+        ) from exc
+
+
+def official_reasoning_prefix_for_adapter(
+    adapter: str | None,
+    effort: str | None,
+) -> str:
+    if effort != "max" or adapter not in (
+        DEEPSEEK_V4_FLASH_ADAPTER,
+        DEEPSEEK_V4_PRO_ADAPTER,
+    ):
+        return ""
+    spec = (
+        DEEPSEEK_V4_PRO_SPEC
+        if adapter == DEEPSEEK_V4_PRO_ADAPTER
+        else DEEPSEEK_V4_FLASH_SPEC
+    )
+    return str(_load_python_encoder(spec)["REASONING_EFFORT_MAX"])
+
+
+def _normalize_deepseek_text_messages(messages) -> list[dict]:
+    normalized = []
+    for message in messages:
+        copied = dict(message)
+        content = copied.get("content")
+        if content is None or isinstance(content, str):
+            normalized.append(copied)
+            continue
+        if not isinstance(content, list):
+            raise ProxyError(
+                "DeepSeek V4 message content must be a string or text content parts",
+                error_type="invalid_request_error",
+                code="unsupported_content_type",
+                status=400,
+            )
+
+        text_parts = []
+        for part in content:
+            part_type = part.get("type") if isinstance(part, dict) else None
+            if part_type not in {"text", "input_text", "output_text"}:
+                raise ProxyError(
+                    "DeepSeek V4 accepts only text content parts",
+                    error_type="invalid_request_error",
+                    code="unsupported_content_type",
+                    status=400,
+                )
+            text = part.get("text")
+            if not isinstance(text, str):
+                raise ProxyError(
+                    "DeepSeek V4 text content parts require a string 'text' field",
+                    error_type="invalid_request_error",
+                    code="unsupported_content_type",
+                    status=400,
+                )
+            text_parts.append(text)
+        copied["content"] = "".join(text_parts)
+        normalized.append(copied)
+    return normalized
+
+
+def official_deepseek_transport_messages(
+    adapter: str,
+    messages,
+    tools,
+    *,
+    reasoning_config: dict | None = None,
+    tool_choice_suffix: str = "",
+) -> list[dict]:
+    if adapter not in (DEEPSEEK_V4_FLASH_ADAPTER, DEEPSEEK_V4_PRO_ADAPTER):
+        raise ValueError("DeepSeek V4 transport requires a V4 adapter")
+
+    spec = (
+        DEEPSEEK_V4_PRO_SPEC
+        if adapter == DEEPSEEK_V4_PRO_ADAPTER
+        else DEEPSEEK_V4_FLASH_SPEC
+    )
+    encoder = _load_python_encoder(spec)
+    function_tools = [
+        tool
+        for tool in tools or []
+        if isinstance(tool, dict) and tool.get("type") == "function"
+    ]
+    if not function_tools:
+        raise ProxyError(
+            "DeepSeek V4 requires at least one function tool",
+            error_type="invalid_request_error",
+            code="unsupported_tool_type",
+            status=400,
+        )
+    # Chat Completions clients such as OMP send attached text files as an
+    # array of text parts. DeepSeek's official encoder accepts OpenAI message
+    # objects but expects their ``content`` fields to be strings.
+    official_messages = _normalize_deepseek_text_messages(messages)
+    if official_messages and official_messages[0].get("role") in {
+        "system",
+        "developer",
+    }:
+        official_messages[0]["tools"] = function_tools
+    else:
+        official_messages.insert(
+            0,
+            {"role": "system", "content": "", "tools": function_tools},
+        )
+    if tool_choice_suffix:
+        official_messages.insert(
+            1,
+            {"role": "system", "content": tool_choice_suffix},
+        )
+
+    effort = (reasoning_config or {}).get("effort")
+    thinking = effort not in (None, "none")
+    reasoning_effort = effort if thinking else None
+    thinking_mode = "thinking" if thinking else "chat"
+    prompt = encoder["encode_messages"](
+        official_messages,
+        thinking_mode=thinking_mode,
+        drop_thinking=True,
+        add_default_bos_token=True,
+        reasoning_effort=reasoning_effort,
+    )
+
+    processed = encoder["merge_tool_messages"](official_messages)
+    processed = encoder["sort_tool_results_by_call_order"](processed)
+    last_user_index = encoder["find_last_user_index"](processed)
+    if last_user_index != len(processed) - 1:
+        raise ProxyError(
+            "DeepSeek V4 tool transport requires the final message to be user or tool",
+            error_type="invalid_request_error",
+            code="unsupported_message_sequence",
+            status=400,
+        )
+
+    rendered_user = encoder["render_message"](
+        last_user_index,
+        processed,
+        thinking_mode=thinking_mode,
+        drop_thinking=False,
+        reasoning_effort=reasoning_effort,
+    )
+    user_prefix = str(encoder["USER_SP_TOKEN"])
+    assistant_suffix = str(encoder["ASSISTANT_SP_TOKEN"]) + str(
+        encoder["thinking_start_token"] if thinking else encoder["thinking_end_token"]
+    )
+    bos = str(encoder["bos_token"])
+    if (
+        not prompt.startswith(bos)
+        or not rendered_user.startswith(user_prefix)
+        or not rendered_user.endswith(assistant_suffix)
+        or not prompt.endswith(rendered_user)
+    ):
+        raise _tokenizer_error(
+            spec,
+            "construct official DeepSeek V4 transport",
+            ValueError("official encoder boundaries changed"),
+        )
+
+    prefix = prompt[len(bos) : -len(rendered_user)]
+    user_content = rendered_user[
+        len(user_prefix) : len(rendered_user) - len(assistant_suffix)
+    ]
+    transported = [
+        {"role": "system", "content": prefix},
+        {"role": "user", "content": user_content},
+    ]
+    verification = encoder["encode_messages"](
+        transported,
+        thinking_mode=thinking_mode,
+        drop_thinking=True,
+        add_default_bos_token=True,
+        reasoning_effort=None,
+    )
+    if verification != prompt:
+        raise _tokenizer_error(
+            spec,
+            "verify official DeepSeek V4 transport",
+            ValueError("transport rendering differs from official prompt"),
+        )
+    return transported
+
+
 def count_openai_request_tokens(
     messages,
     model: str | None,
@@ -227,6 +561,7 @@ def count_openai_request_tokens(
     model_record: dict | None = None,
     tool_adapter: str | None = None,
     reasoning_config: dict | None = None,
+    thinking: bool | None = None,
     image_sizes=None,
 ) -> int:
     family = tokenizer_family_for_model(model, model_record, tool_adapter)
@@ -238,6 +573,7 @@ def count_openai_request_tokens(
         family,
         add_generation_prompt=True,
         reasoning_config=reasoning_config,
+        thinking=thinking,
         image_sizes=image_sizes,
     )
 
@@ -250,6 +586,7 @@ def count_openai_completion_tokens(
     tool_adapter: str | None = None,
     prompt_messages=None,
     reasoning_config: dict | None = None,
+    thinking: bool | None = None,
     finish_reason: str = "stop",
     image_sizes=None,
 ) -> int:
@@ -268,6 +605,7 @@ def count_openai_completion_tokens(
             family,
             add_generation_prompt=True,
             reasoning_config=reasoning_config,
+            thinking=thinking,
             image_sizes=image_sizes,
         )
         completed_count = _count_chat_prompt(
@@ -275,6 +613,7 @@ def count_openai_completion_tokens(
             family,
             add_generation_prompt=False,
             reasoning_config=reasoning_config,
+            thinking=thinking,
             image_sizes=image_sizes,
         )
         return completed_count - prompt_count
@@ -283,6 +622,7 @@ def count_openai_completion_tokens(
         message,
         family,
         finish_reason=finish_reason,
+        thinking=thinking,
     )
     if prompt_messages is None:
         return _count_encoded(family, completion)
@@ -292,6 +632,7 @@ def count_openai_completion_tokens(
         family,
         add_generation_prompt=True,
         reasoning_config=reasoning_config,
+        thinking=thinking,
     )
     return _count_encoded(family, prompt + completion) - _count_encoded(family, prompt)
 
@@ -319,6 +660,7 @@ def count_openai_reasoning_tokens(
     tool_adapter: str | None = None,
     prompt_messages=None,
     reasoning_config: dict | None = None,
+    thinking: bool | None = None,
     image_sizes=None,
 ) -> int:
     if not reasoning:
@@ -339,6 +681,7 @@ def count_openai_reasoning_tokens(
         family,
         add_generation_prompt=True,
         reasoning_config=reasoning_config,
+        thinking=thinking,
     )
     rendered_reasoning = (
         reasoning.strip() if family == QWEN_3_5_SPEC.family else reasoning
@@ -354,6 +697,7 @@ def render_chat_prompt(
     *,
     add_generation_prompt: bool,
     reasoning_config: dict | None = None,
+    thinking: bool | None = None,
     image_sizes=None,
 ) -> str:
     spec = SPECS[family]
@@ -374,9 +718,11 @@ def render_chat_prompt(
     if spec.encoder is not None:
         encode_messages = _load_python_encoder(spec)["encode_messages"]
         effort = (reasoning_config or {}).get("effort")
+        if thinking is False or effort == "none":
+            effort = None
         return encode_messages(
             normalized_messages,
-            thinking_mode="thinking",
+            thinking_mode="chat" if thinking is False else "thinking",
             drop_thinking=True,
             add_default_bos_token=True,
             reasoning_effort=effort,
@@ -388,7 +734,7 @@ def render_chat_prompt(
         "messages": normalized_messages,
         "tools": None,
         "add_generation_prompt": add_generation_prompt,
-        "enable_thinking": True,
+        "enable_thinking": thinking is not False,
         "clear_thinking": True,
         "add_vision_id": False,
     }
@@ -398,6 +744,18 @@ def render_chat_prompt(
 
 
 def kimi_image_sizes_for_messages(messages) -> tuple[tuple[int, int], ...]:
+    return _image_sizes_for_messages(messages, model_name="Kimi K3")
+
+
+def qwen_image_sizes_for_messages(messages) -> tuple[tuple[int, int], ...]:
+    return _image_sizes_for_messages(messages, model_name="Qwen 3.5")
+
+
+def _image_sizes_for_messages(
+    messages,
+    *,
+    model_name: str,
+) -> tuple[tuple[int, int], ...]:
     sizes = []
     for message in messages or []:
         content = message.get("content")
@@ -411,7 +769,7 @@ def kimi_image_sizes_for_messages(messages) -> tuple[tuple[int, int], ...]:
                 continue
             if message.get("role") != "user":
                 raise ProxyError(
-                    "Kimi K3 accepts image content only in user messages",
+                    f"{model_name} accepts image content only in user messages",
                     error_type="invalid_request_error",
                     code="invalid_image",
                     status=400,
@@ -426,6 +784,7 @@ def _count_chat_prompt(
     *,
     add_generation_prompt: bool,
     reasoning_config: dict | None = None,
+    thinking: bool | None = None,
     image_sizes=None,
 ) -> int:
     if family != KIMI_K3_SPEC.family:
@@ -434,8 +793,17 @@ def _count_chat_prompt(
             family,
             add_generation_prompt=add_generation_prompt,
             reasoning_config=reasoning_config,
+            thinking=thinking,
         )
-        return _count_encoded(family, prompt)
+        count = _count_encoded(family, prompt)
+        if family == QWEN_3_5_SPEC.family:
+            if image_sizes is None:
+                image_sizes = qwen_image_sizes_for_messages(messages)
+            count += sum(
+                _qwen_image_token_count(width, height) - 1
+                for width, height in image_sizes
+            )
+        return count
 
     if image_sizes is None:
         image_sizes = kimi_image_sizes_for_messages(messages)
@@ -582,10 +950,7 @@ def _remote_image_size(url: str) -> tuple[int, int]:
                     content_length = int(content_length)
                 except (TypeError, ValueError):
                     content_length = None
-                if (
-                    content_length is not None
-                    and content_length > KIMI_IMAGE_MAX_BYTES
-                ):
+                if content_length is not None and content_length > KIMI_IMAGE_MAX_BYTES:
                     raise ValueError("image exceeds the 50 MiB limit")
             parser = ImageFile.Parser()
             total = 0
@@ -738,6 +1103,35 @@ def _kimi_image_token_count(width: int, height: int) -> int:
     )
     factor = KIMI_IMAGE_MERGE_KERNEL_SIZE * KIMI_IMAGE_PATCH_SIZE
     return math.ceil(new_width / factor) * math.ceil(new_height / factor)
+
+
+def _qwen_image_token_count(width: int, height: int) -> int:
+    width, height = _validated_image_size((width, height))
+    if max(width, height) / min(width, height) > QWEN_IMAGE_MAX_ASPECT_RATIO:
+        raise _invalid_image("Qwen 3.5 image aspect ratio must not exceed 200:1")
+
+    factor = QWEN_IMAGE_PATCH_SIZE * QWEN_IMAGE_MERGE_SIZE
+    resized_height = round(height / factor) * factor
+    resized_width = round(width / factor) * factor
+    resized_pixels = resized_height * resized_width
+    if resized_pixels > QWEN_IMAGE_MAX_PIXELS:
+        beta = math.sqrt((height * width) / QWEN_IMAGE_MAX_PIXELS)
+        resized_height = max(
+            factor,
+            math.floor(height / beta / factor) * factor,
+        )
+        resized_width = max(
+            factor,
+            math.floor(width / beta / factor) * factor,
+        )
+    elif resized_pixels < QWEN_IMAGE_MIN_PIXELS:
+        beta = math.sqrt(QWEN_IMAGE_MIN_PIXELS / (height * width))
+        resized_height = math.ceil(height * beta / factor) * factor
+        resized_width = math.ceil(width * beta / factor) * factor
+
+    grid_height = resized_height // QWEN_IMAGE_PATCH_SIZE
+    grid_width = resized_width // QWEN_IMAGE_PATCH_SIZE
+    return grid_height * grid_width // (QWEN_IMAGE_MERGE_SIZE**2)
 
 
 def estimate_token_by_model(model: str | None, text: str) -> int:
@@ -1057,6 +1451,7 @@ def _serialized_completion(
     family: str,
     *,
     finish_reason: str = "stop",
+    thinking: bool | None = None,
 ) -> str:
     reasoning = message.get("reasoning_content") or ""
     content = message.get("content") or ""
@@ -1102,15 +1497,18 @@ def _serialized_completion(
     include_end_token = finish_reason != "length"
 
     if family.startswith("deepseek_v4"):
-        parts = [str(reasoning), "</think>"]
-        parts.append(str(content))
+        parts = (
+            [str(content)]
+            if thinking is False
+            else [str(reasoning), "</think>", str(content)]
+        )
         if tool_calls:
             parts.append(_deepseek_tool_calls(tool_calls))
         if include_end_token:
             parts.append("<｜end▁of▁sentence｜>")
         return "".join(parts)
 
-    if family == GLM_5_2_SPEC.family:
+    if family in (GLM_5_1_SPEC.family, GLM_5_2_SPEC.family):
         rendered_content = (
             "None"
             if "content" in message and message.get("content") is None
@@ -1118,6 +1516,21 @@ def _serialized_completion(
         )
         parts = [str(reasoning), "</think>", rendered_content]
         parts.extend(_glm_tool_call(call) for call in tool_calls)
+        return "".join(parts)
+
+    if family == MINIMAX_M2_7_SPEC.family:
+        parts = [str(reasoning)]
+        if content or tool_calls or include_end_token:
+            parts.extend(
+                (
+                    "\n</think>\n\n" if reasoning else "</think>\n\n",
+                    str(content),
+                )
+            )
+        if tool_calls:
+            parts.append(_minimax_tool_calls(tool_calls))
+        if include_end_token:
+            parts.append("[e~[\n")
         return "".join(parts)
 
     rendered_content = str(content).strip()
@@ -1164,6 +1577,23 @@ def _glm_tool_call(call) -> str:
         for key, value in arguments.items()
     )
     return f"<tool_call>{function.get('name', '')}{rendered}</tool_call>"
+
+
+def _minimax_tool_calls(tool_calls) -> str:
+    invocations = []
+    for call in tool_calls:
+        function = call.get("function") or {}
+        arguments = _json_arguments(function.get("arguments"))
+        parameters = "".join(
+            f'\n<parameter name="{key}">'
+            f"{value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)}"
+            "</parameter>"
+            for key, value in arguments.items()
+        )
+        invocations.append(
+            f'<invoke name="{function.get("name", "")}">{parameters}\n</invoke>'
+        )
+    return "\n<minimax:tool_call>\n" + "\n".join(invocations) + "\n</minimax:tool_call>"
 
 
 def _qwen_tool_call(call) -> str:

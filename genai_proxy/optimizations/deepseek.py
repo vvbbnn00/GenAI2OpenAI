@@ -5,34 +5,6 @@ from typing import Any
 
 from genai_proxy.optimizations.registry import DEEPSEEK_V4_ADAPTERS
 
-
-DEEPSEEK_V4_TOOL_SYSTEM_TEMPLATE = """## Tools
-
-You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<｜DSML｜tool_calls>" block like the following:
-
-<｜DSML｜tool_calls>
-<｜DSML｜invoke name="$TOOL_NAME">
-<｜DSML｜parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜parameter>
-...
-</｜DSML｜invoke>
-<｜DSML｜invoke name="$TOOL_NAME2">
-...
-</｜DSML｜invoke>
-</｜DSML｜tool_calls>
-
-String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
-
-If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.
-
-Otherwise, output directly after </think> with tool calls or final response.
-
-### Available Tool Schemas
-
-{tool_schemas}
-
-You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
-"""
-
 DEEPSEEK_LEGACY_TOOL_SYSTEM_TEMPLATE = """## Tools
 
 You have access to a set of tools you can use to answer the user's question.
@@ -67,12 +39,6 @@ DSML_TOOL_CALLS_END = "</｜DSML｜tool_calls>"
 DSML_FUNCTION_CALLS_START = "<｜DSML｜function_calls>"
 DSML_FUNCTION_CALLS_END = "</｜DSML｜function_calls>"
 
-DEEPSEEK_V4_REASONING_EFFORT_MAX = (
-    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
-    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
-    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
-)
-
 
 def is_deepseek_model(model: str | None) -> bool:
     return "deepseek" in (model or "").lower()
@@ -85,6 +51,20 @@ def inject_deepseek_tool_prompt(
     adapter=None,
     reasoning_config=None,
 ):
+    if adapter in DEEPSEEK_V4_ADAPTERS:
+        from genai_proxy.token_usage import official_deepseek_transport_messages
+
+        return official_deepseek_transport_messages(
+            adapter,
+            messages,
+            tools,
+            reasoning_config=reasoning_config,
+            tool_choice_suffix=_deepseek_tool_choice_suffix(
+                tool_choice,
+                is_legacy=False,
+            ),
+        )
+
     tool_prompt = _render_deepseek_tools_prompt(tools, tool_choice, adapter=adapter)
     new_messages = []
     has_system = False
@@ -106,7 +86,11 @@ def inject_deepseek_tool_prompt(
             index += 1
             continue
 
-        if role == "assistant" and msg.get("tool_calls"):
+        if (
+            adapter not in DEEPSEEK_V4_ADAPTERS
+            and role == "assistant"
+            and msg.get("tool_calls")
+        ):
             assistant_parts = []
             if msg.get("content"):
                 assistant_parts.append(msg["content"])
@@ -124,7 +108,7 @@ def inject_deepseek_tool_prompt(
             index += 1
             continue
 
-        if role == "tool":
+        if adapter not in DEEPSEEK_V4_ADAPTERS and role == "tool":
             tool_messages = []
             while index < len(messages) and messages[index].get("role") == "tool":
                 tool_messages.append(messages[index])
@@ -147,7 +131,12 @@ def inject_deepseek_tool_prompt(
         index += 1
 
     if not has_system:
-        new_messages.insert(0, {"role": "system", "content": tool_prompt})
+        # The official encoder appends tools to an empty system message with
+        # two separating newlines. Preserve those bytes in the GenAI bridge.
+        content = (
+            "\n\n" + tool_prompt if adapter in DEEPSEEK_V4_ADAPTERS else tool_prompt
+        )
+        new_messages.insert(0, {"role": "system", "content": content})
 
     return inject_deepseek_reasoning_prompt(
         new_messages,
@@ -161,11 +150,14 @@ def inject_deepseek_reasoning_prompt(messages, reasoning_config=None, adapter=No
     if adapter not in DEEPSEEK_V4_ADAPTERS or effort != "max":
         return messages
 
+    from genai_proxy.token_usage import official_reasoning_prefix_for_adapter
+
+    reasoning_prefix = official_reasoning_prefix_for_adapter(adapter, effort)
     new_messages = [dict(message) for message in messages]
     if new_messages and new_messages[0].get("role") == "system":
         content = new_messages[0].get("content", "")
-        if not content.startswith(DEEPSEEK_V4_REASONING_EFFORT_MAX):
-            new_messages[0]["content"] = DEEPSEEK_V4_REASONING_EFFORT_MAX + content
+        if not content.startswith(reasoning_prefix):
+            new_messages[0]["content"] = reasoning_prefix + content
     else:
         new_messages.insert(
             0,
@@ -174,7 +166,7 @@ def inject_deepseek_reasoning_prompt(messages, reasoning_config=None, adapter=No
                 # Keep the two trailing newlines from the official
                 # encoding_dsv4.py prefix. They separate the effort directive
                 # from the first rendered user message.
-                "content": DEEPSEEK_V4_REASONING_EFFORT_MAX,
+                "content": reasoning_prefix,
             },
         )
     return new_messages
@@ -227,37 +219,37 @@ def extract_deepseek_tool_calls(content, tools=None, logger=None, adapter=None):
 
 
 def _render_deepseek_tools_prompt(tools, tool_choice=None, adapter=None):
-    tool_schemas = []
-    for tool in tools:
-        function_data = tool.get("function", {})
-        if function_data:
-            tool_schemas.append(json.dumps(function_data, ensure_ascii=False))
-
     is_legacy = adapter == "deepseek_legacy"
-    template = (
-        DEEPSEEK_LEGACY_TOOL_SYSTEM_TEMPLATE
-        if is_legacy
-        else DEEPSEEK_V4_TOOL_SYSTEM_TEMPLATE
-    )
-    prompt = template.format(
+    tool_schemas = [
+        json.dumps(tool.get("function", {}), ensure_ascii=False)
+        for tool in tools
+        if tool.get("function")
+    ]
+    prompt = DEEPSEEK_LEGACY_TOOL_SYSTEM_TEMPLATE.format(
         tool_schemas="\n".join(tool_schemas),
     )
+    return prompt + _deepseek_tool_choice_suffix(
+        tool_choice,
+        is_legacy=is_legacy,
+    )
 
+
+def _deepseek_tool_choice_suffix(tool_choice, *, is_legacy: bool) -> str:
     if tool_choice == "required":
-        prompt += (
+        return (
             DEEPSEEK_LEGACY_REQUIRED_TOOL_SUFFIX
             if is_legacy
             else DEEPSEEK_REQUIRED_TOOL_SUFFIX
         )
-    elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
-        if is_legacy:
-            prompt += f'\nFor this turn, you must emit a <｜DSML｜function_calls> block using the tool "{tool_choice["function"]["name"]}".'
-        else:
-            prompt += f'\nFor this turn, you must emit a <｜DSML｜tool_calls> block using the tool "{tool_choice["function"]["name"]}".'
-    elif _tool_choice_is_none(tool_choice):
-        prompt += DEEPSEEK_NO_TOOL_SUFFIX
-
-    return prompt
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        block = "function_calls" if is_legacy else "tool_calls"
+        return (
+            f"\nFor this turn, you must emit a <｜DSML｜{block}> block "
+            f'using the tool "{tool_choice["function"]["name"]}".'
+        )
+    if _tool_choice_is_none(tool_choice):
+        return DEEPSEEK_NO_TOOL_SUFFIX
+    return ""
 
 
 def _render_deepseek_tool_calls(tool_calls, adapter=None):

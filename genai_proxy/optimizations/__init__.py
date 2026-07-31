@@ -18,6 +18,10 @@ from genai_proxy.optimizations.kimi import (
     kimi_tool_retry_messages,
 )
 from genai_proxy.optimizations.minimax import inject_minimax_tool_prompt
+from genai_proxy.optimizations.qwen import (
+    extract_qwen35_tool_calls,
+    inject_qwen35_tool_prompt,
+)
 from genai_proxy.optimizations.registry import (
     DEEPSEEK_ADAPTER,
     DEEPSEEK_ADAPTERS,
@@ -32,6 +36,7 @@ from genai_proxy.optimizations.registry import (
     GLM_ADAPTERS,
     KIMI_K3_ADAPTER,
     MINIMAX_ADAPTER,
+    QWEN_3_5_ADAPTER,
     is_deepseek_adapter,
     is_deepseek_v4_adapter,
     is_glm_adapter,
@@ -56,15 +61,18 @@ __all__ = [
     "KIMI_K3_ADAPTER",
     "KIMI_TOOL_TRANSPORT_ERROR",
     "MINIMAX_ADAPTER",
+    "QWEN_3_5_ADAPTER",
     "extract_deepseek_tool_calls",
     "extract_kimi_final_response",
     "extract_kimi_tool_calls",
+    "extract_qwen35_tool_calls",
     "inject_deepseek_reasoning_prompt",
     "inject_deepseek_tool_prompt",
     "inject_glm_reasoning_prompt",
     "inject_glm_tool_prompt",
     "inject_kimi_tool_prompt",
     "inject_minimax_tool_prompt",
+    "inject_qwen35_tool_prompt",
     "is_deepseek_adapter",
     "is_deepseek_model",
     "is_deepseek_v4_adapter",

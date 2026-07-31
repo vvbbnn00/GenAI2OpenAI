@@ -19,7 +19,6 @@ from genai_proxy.compat.claude import (
 from genai_proxy.errors import ProxyError
 from genai_proxy.routes import prime_stream
 
-
 bp = Blueprint("claude", __name__)
 
 
@@ -103,9 +102,10 @@ def create_message():
                 ),
                 mimetype="text/event-stream",
                 headers={
-                    "Cache-Control": "no-cache",
+                    "Cache-Control": "no-cache, no-transform",
                     "Connection": "keep-alive",
                     "Content-Type": "text/event-stream",
+                    "X-Accel-Buffering": "no",
                 },
             )
 

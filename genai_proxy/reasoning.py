@@ -15,7 +15,9 @@ OPENAI_REASONING_EFFORTS = (
     "max",
 )
 CLAUDE_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
-TWO_LEVEL_REASONING_ADAPTERS = (GLM_5_2_ADAPTER, *DEEPSEEK_V4_ADAPTERS)
+CLAUDE_THINKING_TYPES = ("enabled", "adaptive", "disabled")
+DEEPSEEK_HIGH_REASONING_EFFORTS = ("minimal", "low", "medium", "high")
+DEEPSEEK_MAX_REASONING_EFFORTS = ("xhigh", "max")
 
 
 def parse_reasoning_config(req_data: dict | None) -> dict:
@@ -47,7 +49,32 @@ def parse_claude_reasoning_config(req_data: dict | None) -> dict:
         allowed_efforts=CLAUDE_REASONING_EFFORTS,
         field_name="Claude output_config.effort",
     )
-    return config
+    thinking = req_data.get("thinking")
+    if thinking is None:
+        return config
+    if not isinstance(thinking, dict):
+        raise ProxyError(
+            "Claude thinking must be an object",
+            error_type="invalid_request_error",
+            code="invalid_thinking_config",
+            status=400,
+        )
+    thinking_type = str(thinking.get("type") or "").strip().lower()
+    if thinking_type not in CLAUDE_THINKING_TYPES:
+        supported = ", ".join(CLAUDE_THINKING_TYPES)
+        raise ProxyError(
+            f"Unsupported Claude thinking.type '{thinking_type}'. "
+            f"Supported values are: {supported}.",
+            error_type="invalid_request_error",
+            code="invalid_thinking_config",
+            status=400,
+        )
+    if thinking_type == "disabled":
+        return {"effort": "none"}
+    # Anthropic defines high as the default effort. DeepSeek V4 has no token
+    # budget field, so enabled/adaptive thinking without an explicit effort
+    # maps to its high tier rather than inventing a budget-to-tier heuristic.
+    return config or {"effort": "high"}
 
 
 def normalize_reasoning_for_adapter(
@@ -57,22 +84,46 @@ def normalize_reasoning_for_adapter(
     if not effort:
         return reasoning_config
 
-    if adapter in TWO_LEVEL_REASONING_ADAPTERS:
-        return {"effort": "high" if effort == "high" else "max"}
+    if adapter == GLM_5_2_ADAPTER:
+        # GenAI does not expose GLM-5.2's chat-template reasoning_effort
+        # argument. The upstream template therefore always uses its official
+        # default, max; injecting a second system directive would duplicate or
+        # contradict that template-owned directive.
+        return {"effort": "max"}
+    if adapter in DEEPSEEK_V4_ADAPTERS:
+        if effort == "none":
+            return {"effort": "none"}
+        if effort in DEEPSEEK_HIGH_REASONING_EFFORTS:
+            return {"effort": "high"}
+        if effort in DEEPSEEK_MAX_REASONING_EFFORTS:
+            return {"effort": "max"}
     if adapter == KIMI_K3_ADAPTER:
         return {"effort": "max"}
 
     return reasoning_config
 
 
-def validate_reasoning_for_adapter(adapter: str | None, reasoning_config: dict | None) -> None:
+def deepseek_thinking_enabled(
+    adapter: str | None, reasoning_config: dict | None
+) -> bool | None:
+    if adapter not in DEEPSEEK_V4_ADAPTERS:
+        return None
+    effort = (reasoning_config or {}).get("effort")
+    return effort not in (None, "none")
+
+
+def validate_reasoning_for_adapter(
+    adapter: str | None, reasoning_config: dict | None
+) -> None:
     normalized = normalize_reasoning_for_adapter(adapter, reasoning_config)
     if reasoning_config is not None and normalized is not None:
         reasoning_config.clear()
         reasoning_config.update(normalized)
 
 
-def _normalize_reasoning_effort(effort, *, allowed_efforts: tuple[str, ...], field_name: str) -> dict:
+def _normalize_reasoning_effort(
+    effort, *, allowed_efforts: tuple[str, ...], field_name: str
+) -> dict:
     if effort is None:
         return {}
     normalized = str(effort).strip().lower()

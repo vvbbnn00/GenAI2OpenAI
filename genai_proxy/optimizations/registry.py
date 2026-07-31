@@ -13,6 +13,7 @@ GLM_ADAPTER = GLM_5_1_ADAPTER
 GLM_ADAPTERS = (GLM_5_1_ADAPTER, GLM_5_2_ADAPTER)
 KIMI_K3_ADAPTER = "kimi_k3"
 MINIMAX_ADAPTER = "minimax"
+QWEN_3_5_ADAPTER = "qwen_3_5"
 
 
 def select_tool_adapter(model: str | None, record: dict | None = None) -> str:
@@ -24,6 +25,8 @@ def select_tool_adapter(model: str | None, record: dict | None = None) -> str:
 
     if _has_kimi_k3_version(text):
         return KIMI_K3_ADAPTER
+    if model_key == "qwen-instruct" or _has_qwen35_version(text):
+        return QWEN_3_5_ADAPTER
     if "minimax" in text or "mini max" in text or "m2.7" in text or "m27" in text:
         return MINIMAX_ADAPTER
     if "chatglm" in text or "glm" in text:
@@ -57,6 +60,8 @@ def tool_start_tags(adapter: str) -> tuple[str, ...]:
         return ("<minimax:tool_call>", "<tool_call>", "<arg_key>")
     if adapter in GLM_ADAPTERS:
         return ("<tool_call>", "<arg_key>")
+    if adapter == QWEN_3_5_ADAPTER:
+        return ("<tool_call>", "<function=")
     return ("<tool_call>",)
 
 
@@ -111,3 +116,7 @@ def _has_glm_version(text: str, version: str) -> bool:
 
 def _has_kimi_k3_version(text: str) -> bool:
     return bool(re.search(r"(?<![\w])kimi[\s_.-]*k?3(?![\s_.-]*\d)", text))
+
+
+def _has_qwen35_version(text: str) -> bool:
+    return bool(re.search(r"qwen[\s_.-]*3(?:[.\s_-]*5)(?!\d)", text))

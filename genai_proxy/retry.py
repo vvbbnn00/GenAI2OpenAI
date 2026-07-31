@@ -2,7 +2,6 @@ import time
 
 from genai_proxy.errors import ProxyError
 
-
 DEFAULT_MAX_RETRIES = 10
 DEFAULT_RETRY_BACKOFF = 0.5
 MAX_RETRY_DELAY = 5.0
@@ -11,10 +10,14 @@ RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 TRANSIENT_UPSTREAM_ERROR_CODE = "upstream_transient_error"
 NON_RETRYABLE_BUSINESS_ERROR_MARKERS = (
     "模型不存在",
+    "未找到对应节点",
+    "节点信息不存在",
     "参数不合法",
     "参数错误",
     "invalid model",
     "model not found",
+    "node not found",
+    "no corresponding node",
     "unsupported model",
     "invalid parameter",
     "invalid request",
@@ -45,8 +48,7 @@ def is_retryable_business_error(status_code, message: str = "") -> bool:
 
     normalized_message = str(message or "").lower()
     return not any(
-        marker in normalized_message
-        for marker in NON_RETRYABLE_BUSINESS_ERROR_MARKERS
+        marker in normalized_message for marker in NON_RETRYABLE_BUSINESS_ERROR_MARKERS
     )
 
 

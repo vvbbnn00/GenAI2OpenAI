@@ -33,8 +33,8 @@ DEFAULT_FALLBACK_MODEL_IDS = (
     DEFAULT_MODEL,
     "deepseek-chat",
     "deepseek-pro",
-    "MiniMax-M1",
     "chatglm",
+    "qwen-instruct",
     "kimi-k3",
 )
 
@@ -54,9 +54,7 @@ class ModelManager:
         self._token_manager = token_manager
         self._max_retries = max(0, int(max_retries))
         self._retry_backoff = max(0.0, float(retry_backoff))
-        self._models_cache_path = (
-            Path(cache_path).expanduser() if cache_path else None
-        )
+        self._models_cache_path = Path(cache_path).expanduser() if cache_path else None
         self._models_cache_lock = threading.Lock()
         self._models_refresh_lock = threading.Lock()
         self._models_refreshing = False
@@ -314,10 +312,16 @@ class ModelManager:
                 status=502,
             )
         if response.status_code != 200:
-            self._logger.warning("GenAI model list HTTP error %d: %s", response.status_code, response.text[:500])
+            self._logger.warning(
+                "GenAI model list HTTP error %d: %s",
+                response.status_code,
+                response.text[:500],
+            )
             if is_retryable_status(response.status_code):
                 raise transient_upstream_error("Failed to fetch GenAI models")
-            raise ProxyError("Failed to fetch GenAI models", error_type="upstream_error", status=502)
+            raise ProxyError(
+                "Failed to fetch GenAI models", error_type="upstream_error", status=502
+            )
 
         try:
             payload = response.json()
@@ -339,11 +343,15 @@ class ModelManager:
                 payload.get("code"), payload.get("message", "")
             ):
                 raise transient_upstream_error("Failed to fetch GenAI models")
-            raise ProxyError("Failed to fetch GenAI models", error_type="upstream_error", status=502)
+            raise ProxyError(
+                "Failed to fetch GenAI models", error_type="upstream_error", status=502
+            )
 
         result = payload.get("result")
         if not isinstance(result, dict):
-            self._logger.warning("GenAI model list response missing result object: %s", payload)
+            self._logger.warning(
+                "GenAI model list response missing result object: %s", payload
+            )
             raise transient_upstream_error("Failed to fetch GenAI models")
 
         records = result.get("records")
@@ -418,9 +426,7 @@ def _parse_created_timestamp(value) -> int:
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
             return int(
-                datetime.strptime(str(value), fmt)
-                .replace(tzinfo=UTC)
-                .timestamp()
+                datetime.strptime(str(value), fmt).replace(tzinfo=UTC).timestamp()
             )
         except ValueError:
             continue

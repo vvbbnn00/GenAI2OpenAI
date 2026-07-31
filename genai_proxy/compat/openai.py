@@ -9,12 +9,15 @@ from genai_proxy.optimizations import (
     GLM_ADAPTERS,
     KIMI_K3_ADAPTER,
     MINIMAX_ADAPTER,
+    QWEN_3_5_ADAPTER,
     extract_deepseek_tool_calls,
     extract_kimi_tool_calls,
+    extract_qwen35_tool_calls,
     inject_deepseek_tool_prompt,
     inject_glm_tool_prompt,
     inject_kimi_tool_prompt,
     inject_minimax_tool_prompt,
+    inject_qwen35_tool_prompt,
     is_deepseek_adapter,
     is_deepseek_model,
     select_tool_adapter,
@@ -41,9 +44,7 @@ Rules:
 5. The "arguments" field MUST be a valid JSON object matching the tool's parameter schema.
 6. NEVER wrap <tool_call> in markdown code blocks like ```xml or ```json."""
 
-TOOL_CHOICE_REQUIRED_PROMPT = (
-    "\nYou MUST call at least one tool in your response. Do NOT respond with plain text only."
-)
+TOOL_CHOICE_REQUIRED_PROMPT = "\nYou MUST call at least one tool in your response. Do NOT respond with plain text only."
 TOOL_CHOICE_SPECIFIC_PROMPT = (
     '\nYou MUST call the tool named "{name}" in your response.'
 )
@@ -110,7 +111,9 @@ def inject_tool_prompt(
     reasoning_config=None,
 ):
     resolved_adapter = adapter or (select_tool_adapter(model) if model else None)
-    if is_deepseek_adapter(resolved_adapter) or (resolved_adapter is None and is_deepseek_model(model)):
+    if is_deepseek_adapter(resolved_adapter) or (
+        resolved_adapter is None and is_deepseek_model(model)
+    ):
         return inject_deepseek_tool_prompt(
             messages,
             tools,
@@ -134,6 +137,8 @@ def inject_tool_prompt(
             adapter=resolved_adapter,
             reasoning_config=reasoning_config,
         )
+    if resolved_adapter == QWEN_3_5_ADAPTER:
+        return inject_qwen35_tool_prompt(messages, tools, tool_choice)
 
     tool_defs = format_tool_definitions(tools)
     tool_prompt = TOOL_SYSTEM_PROMPT.format(tool_definitions=tool_defs)
@@ -181,9 +186,7 @@ def inject_tool_prompt(
                     "name": func.get("name", ""),
                     "arguments": json.loads(func.get("arguments", "{}")),
                 }
-                tc_text += (
-                    f"\n<tool_call>\n{json.dumps(call_obj, ensure_ascii=False)}\n</tool_call>"
-                )
+                tc_text += f"\n<tool_call>\n{json.dumps(call_obj, ensure_ascii=False)}\n</tool_call>"
             new_messages.append({"role": "assistant", "content": tc_text.strip()})
         else:
             new_messages.append(msg)
@@ -340,7 +343,9 @@ def extract_tool_calls(
         )
         if kimi_tool_calls:
             return kimi_tool_calls, kimi_remaining
-    if is_deepseek_adapter(resolved_adapter) or (resolved_adapter is None and is_deepseek_model(model)):
+    if is_deepseek_adapter(resolved_adapter) or (
+        resolved_adapter is None and is_deepseek_model(model)
+    ):
         repaired_tool_calls, repaired_remaining = extract_deepseek_tool_calls(
             cleaned,
             tools=tools,
@@ -349,6 +354,14 @@ def extract_tool_calls(
         )
         if repaired_tool_calls:
             return repaired_tool_calls, repaired_remaining
+    if resolved_adapter == QWEN_3_5_ADAPTER:
+        qwen_tool_calls, qwen_remaining = extract_qwen35_tool_calls(
+            cleaned,
+            tools=tools,
+            logger=logger,
+        )
+        if qwen_tool_calls:
+            return qwen_tool_calls, qwen_remaining
 
     matches, spans = _find_tool_call_blocks(cleaned, tools=tools)
 
@@ -462,7 +475,9 @@ def _parse_arg_key_arguments(raw: str, arg_keys=None, argument_types=None):
     if not jsonish:
         return {}
 
-    object_text = jsonish if jsonish.startswith("{") else "{" + _quote_jsonish_keys(jsonish) + "}"
+    object_text = (
+        jsonish if jsonish.startswith("{") else "{" + _quote_jsonish_keys(jsonish) + "}"
+    )
     object_text = _escape_invalid_json_backslashes(object_text)
     try:
         parsed = json.loads(object_text)
@@ -477,7 +492,9 @@ def _parse_arg_key_arguments(raw: str, arg_keys=None, argument_types=None):
 def _parse_arg_value_arguments(raw: str, argument_types=None):
     text = raw.strip()
     argument_types = argument_types or {}
-    reversed_args = _parse_reversed_arg_value_arguments(text, argument_types=argument_types)
+    reversed_args = _parse_reversed_arg_value_arguments(
+        text, argument_types=argument_types
+    )
     if reversed_args is not None:
         return reversed_args
 
@@ -564,7 +581,9 @@ def _split_close_only_argument(chunk: str, arg_keys, argument_types=None):
                 strip_unclosed_string=True,
             )
 
-    match = re.match(r"\"?(?P<key>[A-Za-z_][\w./@-]*)\"?\s*(?::\s*)?(?P<value>.*)$", chunk, re.DOTALL)
+    match = re.match(
+        r"\"?(?P<key>[A-Za-z_][\w./@-]*)\"?\s*(?::\s*)?(?P<value>.*)$", chunk, re.DOTALL
+    )
     if not match:
         return None
     key = match.group("key")
@@ -597,7 +616,9 @@ def _parse_lenient_key_value_pairs(text: str, argument_types=None):
     arguments = {}
     for index, match in enumerate(matches):
         value_start = match.end()
-        value_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        value_end = (
+            matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        )
         raw_value = text[value_start:value_end].strip()
         if raw_value.endswith(","):
             raw_value = raw_value[:-1].strip()
@@ -768,7 +789,9 @@ def _tool_required_argument_names(name: str, tools=None) -> list[str]:
         if tool_name != name:
             continue
         parameters = function_data.get("parameters", {}) or tool.get("input_schema", {})
-        required = parameters.get("required", []) if isinstance(parameters, dict) else []
+        required = (
+            parameters.get("required", []) if isinstance(parameters, dict) else []
+        )
         return required if isinstance(required, list) else []
     return []
 
@@ -784,11 +807,12 @@ def _tool_argument_types(name: str, tools=None) -> dict[str, str | None]:
         if tool_name != name:
             continue
         parameters = function_data.get("parameters", {}) or tool.get("input_schema", {})
-        properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+        properties = (
+            parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+        )
         if isinstance(properties, dict):
             return {
-                key: _schema_property_type(value)
-                for key, value in properties.items()
+                key: _schema_property_type(value) for key, value in properties.items()
             }
     return {}
 
@@ -817,9 +841,7 @@ def _schema_property_type(property_schema) -> str | None:
             ]
             if "string" in union_types:
                 return "string"
-            non_null_types = [
-                item for item in union_types if item and item != "null"
-            ]
+            non_null_types = [item for item in union_types if item and item != "null"]
             if len(set(non_null_types)) == 1:
                 return non_null_types[0]
     return None
@@ -870,7 +892,9 @@ def _find_tool_call_blocks(content: str, tools=None):
         if (
             next_start >= 0
             and (tool_end < 0 or next_start < tool_end)
-            and not _tool_call_prefix_looks_parseable(content[body_start:next_start], tools)
+            and not _tool_call_prefix_looks_parseable(
+                content[body_start:next_start], tools
+            )
         ):
             body_end = next_start
             block_end = next_start
@@ -927,8 +951,7 @@ def _find_tool_call_blocks(content: str, tools=None):
         key=lambda item: item[0][0],
     )
     combined = sorted(
-        combined
-        + list(zip(inline_spans, inline_matches, strict=False)),
+        combined + list(zip(inline_spans, inline_matches, strict=False)),
         key=lambda item: item[0][0],
     )
     spans = [span for span, _ in combined]
@@ -973,9 +996,15 @@ def _find_arg_key_tool_blocks(content: str, tools=None, occupied_spans=None):
     spans = []
     for index, match in enumerate(matches):
         start = match.start("name")
-        if any(span_start <= start < span_end for span_start, span_end in occupied_spans):
+        if any(
+            span_start <= start < span_end for span_start, span_end in occupied_spans
+        ):
             continue
-        end = matches[index + 1].start("name") if index + 1 < len(matches) else len(content)
+        end = (
+            matches[index + 1].start("name")
+            if index + 1 < len(matches)
+            else len(content)
+        )
         blocks.append(content[start:end].strip())
         spans.append((start, end))
     return blocks, spans
@@ -988,7 +1017,10 @@ def _find_minimax_tool_call_blocks(content: str, tools=None, occupied_spans=None
     spans = []
 
     for match in pattern.finditer(content):
-        if any(span_start <= match.start() < span_end for span_start, span_end in occupied_spans):
+        if any(
+            span_start <= match.start() < span_end
+            for span_start, span_end in occupied_spans
+        ):
             continue
         inner = match.group(1)
         invocations = list(
@@ -1003,7 +1035,9 @@ def _find_minimax_tool_call_blocks(content: str, tools=None, occupied_spans=None
             if name is None:
                 continue
             arguments = _parse_minimax_parameters(name, invoke.group("body"), tools)
-            blocks.append(json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False))
+            blocks.append(
+                json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False)
+            )
             spans.append((match.start(), match.end()))
 
     return blocks, spans
@@ -1044,7 +1078,10 @@ def _find_inline_tool_argument_blocks(content: str, tools=None, occupied_spans=N
             continue
 
         line_start = offsets[line_index]
-        if any(span_start <= line_start < span_end for span_start, span_end in occupied_spans):
+        if any(
+            span_start <= line_start < span_end
+            for span_start, span_end in occupied_spans
+        ):
             continue
 
         parsed = _parse_inline_tool_line(stripped, tools)
@@ -1072,7 +1109,9 @@ def _find_inline_tool_argument_blocks(content: str, tools=None, occupied_spans=N
             end_index += 1
 
         block_end = offsets[end_index] if end_index < len(offsets) else len(content)
-        blocks.append(json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False))
+        blocks.append(
+            json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False)
+        )
         spans.append((line_start, block_end))
 
     return blocks, spans
@@ -1143,7 +1182,9 @@ def _parse_inline_argument_text(name: str, text: str, tools=None):
         return None
     argument_types = _tool_argument_types(name, tools)
 
-    key_pattern = "|".join(re.escape(key) for key in sorted(argument_names, key=len, reverse=True))
+    key_pattern = "|".join(
+        re.escape(key) for key in sorted(argument_names, key=len, reverse=True)
+    )
     matches = list(
         re.finditer(
             rf"(?<![\w./@-])(?P<key>{key_pattern})\s*:\s*",
@@ -1159,7 +1200,9 @@ def _parse_inline_argument_text(name: str, text: str, tools=None):
     for index, match in enumerate(matches):
         key = canonical_keys.get(match.group("key").lower(), match.group("key"))
         value_start = match.end()
-        value_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        value_end = (
+            matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        )
         raw_value = text[value_start:value_end].strip()
         if not raw_value:
             return None
@@ -1170,7 +1213,9 @@ def _parse_inline_argument_text(name: str, text: str, tools=None):
     return arguments
 
 
-def _find_claude_code_transcript_tool_blocks(content: str, tools=None, occupied_spans=None):
+def _find_claude_code_transcript_tool_blocks(
+    content: str, tools=None, occupied_spans=None
+):
     occupied_spans = occupied_spans or []
     tool_names = sorted(_tool_name_set(tools), key=len, reverse=True)
     if not tool_names:
@@ -1187,14 +1232,21 @@ def _find_claude_code_transcript_tool_blocks(content: str, tools=None, occupied_
 
     for index, match in enumerate(matches):
         start = match.start("name")
-        if any(span_start <= start < span_end for span_start, span_end in occupied_spans):
+        if any(
+            span_start <= start < span_end for span_start, span_end in occupied_spans
+        ):
             continue
 
         body_start = match.end()
         candidates = []
         if index + 1 < len(matches):
             candidates.append(matches[index + 1].start("name"))
-        for marker in ("<tool_call>", "<minimax:tool_call>", "<｜DSML｜tool_calls>", "<｜DSML｜function_calls>"):
+        for marker in (
+            "<tool_call>",
+            "<minimax:tool_call>",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜function_calls>",
+        ):
             marker_pos = content.find(marker, body_start)
             if marker_pos >= 0:
                 candidates.append(marker_pos)
@@ -1211,7 +1263,9 @@ def _find_claude_code_transcript_tool_blocks(content: str, tools=None, occupied_
                     content.find("<minimax:tool_call>", after_out),
                     content.find("<｜DSML｜tool_calls>", after_out),
                     content.find("<｜DSML｜function_calls>", after_out),
-                    matches[index + 1].start("name") if index + 1 < len(matches) else -1,
+                    matches[index + 1].start("name")
+                    if index + 1 < len(matches)
+                    else -1,
                 )
                 if pos >= 0
             ]
@@ -1233,13 +1287,17 @@ def _find_claude_code_transcript_tool_blocks(content: str, tools=None, occupied_
         if arguments is None:
             continue
 
-        blocks.append(json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False))
+        blocks.append(
+            json.dumps({"name": name, "arguments": arguments}, ensure_ascii=False)
+        )
         spans.append((start, span_end))
 
     return blocks, spans
 
 
-def _find_transcript_out_marker(content: str, start: int, end: int) -> tuple[int, int] | None:
+def _find_transcript_out_marker(
+    content: str, start: int, end: int
+) -> tuple[int, int] | None:
     search_area = content[start:end]
     match = re.search(r"(?:\r?\n)OUT(?:\r?\n|$)", search_area)
     if not match:
@@ -1271,11 +1329,7 @@ def _transcript_tool_arguments(name: str, raw_input: str, tools=None, label: str
                 argument_types.get(target_name),
             )
         }
-        if (
-            label
-            and "description" in argument_names
-            and target_name != "description"
-        ):
+        if label and "description" in argument_names and target_name != "description":
             arguments["description"] = label
         return arguments
     return None
