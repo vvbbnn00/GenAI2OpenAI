@@ -2,8 +2,12 @@ import argparse
 import base64
 import io
 import json
+import logging
+import math
+import signal
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from functools import lru_cache
 from unittest.mock import patch
@@ -13,7 +17,6 @@ from PIL import Image
 import genai_proxy.services.genai as genai_module
 from genai_proxy.app import create_app
 from genai_proxy.config import AppConfig
-from genai_proxy.logging_utils import setup_logging
 from genai_proxy.optimizations.registry import (
     DEEPSEEK_V4_FLASH_ADAPTER,
     DEEPSEEK_V4_PRO_ADAPTER,
@@ -301,6 +304,46 @@ def _successful_genai_response(response):
         return False
 
 
+class LiveCaseTimeout(TimeoutError):
+    pass
+
+
+@contextmanager
+def live_case_deadline(seconds):
+    if not hasattr(signal, "setitimer"):
+        yield
+        return
+
+    def timeout_handler(_signum, _frame):
+        raise LiveCaseTimeout(f"live case exceeded {seconds:g} seconds")
+
+    previous_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    started = time.monotonic()
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        previous_delay, previous_interval = previous_timer
+        if previous_delay > 0:
+            elapsed = time.monotonic() - started
+            previous_delay = max(previous_delay - elapsed, 1e-6)
+        signal.setitimer(
+            signal.ITIMER_REAL,
+            previous_delay,
+            previous_interval,
+        )
+
+
+def quiet_integration_logger():
+    logger = logging.getLogger("genai2openai.live_integration")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+    return logger
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--keystore", default="docker-deploy.keystore")
@@ -312,6 +355,12 @@ def main():
         default=1,
         help="Kimi-K3 repetitions; kept separate to limit live test traffic",
     )
+    parser.add_argument(
+        "--case-timeout",
+        type=float,
+        default=240,
+        help="Overall deadline in seconds for each short live test case",
+    )
     args = parser.parse_args()
 
     disallowed = [model for model in args.models if model not in ALLOWED_MODELS]
@@ -319,10 +368,15 @@ def main():
         raise SystemExit(
             f"Refusing to test disallowed model(s): {', '.join(disallowed)}"
         )
-    if args.repeat < 1 or args.kimi_repeat < 1:
-        raise SystemExit("Repeat counts must be positive")
+    if (
+        args.repeat < 1
+        or args.kimi_repeat < 1
+        or not math.isfinite(args.case_timeout)
+        or args.case_timeout <= 0
+    ):
+        raise SystemExit("Repeat counts and --case-timeout must be positive")
 
-    logger = setup_logging(False)
+    logger = quiet_integration_logger()
     app = create_app(
         AppConfig(
             token=None,
@@ -330,7 +384,7 @@ def main():
             port=0,
             debug=False,
             api_key=None,
-            token_check_interval=60,
+            token_check_interval=0,
             claude_haiku_model="chatglm",
             claude_sonnet_model="deepseek-pro",
             claude_opus_model="deepseek-chat",
@@ -356,13 +410,14 @@ def main():
                             label = f"{model}:{name}:run{iteration + 1:02d}"
                             checkpoint = audit.checkpoint()
                             try:
-                                fn(client, model, iteration)
+                                with live_case_deadline(args.case_timeout):
+                                    fn(client, model, iteration)
                                 audit.assert_model_side_effects(model, checkpoint)
                             except Exception as exc:
                                 failures.append((label, exc))
-                                print(f"[FAIL] {label}: {exc}")
+                                print(f"[FAIL] {label}: {exc}", flush=True)
                             else:
-                                print(f"[PASS] {label}")
+                                print(f"[PASS] {label}", flush=True)
     finally:
         app.extensions["token_manager"].shutdown()
 
@@ -372,13 +427,14 @@ def main():
         f"chat_requests={audit_summary['chat_requests']} "
         f"chat_group_id_checks={audit_summary['chat_requests']} "
         f"history_lists={audit_summary['history_list_requests']} "
-        f"history_deletes={audit_summary['successful_history_deletes']}"
+        f"history_deletes={audit_summary['successful_history_deletes']}",
+        flush=True,
     )
 
     if failures:
-        print("\nFailures:")
+        print("\nFailures:", flush=True)
         for label, exc in failures:
-            print(f"  - {label}: {exc}")
+            print(f"  - {label}: {exc}", flush=True)
         return 1
     return 0
 
@@ -1041,9 +1097,18 @@ def test_nonvisual_vision_rejection(client, model, iteration):
             f"HTTP {response.status_code}"
         )
         body = response.get_json()
-        assert "unsupported_content_type" in json.dumps(body, ensure_ascii=False), (
-            f"{path} returned the wrong image error: {body}"
-        )
+        if path == "/v1/messages":
+            error = (body or {}).get("error") or {}
+            assert (body or {}).get("type") == "error"
+            assert error.get("type") == "invalid_request_error"
+            assert "only text" in str(error.get("message") or "").lower(), (
+                f"{path} returned the wrong image error: {body}"
+            )
+        else:
+            assert "unsupported_content_type" in json.dumps(
+                body,
+                ensure_ascii=False,
+            ), f"{path} returned the wrong image error: {body}"
 
     assert audit.chat_requests_since(checkpoint) == [], (
         "non-visual image rejection reached the upstream chat endpoint"
