@@ -94,6 +94,16 @@ def completion_lines(content="ok"):
     ]
 
 
+def completion_events(chunks):
+    events = []
+    for chunk in chunks:
+        for line in chunk.splitlines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            events.append(json.loads(line[6:]))
+    return events
+
+
 class GenAIRetryTests(unittest.TestCase):
     def test_retry_count_defaults_to_ten(self):
         with patch.dict(os.environ, {"GENAI_MAX_RETRIES": ""}):
@@ -215,6 +225,29 @@ class GenAIRetryTests(unittest.TestCase):
         self.assertTrue(
             any("Failed to connect to upstream GenAI" in chunk for chunk in chunks)
         )
+        events = completion_events(chunks)
+        self.assertEqual(len({event["id"] for event in events}), 1)
+        self.assertEqual(len({event["created"] for event in events}), 1)
+
+    def test_stream_content_finish_and_usage_share_completion_metadata(self):
+        service = make_service()
+        request = {
+            **make_request(),
+            "stream_options": {"include_usage": True},
+        }
+
+        with patch(
+            "genai_proxy.services.genai.requests.post",
+            return_value=FakeResponse(completion_lines()),
+        ):
+            chunks = list(service.stream_openai_completion(request))
+
+        events = completion_events(chunks)
+        self.assertGreaterEqual(len(events), 3)
+        self.assertEqual(len({event["id"] for event in events}), 1)
+        self.assertEqual(len({event["created"] for event in events}), 1)
+        self.assertEqual(events[-1]["choices"], [])
+        self.assertIn("usage", events[-1])
 
     def test_non_stream_retries_after_partial_upstream_disconnect(self):
         service = make_service()
@@ -397,6 +430,9 @@ class GenAIRetryTests(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
         self.assertEqual(rendered.count("visible reasoning"), 1)
         self.assertIn("Failed to connect to upstream GenAI", rendered)
+        events = completion_events(chunks)
+        self.assertEqual(len({event["id"] for event in events}), 1)
+        self.assertEqual(len({event["created"] for event in events}), 1)
 
     def test_non_chat_upstream_operation_uses_same_retry_budget(self):
         service = make_service(max_retries=2)

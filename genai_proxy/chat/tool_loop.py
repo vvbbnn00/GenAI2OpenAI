@@ -3,19 +3,22 @@
 import json
 import re
 import uuid
-from datetime import datetime
 
 from genai_proxy.chat.streaming import _iter_sse_lines, _strip_error_prefix
 from genai_proxy.chat.tool_calls import (
     merge_tool_call_deltas as _merge_tool_call_deltas,
+)
+from genai_proxy.chat.tool_calls import (
     normalize_stream_tool_call as _normalize_stream_tool_call,
 )
 from genai_proxy.chat.tool_choice import (
     tool_calls_satisfy_choice as _tool_calls_satisfy_choice,
+)
+from genai_proxy.chat.tool_choice import (
     tool_choice_requires_call as _tool_choice_requires_call,
 )
+from genai_proxy.chat.tool_protocol import extract_tool_calls
 from genai_proxy.chat.types import PreparedChatRequest
-from genai_proxy.compat.openai import extract_tool_calls, make_error_chunk
 from genai_proxy.errors import ProxyError
 from genai_proxy.models import (
     KIMI_FINAL_CLOSE,
@@ -37,25 +40,32 @@ class ToolLoopMixin:
         *,
         stream_reasoning: bool,
     ):
-        completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-        created = int(datetime.now().timestamp())
+        completion_id, created = self._new_completion_metadata()
         open_tags = _tool_start_tags_for_request(prepared.tool_adapter, prepared.tools)
 
         def make_chunk(delta, finish_reason=None):
-            chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": prepared.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": delta,
-                        "finish_reason": finish_reason,
-                    }
-                ],
-            }
-            return f"data: {json.dumps(chunk)}\n\n"
+            return self._make_chunk(
+                prepared.model,
+                delta,
+                finish_reason,
+                completion_id=completion_id,
+                created=created,
+            )
+
+        def make_usage_chunk():
+            return self._make_usage_chunk(
+                prepared,
+                completion_id=completion_id,
+                created=created,
+            )
+
+        def make_error_chunk(message):
+            return self._make_error_chunk(
+                message,
+                prepared.model,
+                completion_id,
+                created,
+            )
 
         def emit_response_text(text, sent_role):
             if not text:
@@ -127,11 +137,7 @@ class ToolLoopMixin:
             except ProxyError as exc:
                 if not sent_role:
                     raise
-                yield make_error_chunk(
-                    exc.message,
-                    prepared.model,
-                    completion_id,
-                )
+                yield make_error_chunk(exc.message)
                 return
 
             if attempt is None:
@@ -261,7 +267,7 @@ class ToolLoopMixin:
                 yield chunk
             yield make_chunk({}, finish_reason="tool_calls")
             if prepared.include_usage:
-                yield self._make_usage_chunk(prepared)
+                yield make_usage_chunk()
             yield "data: [DONE]\n\n"
             return
 
@@ -270,26 +276,16 @@ class ToolLoopMixin:
                 "Tool adapter output contained unparseable tool syntax (%d chars)",
                 len(content),
             )
-            yield make_error_chunk(
-                "Upstream returned an invalid tool call",
-                prepared.model,
-                completion_id,
-            )
+            yield make_error_chunk("Upstream returned an invalid tool call")
             return
 
         if _tool_choice_requires_call(prepared.tool_choice):
-            yield make_error_chunk(
-                "Upstream did not return the required tool call",
-                prepared.model,
-                completion_id,
-            )
+            yield make_error_chunk("Upstream did not return the required tool call")
             return
 
         if prepared.tool_adapter == KIMI_K3_ADAPTER and not final_response:
             yield make_error_chunk(
-                "Upstream returned neither a valid client action nor a final response",
-                prepared.model,
-                completion_id,
+                "Upstream returned neither a valid client action nor a final response"
             )
             return
 
@@ -309,7 +305,7 @@ class ToolLoopMixin:
             yield make_chunk({"role": "assistant", "content": ""})
         yield make_chunk({}, finish_reason="stop")
         if prepared.include_usage:
-            yield self._make_usage_chunk(prepared)
+            yield make_usage_chunk()
         yield "data: [DONE]\n\n"
 
     def _iter_tool_attempt_events(
@@ -384,23 +380,6 @@ class ToolLoopMixin:
                 else [],
             },
         )
-
-    def _make_chunk(self, model, delta, finish_reason=None):
-        response = {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-            "object": "chat.completion.chunk",
-            "created": int(datetime.now().timestamp()),
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": delta,
-                    "finish_reason": finish_reason,
-                }
-            ],
-        }
-        return f"data: {json.dumps(response)}\n\n"
-
 
 def _tool_start_tags_for_request(adapter: str, tools: list | None) -> tuple[str, ...]:
     tags = list(tool_start_tags(adapter))

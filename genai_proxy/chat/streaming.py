@@ -11,7 +11,6 @@ from genai_proxy.chat.tool_calls import (
     merge_tool_call_deltas as _merge_tool_call_deltas,
 )
 from genai_proxy.chat.types import PreparedChatRequest
-from genai_proxy.compat.openai import make_error_chunk
 from genai_proxy.errors import ProxyError
 from genai_proxy.models import KIMI_K3_ADAPTER
 from genai_proxy.retry import (
@@ -192,6 +191,49 @@ class ChatStreamingMixin:
     ):
         if stream_reasoning and not buffer_until_complete:
             raise ValueError("stream_reasoning requires buffered completion content")
+        completion_id, created = self._new_completion_metadata()
+
+        def make_chunk(delta, finish_reason=None):
+            return self._make_chunk(
+                prepared.model,
+                delta,
+                finish_reason,
+                completion_id=completion_id,
+                created=created,
+            )
+
+        def make_usage_chunk():
+            return self._make_usage_chunk(
+                prepared,
+                completion_id=completion_id,
+                created=created,
+            )
+
+        def make_error_chunk(message):
+            return self._make_error_chunk(
+                message,
+                prepared.model,
+                completion_id,
+                created,
+            )
+
+        def error_chunk_or_raise(
+            sent_chunk,
+            message,
+            *,
+            error_type="upstream_error",
+            code=None,
+            status=502,
+        ):
+            if not sent_chunk:
+                raise ProxyError(
+                    message,
+                    error_type=error_type,
+                    code=code,
+                    status=status,
+                )
+            return make_error_chunk(message)
+
         root_ai_type = prepared.root_ai_type
         messages = messages if messages is not None else prepared.messages
         transport_messages, chat_info, image_fields = _genai_transport_input(
@@ -282,22 +324,18 @@ class ChatStreamingMixin:
                             continue
                         if not sent_any_chunk:
                             raise _upstream_auth_error()
-                        yield make_error_chunk(
-                            "Upstream authentication failed", prepared.model
-                        )
+                        yield make_error_chunk("Upstream authentication failed")
                     elif response.status_code == 429:
-                        yield _error_chunk_or_raise(
+                        yield error_chunk_or_raise(
                             sent_any_chunk,
                             "Upstream rate limit exceeded",
-                            prepared.model,
                             error_type="rate_limit_error",
                             status=429,
                         )
                     else:
-                        yield _error_chunk_or_raise(
+                        yield error_chunk_or_raise(
                             sent_any_chunk,
                             f"Upstream API error: {response.status_code}",
-                            prepared.model,
                         )
                     return
 
@@ -328,19 +366,16 @@ class ChatStreamingMixin:
                             break
                         if not sent_any_chunk:
                             raise _upstream_auth_error()
-                        yield make_error_chunk(
-                            "Upstream authentication failed", prepared.model
-                        )
+                        yield make_error_chunk("Upstream authentication failed")
                         return
 
                     structured_error = _structured_upstream_error(genai_json)
                     if structured_error is not None:
                         err_msg, error_type, error_code, error_status = structured_error
                         self._logger.warning("GenAI structured error: %s", err_msg)
-                        yield _error_chunk_or_raise(
+                        yield error_chunk_or_raise(
                             sent_any_chunk,
                             err_msg,
-                            prepared.model,
                             error_type=error_type,
                             code=error_code,
                             status=error_status,
@@ -372,10 +407,9 @@ class ChatStreamingMixin:
                             network_retry_count += 1
                             retry_after_transient_error = True
                             break
-                        yield _error_chunk_or_raise(
+                        yield error_chunk_or_raise(
                             sent_any_chunk,
                             f"Upstream error: {err_msg}",
-                            prepared.model,
                         )
                         return
 
@@ -420,10 +454,9 @@ class ChatStreamingMixin:
                             network_retry_count += 1
                             retry_after_transient_error = True
                             break
-                        yield _error_chunk_or_raise(
+                        yield error_chunk_or_raise(
                             sent_any_chunk,
                             _strip_error_prefix(err_msg),
-                            prepared.model,
                         )
                         return
 
@@ -438,24 +471,16 @@ class ChatStreamingMixin:
                                     buffered_delta["tool_calls"] = tool_calls
                                 if reasoning:
                                     sent_any_chunk = True
-                                    yield self._make_chunk(
-                                        prepared.model,
-                                        {"reasoning_content": reasoning},
+                                    yield make_chunk(
+                                        {"reasoning_content": reasoning}
                                     )
                                 if buffered_delta:
-                                    attempt_chunks.append(
-                                        self._make_chunk(
-                                            prepared.model,
-                                            buffered_delta,
-                                        )
-                                    )
+                                    attempt_chunks.append(make_chunk(buffered_delta))
                             else:
-                                attempt_chunks.append(
-                                    self._make_chunk(prepared.model, delta)
-                                )
+                                attempt_chunks.append(make_chunk(delta))
                         else:
                             sent_any_chunk = True
-                            yield self._make_chunk(prepared.model, delta)
+                            yield make_chunk(delta)
 
                     if finish_reason is not None:
                         finished = True
@@ -474,14 +499,10 @@ class ChatStreamingMixin:
                                 terminal_message,
                                 finish_reason=finish_reason,
                             )
-                        finish_chunk = self._make_chunk(
-                            prepared.model,
-                            {},
-                            finish_reason=finish_reason,
-                        )
+                        finish_chunk = make_chunk({}, finish_reason=finish_reason)
                         terminal_chunks = [finish_chunk]
                         if prepared.include_usage:
-                            terminal_chunks.append(self._make_usage_chunk(prepared))
+                            terminal_chunks.append(make_usage_chunk())
                         terminal_chunks.append("data: [DONE]\n\n")
                         if buffer_until_complete:
                             attempt_chunks.extend(terminal_chunks)
@@ -513,10 +534,9 @@ class ChatStreamingMixin:
                     ):
                         network_retry_count += 1
                         continue
-                    yield _error_chunk_or_raise(
+                    yield error_chunk_or_raise(
                         sent_any_chunk,
                         "Stream ended unexpectedly without completion",
-                        prepared.model,
                     )
                 elif buffer_until_complete:
                     sent_any_chunk = sent_any_chunk or bool(attempt_chunks)
@@ -541,10 +561,9 @@ class ChatStreamingMixin:
                     if isinstance(exc, requests.Timeout)
                     else "Failed to connect to upstream GenAI"
                 )
-                yield _error_chunk_or_raise(
+                yield error_chunk_or_raise(
                     sent_any_chunk,
                     message,
-                    prepared.model,
                 )
                 return
             except ProxyError:
@@ -553,7 +572,7 @@ class ChatStreamingMixin:
                 self._logger.exception("Error in _stream_genai_response")
                 if not sent_any_chunk:
                     raise
-                yield make_error_chunk(str(exc), prepared.model)
+                yield make_error_chunk(str(exc))
                 return
             finally:
                 if response is not None:
@@ -587,7 +606,6 @@ class ChatStreamingMixin:
             reason=reason,
         )
 
-
 def _upstream_auth_error() -> ProxyError:
     return ProxyError(
         "Upstream GenAI token is invalid or expired",
@@ -619,20 +637,6 @@ def _structured_upstream_error(payload):
     status = raw_code if isinstance(raw_code, int) and 400 <= raw_code < 500 else 502
     code = raw_code if isinstance(raw_code, str) else None
     return str(message), str(error_type), code, status
-
-
-def _error_chunk_or_raise(
-    sent_any_chunk: bool,
-    message: str,
-    model: str,
-    *,
-    error_type: str = "upstream_error",
-    code: str | None = None,
-    status: int = 502,
-) -> str:
-    if not sent_any_chunk:
-        raise ProxyError(message, error_type=error_type, code=code, status=status)
-    return make_error_chunk(message, model)
 
 
 def _strip_error_prefix(message: str) -> str:

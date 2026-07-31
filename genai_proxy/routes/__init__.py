@@ -1,12 +1,5 @@
-"""Flask route blueprints."""
+"""Backward-compatible helpers for public API routes."""
 
-from itertools import chain
+from genai_proxy.api.common import prime_stream
 
-
-def prime_stream(gen):
-    iterator = iter(gen)
-    try:
-        first = next(iterator)
-    except StopIteration:
-        return iter(())
-    return chain([first], iterator)
+__all__ = ["prime_stream"]

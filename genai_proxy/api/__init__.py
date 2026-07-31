@@ -1,0 +1,1 @@
+"""Public HTTP API adapters."""

@@ -1,7 +1,7 @@
 from flask import request
 
-from genai_proxy.compat.claude import claude_error
-from genai_proxy.compat.openai import openai_error
+from genai_proxy.api.anthropic.compat import claude_error
+from genai_proxy.api.openai.errors import openai_error
 
 
 def register_auth(app, config, logger):

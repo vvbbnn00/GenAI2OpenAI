@@ -1,9 +1,11 @@
-import requests
 import time
 
+import requests
+
 import genai_proxy.services.genai as legacy_chat
+from genai_proxy.api.openai.service import GenAIService
 from genai_proxy.chat.preparation import ChatPreparationMixin
-from genai_proxy.chat.service import GenAIService
+from genai_proxy.chat.service import ChatService
 from genai_proxy.chat.streaming import ChatStreamingMixin
 from genai_proxy.chat.tool_loop import ToolLoopMixin
 from genai_proxy.chat.usage import ChatUsageMixin
@@ -16,6 +18,7 @@ def test_legacy_chat_service_import_preserves_identity_and_patch_modules():
 
 
 def test_chat_service_uses_the_split_implementations():
+    assert issubclass(GenAIService, ChatService)
     assert GenAIService._prepare_chat_request is (
         ChatPreparationMixin._prepare_chat_request
     )

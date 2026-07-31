@@ -1,9 +1,5 @@
 """Prompt, completion, and reasoning usage accounting for chat requests."""
 
-import json
-import uuid
-from datetime import datetime
-
 from genai_proxy.chat.types import PreparedChatRequest
 from genai_proxy.token_usage import (
     count_openai_completion_tokens,
@@ -85,22 +81,6 @@ class ChatUsageMixin:
             finish_reason=finish_reason,
         )
         return prepared.generated_usage
-
-    def _make_usage_chunk(self, prepared: PreparedChatRequest) -> str:
-        if prepared.generated_usage is None:
-            raise RuntimeError(
-                "Completion usage was requested before generation finished"
-            )
-        chunk = {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-            "object": "chat.completion.chunk",
-            "created": int(datetime.now().timestamp()),
-            "model": prepared.model,
-            "choices": [],
-            "usage": prepared.generated_usage,
-        }
-        return f"data: {json.dumps(chunk)}\n\n"
-
 
 def responses_usage(openai_usage: dict | None) -> dict | None:
     if not openai_usage:

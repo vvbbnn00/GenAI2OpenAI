@@ -3,8 +3,8 @@
 import json
 
 from genai_proxy.chat.tool_choice import tool_choice_is_none as _tool_choice_is_none
+from genai_proxy.chat.tool_protocol import inject_tool_prompt
 from genai_proxy.chat.types import PreparedChatRequest, ResolvedModelContext
-from genai_proxy.compat.openai import inject_tool_prompt
 from genai_proxy.errors import ProxyError
 from genai_proxy.messages import adapter_supports_vision, normalize_message_contents
 from genai_proxy.models import (

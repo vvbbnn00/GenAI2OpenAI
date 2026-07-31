@@ -1,0 +1,1 @@
+"""Anthropic-compatible API adapter."""
