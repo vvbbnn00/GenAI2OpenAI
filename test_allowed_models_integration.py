@@ -3,12 +3,22 @@ import base64
 import io
 import json
 import sys
+import threading
+from contextlib import contextmanager
+from functools import lru_cache
+from unittest.mock import patch
 
 from PIL import Image
 
+import genai_proxy.services.genai as genai_module
 from genai_proxy.app import create_app
 from genai_proxy.config import AppConfig
 from genai_proxy.logging_utils import setup_logging
+from genai_proxy.optimizations.registry import (
+    DEEPSEEK_V4_FLASH_ADAPTER,
+    DEEPSEEK_V4_PRO_ADAPTER,
+)
+from genai_proxy.token_usage import official_reasoning_prefix_for_adapter
 
 # This is an opt-in keystore-backed integration runner, not an offline pytest module.
 __test__ = False
@@ -26,6 +36,8 @@ REASONING_STREAM_MODELS = {
     "chatglm",
     "qwen-instruct",
 }
+VISION_MODELS = {"qwen-instruct", "kimi-k3"}
+DEEPSEEK_MODELS = {"deepseek-chat", "deepseek-pro"}
 CITIES = (
     "Shanghai",
     "Beijing",
@@ -149,6 +161,146 @@ RESPONSES_STAGE_TOOLS = [
 ]
 
 
+@lru_cache(maxsize=1)
+def _deepseek_max_prefixes():
+    return tuple(
+        official_reasoning_prefix_for_adapter(adapter, "max")
+        for adapter in (DEEPSEEK_V4_FLASH_ADAPTER, DEEPSEEK_V4_PRO_ADAPTER)
+    )
+
+
+class LiveTransportAudit:
+    """Observe only request metadata while real integration traffic is running."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._original_post = genai_module.requests.post
+        self._original_get = genai_module.requests.get
+        self._chat_requests = []
+        self._history_list_requests = 0
+        self._successful_history_deletes = 0
+
+    @contextmanager
+    def installed(self):
+        with (
+            patch.object(
+                genai_module.requests,
+                "post",
+                side_effect=self._post,
+            ),
+            patch.object(
+                genai_module.requests,
+                "get",
+                side_effect=self._get,
+            ),
+        ):
+            yield self
+
+    def checkpoint(self):
+        with self._lock:
+            return (
+                len(self._chat_requests),
+                self._history_list_requests,
+                self._successful_history_deletes,
+            )
+
+    def chat_requests_since(self, checkpoint):
+        with self._lock:
+            return list(self._chat_requests[checkpoint[0] :])
+
+    def assert_model_side_effects(self, model, checkpoint):
+        with self._lock:
+            history_lists = self._history_list_requests - checkpoint[1]
+            history_deletes = self._successful_history_deletes - checkpoint[2]
+
+        if model.casefold() == "kimi-k3":
+            assert history_lists >= 2, (
+                "Kimi request did not complete both history snapshot and lookup"
+            )
+            assert history_deletes >= 1, (
+                "Kimi request did not successfully delete its completed history group"
+            )
+        else:
+            assert history_lists == 0 and history_deletes == 0, (
+                "non-Kimi request unexpectedly touched Kimi history endpoints"
+            )
+
+    def summary(self):
+        with self._lock:
+            return {
+                "chat_requests": len(self._chat_requests),
+                "history_list_requests": self._history_list_requests,
+                "successful_history_deletes": self._successful_history_deletes,
+            }
+
+    def _post(self, url, *args, **kwargs):
+        if url == genai_module.GENAI_URL:
+            payload = kwargs.get("json")
+            if not isinstance(payload, dict):
+                raise AssertionError("GenAI chat request did not use a JSON object")
+            if "chatGroupId" in payload:
+                raise AssertionError("GenAI chat request set forbidden chatGroupId")
+            if payload.get("stream") is not True:
+                raise AssertionError("GenAI chat request did not request upstream SSE")
+
+            model = str(payload.get("aiType") or "")
+            chat_info = payload.get("chatInfo")
+            if model.casefold() == "kimi-k3" and not str(chat_info or ""):
+                raise AssertionError("Kimi request used an empty chatInfo")
+
+            messages = payload.get("messages") or []
+            max_prefixes = (
+                _deepseek_max_prefixes()
+                if model.casefold() in DEEPSEEK_MODELS
+                else ()
+            )
+            has_max_prefix = any(
+                isinstance(message, dict)
+                and isinstance(message.get("content"), str)
+                and any(
+                    prefix and message["content"].startswith(prefix)
+                    for prefix in max_prefixes
+                )
+                for message in messages
+            )
+            observation = {
+                "model": model,
+                "thinking_present": "thinking" in payload,
+                "thinking": payload.get("thinking"),
+                "has_max_prefix": has_max_prefix,
+            }
+            with self._lock:
+                self._chat_requests.append(observation)
+
+        return self._original_post(url, *args, **kwargs)
+
+    def _get(self, url, *args, **kwargs):
+        response = self._original_get(url, *args, **kwargs)
+        if url == genai_module.GENAI_HISTORY_LIST_URL:
+            with self._lock:
+                self._history_list_requests += 1
+        elif url == genai_module.GENAI_HISTORY_DELETE_URL:
+            if _successful_genai_response(response):
+                with self._lock:
+                    self._successful_history_deletes += 1
+        return response
+
+
+def _successful_genai_response(response):
+    if response.status_code != 200:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    if not isinstance(payload, dict) or payload.get("success") is False:
+        return False
+    try:
+        return int(payload.get("code", 200) or 200) < 400
+    except (TypeError, ValueError):
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--keystore", default="docker-deploy.keystore")
@@ -185,75 +337,43 @@ def main():
         ),
         logger,
     )
+    audit = LiveTransportAudit()
+    app.extensions["live_transport_audit"] = audit
 
     failures = []
     try:
-        with app.test_client() as client:
-            for model in args.models:
-                if model.casefold() == "kimi-k3":
-                    tests = [
-                        ("openai_text", test_openai_text),
-                        ("openai_stream_text", test_openai_stream_text),
-                        ("openai_tool_call", test_openai_tool_call),
-                        ("openai_stream_tool_call", test_openai_stream_tool_call),
-                        ("openai_vision", test_openai_vision),
-                        ("responses_vision", test_responses_vision),
-                        (
-                            "responses_multiturn_tool_call",
-                            test_responses_multiturn_tool_call,
-                        ),
-                        ("claude_text", test_claude_text),
-                        ("claude_stream_tool_use", test_claude_stream_tool_use),
-                        ("claude_vision", test_claude_vision),
-                    ]
-                else:
-                    tests = [
-                        ("openai_tool_call", test_openai_tool_call),
-                        ("openai_stream_tool_call", test_openai_stream_tool_call),
-                        ("openai_bash_tool_call", test_openai_bash_tool_call),
-                        (
-                            "openai_stream_bash_tool_call",
-                            test_openai_stream_bash_tool_call,
-                        ),
-                        ("openai_tool_result_turn", test_openai_tool_result_turn),
-                        ("openai_no_tool_needed", test_openai_no_tool_needed),
-                        ("claude_tool_use", test_claude_tool_use),
-                        ("claude_stream_tool_use", test_claude_stream_tool_use),
-                        ("claude_bash_tool_use", test_claude_bash_tool_use),
-                        (
-                            "claude_stream_bash_tool_use",
-                            test_claude_stream_bash_tool_use,
-                        ),
-                        ("claude_tool_result_turn", test_claude_tool_result_turn),
-                    ]
-                    if model.casefold() in REASONING_STREAM_MODELS:
-                        tests.extend(
-                            (
-                                (
-                                    "openai_stream_reasoning",
-                                    test_openai_stream_reasoning,
-                                ),
-                                (
-                                    "responses_stream_reasoning",
-                                    test_responses_stream_reasoning,
-                                ),
-                            )
-                        )
-                repeat = (
-                    args.kimi_repeat if model.casefold() == "kimi-k3" else args.repeat
-                )
-                for name, fn in tests:
-                    for iteration in range(repeat):
-                        label = f"{model}:{name}:run{iteration + 1:02d}"
-                        try:
-                            fn(client, model, iteration)
-                        except Exception as exc:
-                            failures.append((label, exc))
-                            print(f"[FAIL] {label}: {exc}")
-                        else:
-                            print(f"[PASS] {label}")
+        with audit.installed():
+            with app.test_client() as client:
+                for model in args.models:
+                    tests = tests_for_model(model)
+                    repeat = (
+                        args.kimi_repeat
+                        if model.casefold() == "kimi-k3"
+                        else args.repeat
+                    )
+                    for name, fn in tests:
+                        for iteration in range(repeat):
+                            label = f"{model}:{name}:run{iteration + 1:02d}"
+                            checkpoint = audit.checkpoint()
+                            try:
+                                fn(client, model, iteration)
+                                audit.assert_model_side_effects(model, checkpoint)
+                            except Exception as exc:
+                                failures.append((label, exc))
+                                print(f"[FAIL] {label}: {exc}")
+                            else:
+                                print(f"[PASS] {label}")
     finally:
         app.extensions["token_manager"].shutdown()
+
+    audit_summary = audit.summary()
+    print(
+        "[transport] "
+        f"chat_requests={audit_summary['chat_requests']} "
+        f"chat_group_id_checks={audit_summary['chat_requests']} "
+        f"history_lists={audit_summary['history_list_requests']} "
+        f"history_deletes={audit_summary['successful_history_deletes']}"
+    )
 
     if failures:
         print("\nFailures:")
@@ -261,6 +381,68 @@ def main():
             print(f"  - {label}: {exc}")
         return 1
     return 0
+
+
+def tests_for_model(model):
+    model_key = model.casefold()
+    tests = [
+        ("openai_text", test_openai_text),
+        ("openai_stream_text", test_openai_stream_text),
+        ("responses_text", test_responses_text),
+        ("responses_stream_text", test_responses_stream_text),
+        ("openai_tool_call", test_openai_tool_call),
+        ("openai_stream_tool_call", test_openai_stream_tool_call),
+        ("openai_tool_result_turn", test_openai_tool_result_turn),
+        ("responses_multiturn_tool_call", test_responses_multiturn_tool_call),
+        ("claude_text", test_claude_text),
+        ("claude_tool_use", test_claude_tool_use),
+        ("claude_stream_tool_use", test_claude_stream_tool_use),
+        ("claude_tool_result_turn", test_claude_tool_result_turn),
+    ]
+
+    if model_key == "kimi-k3":
+        tests.extend(
+            (
+                ("openai_vision", test_openai_vision),
+                ("responses_vision", test_responses_vision),
+                ("claude_vision", test_claude_vision),
+            )
+        )
+        return tests
+
+    tests.extend(
+        (
+            ("openai_bash_tool_call", test_openai_bash_tool_call),
+            (
+                "openai_stream_bash_tool_call",
+                test_openai_stream_bash_tool_call,
+            ),
+            ("openai_no_tool_needed", test_openai_no_tool_needed),
+            ("claude_bash_tool_use", test_claude_bash_tool_use),
+            ("claude_stream_bash_tool_use", test_claude_stream_bash_tool_use),
+        )
+    )
+    if model_key in VISION_MODELS:
+        tests.extend(
+            (
+                ("openai_vision", test_openai_vision),
+                ("responses_vision", test_responses_vision),
+                ("claude_vision", test_claude_vision),
+            )
+        )
+    else:
+        tests.append(("nonvisual_vision_rejection", test_nonvisual_vision_rejection))
+    if model_key in REASONING_STREAM_MODELS:
+        tests.extend(
+            (
+                ("openai_stream_reasoning", test_openai_stream_reasoning),
+                ("responses_stream_reasoning", test_responses_stream_reasoning),
+                ("claude_stream_reasoning", test_claude_stream_reasoning),
+            )
+        )
+    if model_key in DEEPSEEK_MODELS:
+        tests.append(("deepseek_thinking_modes", test_deepseek_thinking_modes))
+    return tests
 
 
 def test_openai_tool_call(client, model, iteration):
@@ -389,6 +571,7 @@ def test_openai_tool_result_turn(client, model, iteration):
         },
     )
     tool_call = first_openai_tool_call(first)
+    assistant_message = first["choices"][0]["message"]
     second = post_json(
         client,
         "/v1/chat/completions",
@@ -400,8 +583,8 @@ def test_openai_tool_result_turn(client, model, iteration):
                     "content": f"Use get_weather for {city}, run {iteration}.",
                 },
                 {
+                    **assistant_message,
                     "role": "assistant",
-                    "content": first["choices"][0]["message"].get("content"),
                     "tool_calls": [tool_call],
                 },
                 {
@@ -449,7 +632,7 @@ def test_openai_no_tool_needed(client, model, iteration):
 
 
 def test_openai_text(client, model, iteration):
-    marker = f"K3_OPENAI_TEXT_{iteration}"
+    marker = f"LIVE_OPENAI_TEXT_{model.replace('-', '_').upper()}_{iteration}"
     data = post_json(
         client,
         "/v1/chat/completions",
@@ -465,7 +648,7 @@ def test_openai_text(client, model, iteration):
 
 
 def test_openai_stream_text(client, model, iteration):
-    marker = f"K3_OPENAI_STREAM_{iteration}"
+    marker = f"LIVE_OPENAI_STREAM_{model.replace('-', '_').upper()}_{iteration}"
     events = post_stream(
         client,
         "/v1/chat/completions",
@@ -483,6 +666,44 @@ def test_openai_stream_text(client, model, iteration):
     )
 
     assert content.strip() == marker
+
+
+def test_responses_text(client, model, iteration):
+    marker = f"LIVE_RESPONSES_TEXT_{model.replace('-', '_').upper()}_{iteration}"
+    data = post_json(
+        client,
+        "/v1/responses",
+        {
+            "model": model,
+            "input": f"Reply with exactly {marker}",
+            "max_output_tokens": 128,
+        },
+    )
+
+    assert (data.get("output_text") or "").strip() == marker
+    assert (data.get("usage") or {}).get("input_tokens", 0) > 0
+
+
+def test_responses_stream_text(client, model, iteration):
+    marker = f"LIVE_RESPONSES_STREAM_{model.replace('-', '_').upper()}_{iteration}"
+    events = post_stream(
+        client,
+        "/v1/responses",
+        {
+            "model": model,
+            "input": f"Reply with exactly {marker}",
+            "stream": True,
+            "max_output_tokens": 128,
+        },
+    )
+    content = "".join(
+        str(event.get("delta") or "")
+        for event in events
+        if event.get("type") == "response.output_text.delta"
+    )
+
+    assert content.strip() == marker
+    completed_responses_stream(events)
 
 
 def test_openai_stream_reasoning(client, model, iteration):
@@ -582,6 +803,98 @@ def test_responses_stream_reasoning(client, model, iteration):
     )
 
 
+def test_claude_stream_reasoning(client, model, iteration):
+    events = post_claude_stream(
+        client,
+        "/v1/messages",
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        f"Claude reasoning stream run {iteration}: calculate "
+                        "127 * 389 and give the final number."
+                    ),
+                }
+            ],
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "output_config": {"effort": "high"},
+            "stream": True,
+            "max_tokens": 512,
+        },
+    )
+    thinking_deltas = [
+        event
+        for event in events
+        if event["event"] == "content_block_delta"
+        and event["data"].get("delta", {}).get("type") == "thinking_delta"
+        and event["data"]["delta"].get("thinking")
+    ]
+    text_deltas = [
+        event
+        for event in events
+        if event["event"] == "content_block_delta"
+        and event["data"].get("delta", {}).get("type") == "text_delta"
+        and event["data"]["delta"].get("text")
+    ]
+    assert thinking_deltas, (
+        "Claude stream did not contain thinking_delta: "
+        + json.dumps(events, ensure_ascii=False)[:800]
+    )
+    assert text_deltas, (
+        "Claude stream did not contain final text_delta: "
+        + json.dumps(events, ensure_ascii=False)[:800]
+    )
+    assert events.index(thinking_deltas[0]) < events.index(text_deltas[-1])
+
+
+def test_deepseek_thinking_modes(client, model, iteration):
+    audit = client.application.extensions["live_transport_audit"]
+    cases = (
+        ("none", False, False),
+        ("high", True, False),
+        ("max", True, True),
+    )
+    for effort, expected_thinking, expected_max_prefix in cases:
+        checkpoint = audit.checkpoint()
+        data = post_json(
+            client,
+            "/v1/chat/completions",
+            {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Thinking mode {effort}, run {iteration}: "
+                            "reply briefly with the number 7."
+                        ),
+                    }
+                ],
+                "reasoning": {"effort": effort},
+                "max_tokens": 512,
+            },
+        )
+        assert (data["choices"][0]["message"].get("content") or "").strip()
+
+        observations = audit.chat_requests_since(checkpoint)
+        assert observations, f"no upstream request observed for effort={effort}"
+        assert all(
+            observation["model"].casefold() == model.casefold()
+            for observation in observations
+        )
+        assert all(
+            observation["thinking_present"]
+            and observation["thinking"] is expected_thinking
+            for observation in observations
+        ), f"unexpected upstream thinking switch for effort={effort}: {observations}"
+        assert all(
+            observation["has_max_prefix"] is expected_max_prefix
+            for observation in observations
+        ), f"unexpected max-effort prefix for effort={effort}: {observations}"
+
+
 def test_openai_vision(client, model, iteration):
     image_url = red_image_url()
     data = post_json(
@@ -652,8 +965,93 @@ def test_responses_vision(client, model, iteration):
     assert (data.get("usage") or {}).get("output_tokens", 0) > 0
 
 
+def test_nonvisual_vision_rejection(client, model, iteration):
+    audit = client.application.extensions["live_transport_audit"]
+    checkpoint = audit.checkpoint()
+    image_url = red_image_url()
+    requests = (
+        (
+            "/v1/chat/completions",
+            {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"Vision reject {iteration}."},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_url},
+                            },
+                        ],
+                    }
+                ],
+            },
+        ),
+        (
+            "/v1/responses",
+            {
+                "model": model,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": f"Responses vision reject {iteration}.",
+                            },
+                            {"type": "input_image", "image_url": image_url},
+                        ],
+                    }
+                ],
+            },
+        ),
+        (
+            "/v1/messages",
+            {
+                "model": model,
+                "max_tokens": 128,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Claude vision reject {iteration}.",
+                            },
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": image_url.partition(",")[2],
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+        ),
+    )
+
+    for path, payload in requests:
+        response = client.post(path, json=payload)
+        assert response.status_code == 400, (
+            f"{path} accepted image input for non-visual model {model}: "
+            f"HTTP {response.status_code}"
+        )
+        body = response.get_json()
+        assert "unsupported_content_type" in json.dumps(body, ensure_ascii=False), (
+            f"{path} returned the wrong image error: {body}"
+        )
+
+    assert audit.chat_requests_since(checkpoint) == [], (
+        "non-visual image rejection reached the upstream chat endpoint"
+    )
+
+
 def test_responses_multiturn_tool_call(client, model, iteration):
-    marker = f"K3_MULTITURN_DONE_{iteration}"
+    marker = f"LIVE_MULTITURN_DONE_{model.replace('-', '_').upper()}_{iteration}"
     history = []
     for index in range(8):
         history.extend(
@@ -722,10 +1120,14 @@ def test_responses_multiturn_tool_call(client, model, iteration):
     ), json.dumps(first_events, ensure_ascii=False)[:800]
     first_call = first_responses_function_call(first)
     assert first_call["name"] == "get_stage_one"
+    first_output = first.get("output") or []
+    assert any(item.get("type") == "reasoning" for item in first_output), (
+        json.dumps(first, ensure_ascii=False)[:800]
+    )
 
     second_input = [
         *initial_input,
-        first_call,
+        *first_output,
         {
             "type": "function_call_output",
             "call_id": first_call["call_id"],
@@ -753,6 +1155,10 @@ def test_responses_multiturn_tool_call(client, model, iteration):
     assert json.loads(second_call["arguments"]).get("value") == "beta", json.dumps(
         second, ensure_ascii=False
     )[:800]
+    second_output = second.get("output") or []
+    assert any(item.get("type") == "reasoning" for item in second_output), (
+        json.dumps(second, ensure_ascii=False)[:800]
+    )
 
     third = post_json(
         client,
@@ -761,7 +1167,7 @@ def test_responses_multiturn_tool_call(client, model, iteration):
             **common,
             "input": [
                 *second_input,
-                second_call,
+                *second_output,
                 {
                     "type": "function_call_output",
                     "call_id": second_call["call_id"],
@@ -829,7 +1235,7 @@ def test_claude_vision(client, model, iteration):
 
 
 def test_claude_text(client, model, iteration):
-    marker = f"K3_CLAUDE_TEXT_{iteration}"
+    marker = f"LIVE_CLAUDE_TEXT_{model.replace('-', '_').upper()}_{iteration}"
     data = post_json(
         client,
         "/v1/messages",
@@ -947,7 +1353,7 @@ def test_claude_tool_result_turn(client, model, iteration):
             "max_tokens": 1024,
             "messages": [
                 {"role": "user", "content": f"Use get_weather for {city}."},
-                {"role": "assistant", "content": [tool_use]},
+                {"role": "assistant", "content": first["content"]},
                 {
                     "role": "user",
                     "content": [
