@@ -24,8 +24,6 @@ class ResponsesRequestContext:
 
 def convert_responses_to_openai_request(
     req_data: dict | None,
-    *,
-    keep_tools_after_output: bool = False,
 ) -> ResponsesRequestContext:
     if not isinstance(req_data, dict):
         raise ProxyError("Request body must be a JSON object")
@@ -41,12 +39,6 @@ def convert_responses_to_openai_request(
     openai_tools, tool_map = _convert_responses_tools(request_tools)
     model = req_data.get("model", "GPT-4.1")
     tool_choice = req_data.get("tool_choice")
-    if (
-        tool_choice is None
-        and _input_has_tool_output(input_items)
-        and not keep_tools_after_output
-    ):
-        tool_choice = "none"
 
     messages = []
     instructions = req_data.get("instructions")
@@ -510,15 +502,6 @@ def _additional_tools_from_input(input_items: list) -> list:
                 raise ProxyError("'additional_tools.tools' must be a list of objects")
             tools.extend(additional_tools)
     return tools
-
-
-def _input_has_tool_output(input_items: list) -> bool:
-    return any(
-        isinstance(item, dict)
-        and item.get("type")
-        in {"function_call_output", "custom_tool_call_output", "tool_search_output"}
-        for item in input_items
-    )
 
 
 def _convert_response_input_items(

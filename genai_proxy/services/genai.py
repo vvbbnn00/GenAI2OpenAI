@@ -344,12 +344,7 @@ class GenAIService:
             raise ProxyError("Request body must be a JSON object")
         requested_model = req_data.get("model", "GPT-4.1")
         model_context = self.resolve_model_context(requested_model)
-        context = convert_responses_to_openai_request(
-            req_data,
-            keep_tools_after_output=(
-                model_context.tool_adapter == KIMI_K3_ADAPTER
-            ),
-        )
+        context = convert_responses_to_openai_request(req_data)
         return context, model_context
 
     def build_response(self, req_data):

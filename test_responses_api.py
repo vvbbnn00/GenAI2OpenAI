@@ -898,6 +898,39 @@ def test_responses_function_call_output_turn_returns_final_message():
     )
 
 
+@pytest.mark.parametrize(
+    "model",
+    ("chatglm", "deepseek-chat", "deepseek-pro", "qwen-instruct", "kimi-k3"),
+)
+def test_responses_tool_output_keeps_tools_available_unless_explicitly_disabled(
+    model,
+):
+    request = {
+        "model": model,
+        "input": [
+            {
+                "type": "function_call",
+                "name": "get_weather",
+                "arguments": '{"location":"Shanghai"}',
+                "call_id": "call_weather",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_weather",
+                "output": "Continue the current task.",
+            },
+        ],
+        "tools": [RESPONSES_WEATHER_TOOL],
+    }
+
+    context = convert_responses_to_openai_request(request)
+    assert context.openai_request["tool_choice"] == "auto"
+
+    request["tool_choice"] = "none"
+    disabled = convert_responses_to_openai_request(request)
+    assert disabled.openai_request["tool_choice"] == "none"
+
+
 def test_responses_kimi_function_output_keeps_tools_available_by_default():
     request = {
         "model": "kimi-k3",
@@ -922,10 +955,7 @@ def test_responses_kimi_function_output_keeps_tools_available_by_default():
         "tools": [RESPONSES_WEATHER_TOOL],
     }
 
-    context = convert_responses_to_openai_request(
-        request,
-        keep_tools_after_output=True,
-    )
+    context = convert_responses_to_openai_request(request)
 
     assert context.openai_request["tool_choice"] == "auto"
     service, _captured, _fake_post = make_service([])
@@ -950,10 +980,7 @@ def test_responses_kimi_function_output_keeps_tools_available_by_default():
     )
 
     request["tool_choice"] = "none"
-    explicit_none = convert_responses_to_openai_request(
-        request,
-        keep_tools_after_output=True,
-    )
+    explicit_none = convert_responses_to_openai_request(request)
     assert explicit_none.openai_request["tool_choice"] == "none"
 
 
