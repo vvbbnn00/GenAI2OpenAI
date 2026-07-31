@@ -12,7 +12,7 @@ from genai_proxy.chat.tool_calls import (
 )
 from genai_proxy.chat.types import PreparedChatRequest
 from genai_proxy.errors import ProxyError
-from genai_proxy.models import KIMI_K3_ADAPTER
+from genai_proxy.models import DEEPSEEK_V4_ADAPTERS, KIMI_K3_ADAPTER
 from genai_proxy.retry import (
     is_retryable_business_error,
     is_retryable_status,
@@ -22,6 +22,7 @@ from genai_proxy.upstream import transport as upstream_transport
 from genai_proxy.upstream.auth import is_genai_auth_failure
 
 GENAI_TIMEOUT_MAX_RETRIES = 1
+GENAI_DEEPSEEK_TIMEOUT_MAX_RETRIES = 2
 
 
 class _ThinkTagDeltaParser:
@@ -280,6 +281,12 @@ class ChatStreamingMixin:
         auth_retry_used = False
         network_retry_count = 0
         sent_any_chunk = False
+        if prepared.tool_adapter in DEEPSEEK_V4_ADAPTERS:
+            stream_timeout = upstream_transport.GENAI_DEEPSEEK_STREAM_TIMEOUT
+            timeout_max_retries = GENAI_DEEPSEEK_TIMEOUT_MAX_RETRIES
+        else:
+            stream_timeout = upstream_transport.GENAI_STREAM_TIMEOUT
+            timeout_max_retries = GENAI_TIMEOUT_MAX_RETRIES
         while True:
             response = None
             retry_after_refresh = False
@@ -292,7 +299,11 @@ class ChatStreamingMixin:
             think_tag_parser = _ThinkTagDeltaParser()
             request_token = self._token_manager.token
             try:
-                response = upstream_transport.post_chat(request_token, genai_data)
+                response = upstream_transport.post_chat(
+                    request_token,
+                    genai_data,
+                    timeout=stream_timeout,
+                )
                 self._logger.debug("GenAI Response Status: %d", response.status_code)
 
                 if response.status_code != 200:
@@ -544,15 +555,17 @@ class ChatStreamingMixin:
                 return
             except (requests.RequestException, OSError, EOFError) as exc:
                 self._logger.warning("GenAI chat request failed: %s", exc)
+                if isinstance(exc, requests.ReadTimeout):
+                    retry_limit = timeout_max_retries
+                elif isinstance(exc, requests.Timeout):
+                    retry_limit = GENAI_TIMEOUT_MAX_RETRIES
+                else:
+                    retry_limit = None
                 if self._schedule_chat_retry(
                     network_retry_count,
                     str(exc),
                     sent_any_chunk=sent_any_chunk,
-                    max_retries=(
-                        GENAI_TIMEOUT_MAX_RETRIES
-                        if isinstance(exc, requests.Timeout)
-                        else None
-                    ),
+                    max_retries=retry_limit,
                 ):
                     network_retry_count += 1
                     continue
@@ -667,4 +680,8 @@ def _has_successful_finish_reason(payload) -> bool:
     return False
 
 
-__all__ = ["ChatStreamingMixin", "GENAI_TIMEOUT_MAX_RETRIES"]
+__all__ = [
+    "ChatStreamingMixin",
+    "GENAI_DEEPSEEK_TIMEOUT_MAX_RETRIES",
+    "GENAI_TIMEOUT_MAX_RETRIES",
+]

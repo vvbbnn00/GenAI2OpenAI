@@ -12,7 +12,10 @@ from flask import Flask
 
 from genai_proxy.api.openai.routes import bp as openai_bp
 from genai_proxy.api.openai.service import GenAIService
-from genai_proxy.chat.streaming import GENAI_TIMEOUT_MAX_RETRIES
+from genai_proxy.chat.streaming import (
+    GENAI_DEEPSEEK_TIMEOUT_MAX_RETRIES,
+    GENAI_TIMEOUT_MAX_RETRIES,
+)
 from genai_proxy.config import parse_args
 from genai_proxy.errors import ProxyError
 from genai_proxy.retry import (
@@ -21,7 +24,10 @@ from genai_proxy.retry import (
     retry_delay,
 )
 from genai_proxy.upstream.catalog import ModelManager
-from genai_proxy.upstream.transport import GENAI_STREAM_TIMEOUT
+from genai_proxy.upstream.transport import (
+    GENAI_DEEPSEEK_STREAM_TIMEOUT,
+    GENAI_STREAM_TIMEOUT,
+)
 
 
 class FakeTokenManager:
@@ -73,9 +79,9 @@ def make_service(max_retries=3):
     )
 
 
-def make_request():
+def make_request(model="chatglm"):
     return {
-        "model": "chatglm",
+        "model": model,
         "messages": [{"role": "user", "content": "hello"}],
         "stream": True,
     }
@@ -169,6 +175,130 @@ class GenAIRetryTests(unittest.TestCase):
         self.assertEqual(
             raised.exception.message,
             "Upstream stream timed out or stalled",
+        )
+
+    def test_deepseek_stall_retries_recover_on_the_third_attempt(self):
+        for model in ("deepseek-chat", "deepseek-pro"):
+            with self.subTest(model=model):
+                service = make_service(max_retries=10)
+                success = FakeResponse(completion_lines())
+
+                with patch(
+                    "genai_proxy.upstream.transport.requests.post",
+                    side_effect=[
+                        requests.ReadTimeout("first stall"),
+                        requests.ReadTimeout("second stall"),
+                        success,
+                    ],
+                ) as post:
+                    chunks = list(
+                        service.stream_openai_completion(make_request(model))
+                    )
+
+                self.assertEqual(GENAI_DEEPSEEK_STREAM_TIMEOUT, (10, 60))
+                self.assertEqual(GENAI_DEEPSEEK_TIMEOUT_MAX_RETRIES, 2)
+                self.assertEqual(post.call_count, 3)
+                self.assertTrue(success.closed)
+                self.assertTrue(any('"content": "ok"' in chunk for chunk in chunks))
+                self.assertTrue(
+                    all(
+                        call.kwargs["timeout"] == GENAI_DEEPSEEK_STREAM_TIMEOUT
+                        for call in post.call_args_list
+                    )
+                )
+                self.assertTrue(
+                    all(
+                        "chatGroupId" not in call.kwargs["json"]
+                        for call in post.call_args_list
+                    )
+                )
+
+    def test_deepseek_stall_retry_budget_is_still_bounded(self):
+        service = make_service(max_retries=10)
+
+        with patch(
+            "genai_proxy.upstream.transport.requests.post",
+            side_effect=requests.ReadTimeout("upstream stalled"),
+        ) as post:
+            with self.assertRaises(ProxyError) as raised:
+                list(
+                    service.stream_openai_completion(
+                        make_request("deepseek-chat")
+                    )
+                )
+
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(
+            raised.exception.message,
+            "Upstream stream timed out or stalled",
+        )
+
+    def test_deepseek_connect_timeout_keeps_the_default_retry_budget(self):
+        service = make_service(max_retries=10)
+
+        with patch(
+            "genai_proxy.upstream.transport.requests.post",
+            side_effect=requests.ConnectTimeout("connect timed out"),
+        ) as post:
+            with self.assertRaises(ProxyError):
+                list(
+                    service.stream_openai_completion(
+                        make_request("deepseek-chat")
+                    )
+                )
+
+        self.assertEqual(post.call_count, 2)
+        self.assertTrue(
+            all(
+                call.kwargs["timeout"] == GENAI_DEEPSEEK_STREAM_TIMEOUT
+                for call in post.call_args_list
+            )
+        )
+
+    def test_kimi_keeps_the_default_stall_budget(self):
+        service = make_service(max_retries=10)
+
+        with patch(
+            "genai_proxy.upstream.transport.requests.post",
+            side_effect=requests.ReadTimeout("upstream stalled"),
+        ) as post:
+            with self.assertRaises(ProxyError):
+                list(service.stream_openai_completion(make_request("kimi-k3")))
+
+        self.assertEqual(post.call_count, 2)
+        self.assertTrue(
+            all(
+                call.kwargs["timeout"] == GENAI_STREAM_TIMEOUT
+                for call in post.call_args_list
+            )
+        )
+
+    def test_deepseek_does_not_retry_a_timeout_after_client_output(self):
+        service = make_service(max_retries=10)
+
+        class InterruptedResponse(FakeResponse):
+            def iter_lines(self, *args, **kwargs):
+                yield completion_lines("partial")[0]
+                raise requests.ReadTimeout("upstream stalled")
+
+        response = InterruptedResponse()
+        with patch(
+            "genai_proxy.upstream.transport.requests.post",
+            return_value=response,
+        ) as post:
+            chunks = list(
+                service.stream_openai_completion(make_request("deepseek-pro"))
+            )
+
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(
+            post.call_args.kwargs["timeout"],
+            GENAI_DEEPSEEK_STREAM_TIMEOUT,
+        )
+        self.assertTrue(response.closed)
+        self.assertTrue(any('"content": "partial"' in chunk for chunk in chunks))
+        self.assertTrue(
+            any("Upstream stream timed out or stalled" in chunk for chunk in chunks)
         )
 
     def test_retries_retryable_http_status_before_stream_starts(self):

@@ -40,6 +40,34 @@ def test_chat_transport_preserves_payload_and_stream_contract():
     assert "chatGroupId" not in post.call_args.kwargs["json"]
 
 
+def test_chat_transport_accepts_an_explicit_model_timeout():
+    payload = {
+        "chatInfo": "hello",
+        "messages": [],
+        "stream": True,
+    }
+    response = object()
+
+    with patch.object(transport.requests, "post", return_value=response) as post:
+        assert (
+            transport.post_chat(
+                "token",
+                payload,
+                timeout=transport.GENAI_DEEPSEEK_STREAM_TIMEOUT,
+            )
+            is response
+        )
+
+    post.assert_called_once_with(
+        transport.GENAI_URL,
+        headers=transport.genai_headers("token"),
+        json=payload,
+        stream=True,
+        timeout=transport.GENAI_DEEPSEEK_STREAM_TIMEOUT,
+    )
+    assert "chatGroupId" not in post.call_args.kwargs["json"]
+
+
 def test_user_and_history_transports_keep_exact_query_contracts():
     responses = [object(), object(), object(), object()]
     with (

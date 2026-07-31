@@ -15,6 +15,7 @@ GENAI_HISTORY_DELETE_URL = (
     "https://genai.shanghaitech.edu.cn/htk/ai/history/delete/groupId"
 )
 GENAI_STREAM_TIMEOUT = (10, 90)
+GENAI_DEEPSEEK_STREAM_TIMEOUT = (10, 60)
 GENAI_HISTORY_TIMEOUT = (5, 15)
 
 GENAI_BASE_HEADERS = {
@@ -50,13 +51,18 @@ def user_headers(token: str) -> dict[str, str]:
     }
 
 
-def post_chat(token: str | None, payload: dict):
+def post_chat(
+    token: str | None,
+    payload: dict,
+    *,
+    timeout=GENAI_STREAM_TIMEOUT,
+):
     return requests.post(
         GENAI_URL,
         headers=genai_headers(token),
         json=payload,
         stream=True,
-        timeout=GENAI_STREAM_TIMEOUT,
+        timeout=timeout,
     )
 
 
@@ -145,6 +151,7 @@ __all__ = [
     "GENAI_HISTORY_DELETE_URL",
     "GENAI_HISTORY_LIST_URL",
     "GENAI_HISTORY_TIMEOUT",
+    "GENAI_DEEPSEEK_STREAM_TIMEOUT",
     "GENAI_STREAM_TIMEOUT",
     "GENAI_URL",
     "GENAI_USER_INFO_URL",
