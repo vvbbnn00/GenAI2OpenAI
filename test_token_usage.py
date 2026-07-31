@@ -2358,9 +2358,7 @@ def test_kimi_rejects_invalid_history_content_shape():
     )
 
     assert response.status_code == 400
-    assert (
-        "supports only text and image parts" in response.get_json()["error"]["message"]
-    )
+    assert response.get_json()["error"]["code"] == "unsupported_content_type"
 
 
 def test_openai_responses_input_tokens_route_uses_official_qwen_template():

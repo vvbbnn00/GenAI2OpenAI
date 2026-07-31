@@ -38,6 +38,7 @@ from genai_proxy.compat.responses import (
     response_reasoning_text_done,
 )
 from genai_proxy.errors import ProxyError
+from genai_proxy.messages import normalize_message_contents
 from genai_proxy.optimizations import (
     DEEPSEEK_V4_ADAPTERS,
     GLM_5_2_ADAPTER,
@@ -781,6 +782,7 @@ class GenAIService:
         tool_choice = req_data.get("tool_choice")
         model_record = self._model_manager.get_model_record(model)
         tool_adapter = select_tool_adapter(model, model_record)
+        messages = normalize_message_contents(messages, adapter=tool_adapter)
         messages = _normalize_messages_for_model_template(
             messages,
             model,
