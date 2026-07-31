@@ -8,6 +8,7 @@ from genai_proxy.config import (
 )
 from genai_proxy.logging_utils import setup_logging
 from genai_proxy.retry import DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BACKOFF
+from genai_proxy.version import format_program_version, get_program_version
 
 
 def _int_env(name: str, default: int) -> int:
@@ -48,6 +49,7 @@ def _config_from_env() -> AppConfig:
 
 
 def _log_startup(config: AppConfig, logger) -> None:
+    logger.info("Program version: %s", format_program_version(get_program_version()))
     if config.api_key:
         logger.info("API key authentication enabled")
     else:
