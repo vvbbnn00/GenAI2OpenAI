@@ -363,7 +363,11 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
                 try:
                     chunk = json.loads(chunk_data)
                 except json.JSONDecodeError as exc:
-                    logger.warning("Failed to parse OpenAI chunk: %s", exc)
+                    logger.warning(
+                        "Failed to parse OpenAI chunk (%s, %d chars)",
+                        type(exc).__name__,
+                        len(chunk_data),
+                    )
                     continue
 
                 choices = chunk.get("choices", [])
@@ -461,7 +465,10 @@ def stream_openai_to_claude(openai_stream, original_request, logger):
                     }.get(finish_reason, STOP_END_TURN)
 
     except Exception as exc:
-        logger.exception("Claude streaming conversion failed")
+        logger.error(
+            "Claude streaming conversion failed (%s)",
+            type(exc).__name__,
+        )
         yield _claude_event(
             "error",
             {

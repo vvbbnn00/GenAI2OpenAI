@@ -24,8 +24,8 @@ from genai_proxy.upstream.auth import (
 from genai_proxy.upstream.catalog import ModelManager
 
 
-def make_jwt(exp: int | None = None) -> str:
-    payload = {"username": "2025233184", "exp": exp or int(time.time()) + 3600}
+def make_jwt(exp: int | None = None, username: str = "test-user") -> str:
+    payload = {"username": username, "exp": exp or int(time.time()) + 3600}
     return ".".join(
         [
             _b64({"typ": "JWT", "alg": "HS256"}),
@@ -842,7 +842,7 @@ class AuthRefreshTests(unittest.TestCase):
             )
 
             with (
-                patch.object(manager._logger, "exception"),
+                patch.object(manager._logger, "error"),
                 self.assertRaises(Exception),
             ):
                 manager._refresh_token(force=True)

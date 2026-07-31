@@ -1,6 +1,7 @@
 """Incremental upstream stream parsing, retries, and Kimi cleanup ordering."""
 
 import json
+import logging
 
 import requests
 
@@ -12,6 +13,7 @@ from genai_proxy.chat.tool_calls import (
 )
 from genai_proxy.chat.types import PreparedChatRequest
 from genai_proxy.errors import ProxyError
+from genai_proxy.logging_utils import safe_log_code
 from genai_proxy.models import DEEPSEEK_V4_ADAPTERS, KIMI_K3_ADAPTER
 from genai_proxy.retry import (
     is_retryable_business_error,
@@ -179,7 +181,10 @@ class ChatStreamingMixin:
                 try:
                     upstream.close()
                 except Exception as exc:
-                    self._logger.debug("Failed to close Kimi K3 stream: %s", exc)
+                    self._logger.debug(
+                        "Failed to close Kimi K3 stream (%s)",
+                        type(exc).__name__,
+                    )
             self._release_kimi_history_lock(lock_key, history_lock)
 
     def _stream_genai_response_raw(
@@ -259,24 +264,27 @@ class ChatStreamingMixin:
         if prepared.root_model_name:
             genai_data["rootModelName"] = prepared.root_model_name
 
-        self._logger.debug("=== GenAI Request ===")
-        self._logger.debug(
-            "Model: %s, rootAiType: %s, rootModelName: %s, tool_prompt: %s",
-            prepared.model,
-            root_ai_type,
-            prepared.root_model_name,
-            prepared.has_tools,
-        )
-        self._logger.debug("Messages count: %d", len(transport_messages))
-        for index, message in enumerate(transport_messages):
-            role = message.get("role", "?")
-            content = message.get("content", "")
-            preview = (
-                json.dumps(content, ensure_ascii=False)[:200] + "..."
-                if not isinstance(content, str)
-                else (content[:200] + "..." if len(content) > 200 else content)
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug("=== GenAI Request ===")
+            self._logger.debug(
+                "Model: %s, rootAiType: %s, rootModelName: %s, tool_prompt: %s",
+                prepared.model,
+                root_ai_type,
+                prepared.root_model_name,
+                prepared.has_tools,
             )
-            self._logger.debug("  [%d] role=%s, content=%s", index, role, preview)
+            self._logger.debug("Messages count: %d", len(transport_messages))
+            for index, message in enumerate(transport_messages):
+                role = message.get("role", "?")
+                content = message.get("content", "")
+                content_kind, content_size = _content_log_shape(content)
+                self._logger.debug(
+                    "  [%d] role=%s, content_kind=%s, content_size=%d",
+                    index,
+                    role,
+                    content_kind,
+                    content_size,
+                )
 
         auth_retry_used = False
         network_retry_count = 0
@@ -308,9 +316,8 @@ class ChatStreamingMixin:
 
                 if response.status_code != 200:
                     self._logger.warning(
-                        "GenAI API error %d: %s",
+                        "GenAI API error %d",
                         response.status_code,
-                        response.text[:500],
                     )
                     if is_retryable_status(
                         response.status_code
@@ -360,9 +367,9 @@ class ChatStreamingMixin:
                         break
 
                     if is_genai_auth_failure(genai_json):
-                        err_msg = genai_json.get("message", "Unknown upstream error")
                         self._logger.warning(
-                            "GenAI authentication business error: %s", err_msg
+                            "GenAI authentication business error (code=%s)",
+                            safe_log_code(genai_json.get("code")),
                         )
                         if (
                             not sent_any_chunk
@@ -383,7 +390,11 @@ class ChatStreamingMixin:
                     structured_error = _structured_upstream_error(genai_json)
                     if structured_error is not None:
                         err_msg, error_type, error_code, error_status = structured_error
-                        self._logger.warning("GenAI structured error: %s", err_msg)
+                        self._logger.warning(
+                            "GenAI structured error (status=%d, code=%s)",
+                            error_status,
+                            safe_log_code(error_code),
+                        )
                         yield error_chunk_or_raise(
                             sent_any_chunk,
                             err_msg,
@@ -404,15 +415,14 @@ class ChatStreamingMixin:
                         )
                         err_code = genai_json.get("code", 500)
                         self._logger.warning(
-                            "GenAI business error (code=%s): %s",
-                            err_code,
-                            err_msg,
+                            "GenAI business error (code=%s)",
+                            safe_log_code(err_code),
                         )
                         if is_retryable_business_error(
                             err_code, err_msg
                         ) and self._schedule_chat_retry(
                             network_retry_count,
-                            f"stream business error {err_code}: {err_msg}",
+                            f"stream business error {safe_log_code(err_code)}",
                             sent_any_chunk=sent_any_chunk,
                         ):
                             network_retry_count += 1
@@ -554,7 +564,11 @@ class ChatStreamingMixin:
                     yield from attempt_chunks
                 return
             except (requests.RequestException, OSError, EOFError) as exc:
-                self._logger.warning("GenAI chat request failed: %s", exc)
+                exception_name = type(exc).__name__
+                self._logger.warning(
+                    "GenAI chat request failed (%s)",
+                    exception_name,
+                )
                 if isinstance(exc, requests.ReadTimeout):
                     retry_limit = timeout_max_retries
                 elif isinstance(exc, requests.Timeout):
@@ -563,7 +577,7 @@ class ChatStreamingMixin:
                     retry_limit = None
                 if self._schedule_chat_retry(
                     network_retry_count,
-                    str(exc),
+                    exception_name,
                     sent_any_chunk=sent_any_chunk,
                     max_retries=retry_limit,
                 ):
@@ -582,7 +596,10 @@ class ChatStreamingMixin:
             except ProxyError:
                 raise
             except Exception as exc:
-                self._logger.exception("Error in _stream_genai_response")
+                self._logger.error(
+                    "Error in _stream_genai_response (%s)",
+                    type(exc).__name__,
+                )
                 if not sent_any_chunk:
                     raise
                 yield make_error_chunk(str(exc))
@@ -592,7 +609,10 @@ class ChatStreamingMixin:
                     try:
                         response.close()
                     except Exception as exc:
-                        self._logger.debug("Failed to close GenAI response: %s", exc)
+                        self._logger.debug(
+                            "Failed to close GenAI response (%s)",
+                            type(exc).__name__,
+                        )
 
     def _schedule_chat_retry(
         self,
@@ -619,6 +639,7 @@ class ChatStreamingMixin:
             reason=reason,
         )
 
+
 def _upstream_auth_error() -> ProxyError:
     return ProxyError(
         "Upstream GenAI token is invalid or expired",
@@ -626,6 +647,16 @@ def _upstream_auth_error() -> ProxyError:
         code="upstream_auth_failed",
         status=502,
     )
+
+
+def _content_log_shape(content) -> tuple[str, int]:
+    if isinstance(content, str):
+        return "text", len(content)
+    if isinstance(content, list):
+        return "parts", len(content)
+    if content is None:
+        return "none", 0
+    return "other", 0
 
 
 def _structured_upstream_error(payload):

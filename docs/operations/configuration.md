@@ -26,7 +26,7 @@ CLI 的 `--api-key` 或环境变量 `API_KEY` 用于保护代理。Docker Compos
 | CLI | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `--port` | `APP_PORT` | `5000` | 监听端口 |
-| `--debug` | `APP_DEBUG=1` | 关闭 | 详细日志，不启用 Flask reloader |
+| `--debug` | `APP_DEBUG=1` | 关闭 | 增加结构和长度等诊断元数据，不记录请求正文，也不启用 Flask reloader |
 | `--genai-max-retries` | `GENAI_MAX_RETRIES` | `10` | 临时上游错误最大重试次数 |
 | `--genai-retry-backoff` | `GENAI_RETRY_BACKOFF` | `0.5` | 首次退避秒数，翻倍后最高 5 秒 |
 | `--genai-model-cache` | `GENAI_MODEL_CACHE` | `~/.cache/genai2openai/models.json` | 持久模型目录缓存 |

@@ -63,7 +63,7 @@ def log_startup(config: AppConfig, logger) -> None:
         "passkey auto-refresh" if config.keystore else "static token (no auto-refresh)",
     )
     if config.keystore:
-        logger.info("Keystore: %s", config.keystore)
+        logger.info("Keystore: configured")
         if config.token_check_interval:
             logger.info(
                 "Token maintenance interval: %d seconds",
@@ -84,7 +84,7 @@ def log_startup(config: AppConfig, logger) -> None:
     )
     logger.info(
         "GenAI model cache: %s",
-        config.genai_model_cache or "memory only",
+        "persistent" if config.genai_model_cache else "memory only",
     )
 
 

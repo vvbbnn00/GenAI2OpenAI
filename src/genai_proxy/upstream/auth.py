@@ -115,11 +115,11 @@ class TokenManager:
                     exp_dt.strftime("%Y-%m-%d %H:%M:%S"),
                     remaining / 60,
                 )
-            username = payload.get("username")
-            if username:
-                self._logger.info("Token username: %s", username)
         except Exception as exc:
-            self._logger.warning("Failed to parse JWT token: %s", exc)
+            self._logger.warning(
+                "Failed to parse JWT token (%s)",
+                type(exc).__name__,
+            )
             self._token_exp = None
 
     def _needs_refresh(self) -> bool:
@@ -158,7 +158,10 @@ class TokenManager:
         except FileNotFoundError:
             return False
         except Exception as exc:
-            self._logger.warning("Failed to read token cache %s: %s", self._token_cache_path, exc)
+            self._logger.warning(
+                "Failed to read GenAI token cache (%s)",
+                type(exc).__name__,
+            )
             return False
 
         cached_token = payload.get("token")
@@ -180,7 +183,7 @@ class TokenManager:
 
         self._token = cached_token
         self._update_expiry()
-        self._logger.info("Loaded GenAI token from cache: %s", self._token_cache_path)
+        self._logger.info("Loaded GenAI token from cache")
         return True
 
     def _write_cached_token(self) -> None:
@@ -201,7 +204,10 @@ class TokenManager:
                 json.dump(payload, cache_file)
             os.replace(temp_path, self._token_cache_path)
         except Exception as exc:
-            self._logger.warning("Failed to update token cache %s: %s", self._token_cache_path, exc)
+            self._logger.warning(
+                "Failed to update GenAI token cache (%s)",
+                type(exc).__name__,
+            )
 
     def update_token_from_upstream(self, token: str | None, reason: str) -> bool:
         if not token:
@@ -245,7 +251,10 @@ class TokenManager:
         except FileNotFoundError:
             return
         except Exception as exc:
-            self._logger.warning("Failed to delete token cache %s: %s", self._token_cache_path, exc)
+            self._logger.warning(
+                "Failed to delete GenAI token cache (%s)",
+                type(exc).__name__,
+            )
 
     def _refresh_token(self, force: bool = False, rejected_token: str | None = None) -> None:
         if not self._keystore_path:
@@ -277,7 +286,7 @@ class TokenManager:
             keystore = self._keystore
             client.login()
             self._used_ids = True
-            self._logger.info("IDS passkey login successful for user: %s", keystore.username)
+            self._logger.info("IDS passkey login successful")
 
             login_response = self._get_genai_login_response(client)
             params = parse_qs(urlparse(login_response.url).query)
@@ -311,8 +320,11 @@ class TokenManager:
                 "pip install shanghaitech-ids-passkey"
             )
             raise
-        except Exception:
-            self._logger.exception("Failed to refresh token via passkey")
+        except Exception as exc:
+            self._logger.error(
+                "Failed to refresh token via passkey (%s)",
+                type(exc).__name__,
+            )
             raise
         finally:
             self._release_process_refresh_lock(lock_fd)
@@ -327,10 +339,7 @@ class TokenManager:
             parsed = urlparse(response.url)
             params = parse_qs(parsed.query)
             self._logger.debug(
-                "GenAI login flow ended at %s://%s%s with query keys: %s",
-                parsed.scheme,
-                parsed.netloc,
-                parsed.path,
+                "GenAI login flow returned query keys: %s",
                 sorted(params),
             )
             if params.get("token"):
@@ -359,8 +368,11 @@ class TokenManager:
         while not self._stop_event.is_set():
             try:
                 self._confirm_token_for_background()
-            except Exception:
-                self._logger.exception("Periodic GenAI token maintenance failed")
+            except Exception as exc:
+                self._logger.error(
+                    "Periodic GenAI token maintenance failed (%s)",
+                    type(exc).__name__,
+                )
 
             if self._stop_event.wait(self._token_check_interval):
                 break
@@ -399,9 +411,12 @@ class TokenManager:
             self._logger.warning("GenAI token was rejected by upstream (%s); refreshing", reason)
             try:
                 self._refresh_token(force=True, rejected_token=rejected_token)
-            except Exception:
+            except Exception as exc:
                 self._last_refresh_failure_at = time.time()
-                self._logger.exception("Failed to refresh GenAI token after upstream rejection")
+                self._logger.error(
+                    "Failed to refresh GenAI token after upstream rejection (%s)",
+                    type(exc).__name__,
+                )
                 return False
             return bool(self._token)
 
@@ -464,7 +479,10 @@ class TokenManager:
                     self._logger.info("Logging out from IDS before shutdown...")
                     self._ids_client.logout()
                     self._logger.info("IDS logout successful")
-            except Exception:
-                self._logger.exception("Failed to logout from IDS during shutdown")
+            except Exception as exc:
+                self._logger.error(
+                    "Failed to logout from IDS during shutdown (%s)",
+                    type(exc).__name__,
+                )
             finally:
                 self._ids_client.session.close()

@@ -334,9 +334,8 @@ def extract_tool_calls(
     if not matches:
         if logger:
             logger.debug(
-                "No <tool_call> tags found in content (%d chars): %s",
+                "No <tool_call> tags found in content (%d chars)",
                 len(content),
-                content[:500],
             )
         return None, content
 
@@ -349,9 +348,9 @@ def extract_tool_calls(
         if not call:
             if logger:
                 logger.warning(
-                    "Failed to parse tool_call[%d] — raw: %s",
+                    "Failed to parse tool_call[%d] (%d chars)",
                     index,
-                    match[:300],
+                    len(match),
                 )
             continue
 

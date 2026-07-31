@@ -129,7 +129,7 @@ def iter_sse_json(response, logger):
 
         line_str = line.decode("utf-8") if isinstance(line, bytes) else line
         if line_count < 5:
-            logger.debug("Raw line [%d]: %s", line_count, line_str[:300])
+            logger.debug("SSE line [%d]: %d chars", line_count, len(line_str))
         line_count += 1
 
         if line_str.startswith("data:"):
@@ -140,7 +140,11 @@ def iter_sse_json(response, logger):
         try:
             payload = json.loads(line_str)
         except json.JSONDecodeError as exc:
-            logger.debug("JSON decode error: %s, line: %s", exc, line_str[:200])
+            logger.debug(
+                "JSON decode error (%s, %d chars)",
+                type(exc).__name__,
+                len(line_str),
+            )
             continue
         yield line_count, payload
 

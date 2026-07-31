@@ -95,7 +95,11 @@ def chat_completions():
             status=exc.status,
         )
     except Exception as exc:
-        logger.exception("[%s] Unhandled error", request_id)
+        logger.error(
+            "[%s] Unhandled error (%s)",
+            request_id,
+            type(exc).__name__,
+        )
         return openai_error(
             str(exc),
             error_type="server_error",
@@ -155,7 +159,11 @@ def responses():
             status=exc.status,
         )
     except Exception as exc:
-        logger.exception("[%s] Unhandled responses error", request_id)
+        logger.error(
+            "[%s] Unhandled responses error (%s)",
+            request_id,
+            type(exc).__name__,
+        )
         return openai_error(
             str(exc),
             error_type="server_error",
@@ -188,7 +196,10 @@ def response_input_tokens():
             status=exc.status,
         )
     except Exception as exc:
-        current_app.extensions["logger"].exception("Unhandled input token count error")
+        current_app.extensions["logger"].error(
+            "Unhandled input token count error (%s)",
+            type(exc).__name__,
+        )
         return openai_error(
             str(exc),
             error_type="server_error",

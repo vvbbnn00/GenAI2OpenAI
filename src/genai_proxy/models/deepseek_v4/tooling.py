@@ -192,9 +192,9 @@ def extract_deepseek_tool_calls(content, tools=None, logger=None, adapter=None):
         if not repaired:
             if logger:
                 logger.warning(
-                    "DeepSeek repair failed for tool_call[%d] — raw: %s",
+                    "DeepSeek repair failed for tool_call[%d] (%d chars)",
                     index,
-                    match[:300],
+                    len(match),
                 )
             continue
 

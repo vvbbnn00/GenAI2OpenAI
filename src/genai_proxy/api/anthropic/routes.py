@@ -134,7 +134,11 @@ def create_message():
     except ProxyError as exc:
         return claude_error(exc.message, exc.error_type, exc.status)
     except Exception as exc:
-        logger.exception("[%s] Unhandled Claude error", request_id)
+        logger.error(
+            "[%s] Unhandled Claude error (%s)",
+            request_id,
+            type(exc).__name__,
+        )
         return claude_error(str(exc), "api_error", 500)
     finally:
         if not streaming_response_started:

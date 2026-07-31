@@ -74,9 +74,10 @@ def extract_qwen35_tool_calls(content, tools=None, logger=None):
         if tool_map and tool is None:
             if logger:
                 logger.warning(
-                    "Qwen 3.5 returned unknown tool name in tool_call[%d]: %s",
+                    "Qwen 3.5 returned an unknown tool name in tool_call[%d] "
+                    "(%d chars)",
                     index,
-                    raw_name,
+                    len(raw_name),
                 )
             continue
 

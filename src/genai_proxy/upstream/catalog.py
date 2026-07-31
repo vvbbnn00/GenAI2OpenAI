@@ -9,6 +9,7 @@ from pathlib import Path
 import requests
 
 from genai_proxy.errors import ProxyError
+from genai_proxy.logging_utils import safe_log_code
 from genai_proxy.retry import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_RETRY_BACKOFF,
@@ -172,12 +173,12 @@ class ModelManager:
                     self._models_cache = cached
                 if isinstance(exc, ProxyError):
                     self._logger.warning(
-                        "Using cached GenAI models after refresh failed: %s",
-                        exc.message,
+                        "Using cached GenAI models after refresh failed"
                     )
                 else:
-                    self._logger.exception(
-                        "Using cached GenAI models after unexpected refresh failure"
+                    self._logger.error(
+                        "Using cached GenAI models after unexpected refresh failure (%s)",
+                        type(exc).__name__,
                     )
                 return cached
 
@@ -208,9 +209,8 @@ class ModelManager:
             return None
         except (OSError, TypeError, ValueError) as exc:
             self._logger.warning(
-                "Ignoring invalid GenAI model cache %s: %s",
-                self._models_cache_path,
-                exc,
+                "Ignoring invalid GenAI model cache (%s)",
+                type(exc).__name__,
             )
             return None
 
@@ -254,9 +254,8 @@ class ModelManager:
             temporary_path.replace(self._models_cache_path)
         except (OSError, TypeError, ValueError) as exc:
             self._logger.warning(
-                "Failed to persist GenAI model cache %s: %s",
-                self._models_cache_path,
-                exc,
+                "Failed to persist GenAI model cache (%s)",
+                type(exc).__name__,
             )
         finally:
             if temporary_path is not None:
@@ -305,7 +304,10 @@ class ModelManager:
                 timeout=30,
             )
         except requests.RequestException as exc:
-            self._logger.warning("Failed to fetch GenAI model list: %s", exc)
+            self._logger.warning(
+                "Failed to fetch GenAI model list (%s)",
+                type(exc).__name__,
+            )
             raise transient_upstream_error("Failed to fetch GenAI models") from exc
 
         if response.status_code in (401, 403):
@@ -317,9 +319,8 @@ class ModelManager:
             )
         if response.status_code != 200:
             self._logger.warning(
-                "GenAI model list HTTP error %d: %s",
+                "GenAI model list HTTP error %d",
                 response.status_code,
-                response.text[:500],
             )
             if is_retryable_status(response.status_code):
                 raise transient_upstream_error("Failed to fetch GenAI models")
@@ -330,7 +331,10 @@ class ModelManager:
         try:
             payload = response.json()
         except ValueError as exc:
-            self._logger.warning("Failed to decode GenAI model list JSON: %s", exc)
+            self._logger.warning(
+                "Failed to decode GenAI model list JSON (%s)",
+                type(exc).__name__,
+            )
             raise transient_upstream_error("Failed to fetch GenAI models") from exc
 
         if is_genai_auth_failure(payload):
@@ -342,7 +346,10 @@ class ModelManager:
             )
 
         if payload.get("success") is False or payload.get("code", 200) >= 400:
-            self._logger.warning("GenAI model list business error: %s", payload)
+            self._logger.warning(
+                "GenAI model list business error (code=%s)",
+                safe_log_code(payload.get("code")),
+            )
             if is_retryable_business_error(
                 payload.get("code"), payload.get("message", "")
             ):
@@ -353,17 +360,12 @@ class ModelManager:
 
         result = payload.get("result")
         if not isinstance(result, dict):
-            self._logger.warning(
-                "GenAI model list response missing result object: %s", payload
-            )
+            self._logger.warning("GenAI model list response missing result object")
             raise transient_upstream_error("Failed to fetch GenAI models")
 
         records = result.get("records")
         if not isinstance(records, list):
-            self._logger.warning(
-                "GenAI model list response missing records array: %s",
-                payload,
-            )
+            self._logger.warning("GenAI model list response missing records array")
             raise transient_upstream_error("Failed to fetch GenAI models")
         models = _normalize_model_records(records)
         if not models:
@@ -371,9 +373,8 @@ class ModelManager:
             raise transient_upstream_error("Failed to fetch GenAI models")
 
         self._logger.debug(
-            "Fetched %d GenAI models from upstream: %s",
+            "Fetched %d GenAI models from upstream",
             len(models),
-            [model.get("aiType") for model in models],
         )
         return models
 

@@ -21,6 +21,7 @@ from genai_proxy.chat.tool_loop import (
 from genai_proxy.chat.types import PreparedChatRequest, ResolvedModelContext
 from genai_proxy.chat.usage import ChatUsageMixin
 from genai_proxy.errors import ProxyError
+from genai_proxy.logging_utils import safe_log_code
 from genai_proxy.retry import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_RETRY_BACKOFF,
@@ -156,7 +157,10 @@ class ChatService(
         try:
             response = upstream_transport.fetch_user_info(user_token, user_id)
         except requests.RequestException as exc:
-            self._logger.warning("Failed to fetch user billing info: %s", exc)
+            self._logger.warning(
+                "Failed to fetch user billing info (%s)",
+                type(exc).__name__,
+            )
             raise transient_upstream_error(
                 "Failed to fetch subscription quota"
             ) from exc
@@ -170,9 +174,8 @@ class ChatService(
             )
         if response.status_code != 200:
             self._logger.warning(
-                "GenAI billing API error %d: %s",
+                "GenAI billing API error %d",
                 response.status_code,
-                response.text[:500],
             )
             if is_retryable_status(response.status_code):
                 raise transient_upstream_error("Failed to fetch subscription quota")
@@ -184,7 +187,10 @@ class ChatService(
         try:
             payload = response.json()
         except ValueError as exc:
-            self._logger.warning("Failed to decode billing response JSON: %s", exc)
+            self._logger.warning(
+                "Failed to decode billing response JSON (%s)",
+                type(exc).__name__,
+            )
             raise transient_upstream_error(
                 "Failed to fetch subscription quota"
             ) from exc
@@ -198,7 +204,10 @@ class ChatService(
             )
 
         if payload.get("code", 200) >= 400 or payload.get("success") is False:
-            self._logger.warning("GenAI billing business error: %s", payload)
+            self._logger.warning(
+                "GenAI billing business error (code=%s)",
+                safe_log_code(payload.get("code")),
+            )
             if is_retryable_business_error(
                 payload.get("code"), payload.get("message", "")
             ):
@@ -220,11 +229,7 @@ class ChatService(
 
         record = records[0]
         if str(record.get("id")) != str(user_id):
-            self._logger.warning(
-                "Billing record mismatch for user_id=%s, got id=%s",
-                user_id,
-                record.get("id"),
-            )
+            self._logger.warning("Billing record did not match the current account")
             raise ProxyError(
                 "Quota information for the current GenAI account was not found",
                 error_type="invalid_request_error",
@@ -237,7 +242,10 @@ class ChatService(
         try:
             response = upstream_transport.fetch_current_user(user_token)
         except requests.RequestException as exc:
-            self._logger.warning("Failed to fetch current user info: %s", exc)
+            self._logger.warning(
+                "Failed to fetch current user info (%s)",
+                type(exc).__name__,
+            )
             raise transient_upstream_error(
                 "Failed to fetch subscription quota"
             ) from exc
@@ -251,9 +259,8 @@ class ChatService(
             )
         if response.status_code != 200:
             self._logger.warning(
-                "GenAI current user API error %d: %s",
+                "GenAI current user API error %d",
                 response.status_code,
-                response.text[:500],
             )
             if is_retryable_status(response.status_code):
                 raise transient_upstream_error("Failed to fetch subscription quota")
@@ -266,7 +273,10 @@ class ChatService(
         try:
             payload = response.json()
         except ValueError as exc:
-            self._logger.warning("Failed to decode current user JSON: %s", exc)
+            self._logger.warning(
+                "Failed to decode current user JSON (%s)",
+                type(exc).__name__,
+            )
             raise transient_upstream_error(
                 "Failed to fetch subscription quota"
             ) from exc
@@ -280,7 +290,10 @@ class ChatService(
             )
 
         if payload.get("code", 200) >= 400 or payload.get("success") is False:
-            self._logger.warning("GenAI current user business error: %s", payload)
+            self._logger.warning(
+                "GenAI current user business error (code=%s)",
+                safe_log_code(payload.get("code")),
+            )
             if is_retryable_business_error(
                 payload.get("code"), payload.get("message", "")
             ):
@@ -295,7 +308,7 @@ class ChatService(
         user_info = result.get("userInfo") if isinstance(result, dict) else {}
         user_id = user_info.get("id")
         if not user_id:
-            self._logger.warning("Current user response missing id: %s", payload)
+            self._logger.warning("Current user response missing id")
             raise ProxyError(
                 "Failed to fetch subscription quota",
                 error_type="upstream_error",
@@ -315,7 +328,10 @@ class ChatService(
         try:
             access_until = int(parse_jwt_payload(user_token).get("exp") or 0)
         except Exception as exc:
-            self._logger.warning("Failed to parse billing token expiry: %s", exc)
+            self._logger.warning(
+                "Failed to parse billing token expiry (%s)",
+                type(exc).__name__,
+            )
             raise ProxyError(
                 "Upstream GenAI token is invalid or expired",
                 error_type="authentication_error",
@@ -337,8 +353,11 @@ class ChatService(
             return 0.0
         try:
             return float(value)
-        except (TypeError, ValueError):
-            self._logger.warning("Invalid billing amount from upstream: %r", value)
+        except (TypeError, ValueError) as exc:
+            self._logger.warning(
+                "Invalid billing amount from upstream (%s)",
+                type(exc).__name__,
+            )
             raise ProxyError(
                 "Failed to fetch subscription quota",
                 error_type="upstream_error",

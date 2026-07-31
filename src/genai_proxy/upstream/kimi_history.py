@@ -71,8 +71,8 @@ class KimiHistoryCleanupMixin:
             )
         except Exception as exc:
             self._logger.warning(
-                "Kimi K3 history cleanup disabled for this request: %s",
-                exc,
+                "Kimi K3 history cleanup disabled for this request (%s)",
+                type(exc).__name__,
             )
             return None
 
@@ -130,7 +130,10 @@ class KimiHistoryCleanupMixin:
             )
             self._logger.debug("Deleted completed Kimi K3 history record")
         except Exception as exc:
-            self._logger.warning("Failed to delete Kimi K3 history record: %s", exc)
+            self._logger.warning(
+                "Failed to delete Kimi K3 history record (%s)",
+                type(exc).__name__,
+            )
 
     def _fetch_kimi_history_records(
         self,
