@@ -9,4 +9,3 @@ def setup_logging(debug: bool) -> logging.Logger:
         force=True,
     )
     return logging.getLogger("genai_proxy")
-

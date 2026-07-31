@@ -150,6 +150,43 @@ class ProgramVersionTests(unittest.TestCase):
             ),
         )
 
+    def test_deployment_configuration_changes_mark_checkout_dirty(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = Path(temp_dir)
+            (repository / "src" / "genai_proxy").mkdir(parents=True)
+            (repository / "src" / "genai_proxy" / "__init__.py").write_text(
+                "\n",
+                encoding="utf-8",
+            )
+            (repository / "docker-compose.yml").write_text(
+                "services: {}\n",
+                encoding="utf-8",
+            )
+            for command in (
+                ("git", "init", "-q"),
+                ("git", "config", "user.name", "Version Test"),
+                ("git", "config", "user.email", "version@example.test"),
+                ("git", "add", "."),
+                ("git", "-c", "commit.gpgsign=false", "commit", "-qm", "initial"),
+            ):
+                subprocess.run(command, cwd=repository, check=True)
+
+            clean = get_program_version(
+                metadata_path=repository / "missing.json",
+                source_root=repository,
+            )
+            (repository / "docker-compose.yml").write_text(
+                "services:\n  proxy: {}\n",
+                encoding="utf-8",
+            )
+            dirty = get_program_version(
+                metadata_path=repository / "missing.json",
+                source_root=repository,
+            )
+
+        self.assertFalse(clean.dirty)
+        self.assertTrue(dirty.dirty)
+
 
 if __name__ == "__main__":
     unittest.main()

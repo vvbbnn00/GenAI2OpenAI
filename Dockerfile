@@ -51,9 +51,8 @@ RUN python -m pip install \
     werkzeug==3.1.3 \
     "shanghaitech-ids-passkey @ git+https://github.com/vvbbnn00/shanghaitech-ids-passkey.git@7c4df62716ceb3d94452d22f3d07f19ff1b8db8b"
 
-COPY pyproject.toml uv.lock README.md ./
-COPY genai_proxy ./genai_proxy
-COPY main.py ./
+COPY pyproject.toml README.md ./
+COPY src ./src
 
 ARG GENAI_BUILD_COMMIT=""
 ARG GENAI_BUILD_COMMIT_TIME=""
@@ -61,8 +60,10 @@ ARG GENAI_BUILD_DIRTY="0"
 RUN GENAI_BUILD_COMMIT="${GENAI_BUILD_COMMIT}" \
     GENAI_BUILD_COMMIT_TIME="${GENAI_BUILD_COMMIT_TIME}" \
     GENAI_BUILD_DIRTY="${GENAI_BUILD_DIRTY}" \
+    PYTHONPATH=/app/src \
     python -m genai_proxy.version \
-        --output ./genai_proxy/_build_version.json \
-        --source-root /app
+        --output ./src/genai_proxy/_build_version.json \
+        --source-root /app \
+    && python -m pip install --no-deps .
 
 EXPOSE 5000

@@ -1,4 +1,4 @@
-"""Compatibility entrypoint for direct source checkouts."""
+"""Run the proxy with ``python -m genai_proxy``."""
 
 from genai_proxy.cli import main
 

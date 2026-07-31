@@ -18,5 +18,9 @@ __pycache__
 .env
 *.keystore*
 images
+docs
+scripts
+tests
+var
 test_*.py
 test_*.sh

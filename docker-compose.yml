@@ -70,7 +70,7 @@ services:
           --access-logfile - \
           --error-logfile - \
           --capture-output \
-          main:app
+          genai_proxy.wsgi:app
     healthcheck:
       test:
         [

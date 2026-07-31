@@ -14,7 +14,8 @@ if [ -n "${git_root}" ] && [ "$(CDPATH= cd -- "${git_root}" && pwd)" = "${projec
     GENAI_BUILD_COMMIT=$(git log -1 --format=%H)
     GENAI_BUILD_COMMIT_TIME=$(git log -1 --format=%cI)
     if [ -n "$(git status --porcelain --untracked-files=normal -- \
-        Dockerfile README.md main.py pyproject.toml uv.lock genai_proxy)" ]; then
+        .dockerignore Dockerfile README.md docker-compose.yml main.py \
+        pyproject.toml scripts/docker-compose.sh src/genai_proxy uv.lock)" ]; then
         GENAI_BUILD_DIRTY=1
     fi
 fi

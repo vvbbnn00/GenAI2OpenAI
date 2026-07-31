@@ -11,7 +11,7 @@ from pathlib import Path
 BUILD_METADATA_VERSION = 1
 LOCAL_DEV_VERSION = "local-dev"
 _BUILD_METADATA_PATH = Path(__file__).with_name("_build_version.json")
-_SOURCE_ROOT = Path(__file__).resolve().parent.parent
+_SOURCE_ROOT = Path(__file__).resolve().parents[2]
 _COMMIT_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
@@ -157,12 +157,15 @@ def _read_git_version(source_root: Path) -> ProgramVersion | None:
         "--porcelain",
         "--untracked-files=normal",
         "--",
+        ".dockerignore",
         "Dockerfile",
         "README.md",
+        "docker-compose.yml",
         "main.py",
         "pyproject.toml",
+        "scripts/docker-compose.sh",
+        "src/genai_proxy",
         "uv.lock",
-        "genai_proxy",
     )
     return _version_from_values(
         lines[0],
