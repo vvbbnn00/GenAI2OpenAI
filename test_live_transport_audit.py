@@ -16,6 +16,7 @@ from test_allowed_models_integration import (
     LiveTransportAudit,
     LiveCaseTimeout,
     _deepseek_max_prefixes,
+    assert_optional_responses_reasoning_preserved,
     live_case_deadline,
     quiet_integration_logger,
     tests_for_model as _tests_for_model,
@@ -107,6 +108,30 @@ def test_live_case_deadline_preserves_an_outer_deadline_without_extending_it():
         assert signal.getsignal(signal.SIGALRM) is outer_handler
         assert restored_remaining < outer_remaining - 0.015
         assert restored_interval == outer_interval
+
+
+def test_optional_responses_reasoning_must_match_streamed_deltas():
+    events = [
+        {"type": "response.reasoning_text.delta", "delta": "think "},
+        {"type": "response.reasoning_text.delta", "delta": "again"},
+    ]
+    completed = {
+        "output": [
+            {
+                "type": "reasoning",
+                "content": [
+                    {"type": "reasoning_text", "text": "think again"}
+                ],
+            }
+        ]
+    }
+
+    assert_optional_responses_reasoning_preserved(events, completed)
+    assert_optional_responses_reasoning_preserved([], {"output": []})
+
+    completed["output"][0]["content"][0]["text"] = "different"
+    with pytest.raises(AssertionError):
+        assert_optional_responses_reasoning_preserved(events, completed)
 
 
 def test_live_audit_records_sanitized_transport_metadata():

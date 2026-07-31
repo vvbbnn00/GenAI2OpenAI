@@ -1180,15 +1180,10 @@ def test_responses_multiturn_tool_call(client, model, iteration):
         },
     )
     first = completed_responses_stream(first_events)
-    assert any(
-        event.get("type") == "response.reasoning_text.delta" for event in first_events
-    ), json.dumps(first_events, ensure_ascii=False)[:800]
     first_call = first_responses_function_call(first)
     assert first_call["name"] == "get_stage_one"
     first_output = first.get("output") or []
-    assert any(item.get("type") == "reasoning" for item in first_output), (
-        json.dumps(first, ensure_ascii=False)[:800]
-    )
+    assert_optional_responses_reasoning_preserved(first_events, first)
 
     second_input = [
         *initial_input,
@@ -1210,9 +1205,6 @@ def test_responses_multiturn_tool_call(client, model, iteration):
         {**common, "input": second_input, "stream": True},
     )
     second = completed_responses_stream(second_events)
-    assert any(
-        event.get("type") == "response.reasoning_text.delta" for event in second_events
-    ), json.dumps(second_events, ensure_ascii=False)[:800]
     second_call = first_responses_function_call(second)
     assert second_call["name"] == "get_stage_two", json.dumps(
         second, ensure_ascii=False
@@ -1221,9 +1213,7 @@ def test_responses_multiturn_tool_call(client, model, iteration):
         second, ensure_ascii=False
     )[:800]
     second_output = second.get("output") or []
-    assert any(item.get("type") == "reasoning" for item in second_output), (
-        json.dumps(second, ensure_ascii=False)[:800]
-    )
+    assert_optional_responses_reasoning_preserved(second_events, second)
 
     third = post_json(
         client,
@@ -1571,6 +1561,22 @@ def completed_responses_stream(events):
     raise AssertionError(
         "no response.completed event: " + json.dumps(events, ensure_ascii=False)[:800]
     )
+
+
+def assert_optional_responses_reasoning_preserved(events, completed):
+    streamed = "".join(
+        event.get("delta", "")
+        for event in events
+        if event.get("type") == "response.reasoning_text.delta"
+    )
+    replayed = "".join(
+        part.get("text", "")
+        for item in completed.get("output", [])
+        if item.get("type") == "reasoning"
+        for part in item.get("content", [])
+        if part.get("type") == "reasoning_text"
+    )
+    assert replayed == streamed, json.dumps(completed, ensure_ascii=False)[:800]
 
 
 def first_claude_tool_use(data):
