@@ -526,73 +526,161 @@ def _convert_response_input_items(
     tool_map: dict[str, ResponseToolMapping],
 ) -> list[dict]:
     messages = []
+    pending_reasoning = []
+    active_tool_message = None
+
+    def flush_pending_reasoning() -> None:
+        nonlocal active_tool_message
+        if pending_reasoning:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "".join(pending_reasoning),
+                }
+            )
+            pending_reasoning.clear()
+        active_tool_message = None
+
     for item in input_items:
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
         if item_type == "additional_tools":
             continue
+        if item_type == "reasoning":
+            active_tool_message = None
+            reasoning = _response_reasoning_to_text(item)
+            if reasoning:
+                pending_reasoning.append(reasoning)
+            continue
         if _is_response_message_item(item):
+            active_tool_message = None
             role = _response_role_to_chat_role(item.get("role"))
             content = _content_to_chat_content(item.get("content"))
-            if content:
+            if role == "assistant" and (content or pending_reasoning):
+                message = {"role": role, "content": content or None}
+                if pending_reasoning:
+                    message["reasoning_content"] = "".join(pending_reasoning)
+                    pending_reasoning.clear()
+                messages.append(message)
+            elif content:
+                flush_pending_reasoning()
                 messages.append({"role": role, "content": content})
-        elif item_type == "function_call":
-            messages.append(
-                {
+            else:
+                flush_pending_reasoning()
+        elif item_type in {
+            "function_call",
+            "custom_tool_call",
+            "tool_search_call",
+            "local_shell_call",
+        }:
+            tool_calls = _response_call_to_chat_tool_calls(item, tool_map)
+            if not tool_calls:
+                continue
+            if active_tool_message is None:
+                active_tool_message = {
                     "role": "assistant",
                     "content": None,
-                    "tool_calls": [
-                        {
-                            "id": item.get("call_id")
-                            or f"call_{uuid.uuid4().hex[:24]}",
-                            "type": "function",
-                            "function": {
-                                "name": _model_name_for_response_call(item, tool_map),
-                                "arguments": item.get("arguments") or "{}",
-                            },
-                        }
-                    ],
+                    "tool_calls": [],
                 }
-            )
-        elif item_type == "custom_tool_call":
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": item.get("call_id")
-                            or f"call_{uuid.uuid4().hex[:24]}",
-                            "type": "function",
-                            "function": {
-                                "name": item.get("name") or "custom_tool",
-                                "arguments": json.dumps(
-                                    {"input": item.get("input") or ""},
-                                    ensure_ascii=False,
-                                ),
-                            },
-                        }
-                    ],
-                }
-            )
+                if pending_reasoning:
+                    active_tool_message["reasoning_content"] = "".join(
+                        pending_reasoning
+                    )
+                    pending_reasoning.clear()
+                messages.append(active_tool_message)
+            active_tool_message["tool_calls"].extend(tool_calls)
         elif item_type in {
             "function_call_output",
             "custom_tool_call_output",
             "tool_search_output",
         }:
+            flush_pending_reasoning()
+            output = item.get("output", item.get("tools", ""))
+            if item_type == "tool_search_output" and "output" not in item:
+                output_text = json.dumps(item.get("tools") or [], ensure_ascii=False)
+            else:
+                output_text = _output_to_text(output)
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": item.get("call_id") or "unknown",
-                    "content": _output_to_text(
-                        item.get("output", item.get("tools", ""))
-                    ),
+                    "content": output_text,
                 }
             )
-        elif item_type == "local_shell_call":
-            messages.append(_local_shell_call_to_chat_message(item))
+        else:
+            flush_pending_reasoning()
+    flush_pending_reasoning()
     return messages
+
+
+def _response_reasoning_to_text(item: dict) -> str:
+    for field in ("content", "summary"):
+        value = item.get(field)
+        if isinstance(value, str) and value:
+            return value
+        if not isinstance(value, list):
+            continue
+        parts = []
+        for part in value:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        if parts:
+            return "".join(parts)
+    return ""
+
+
+def _response_call_to_chat_tool_calls(
+    item: dict,
+    tool_map: dict[str, ResponseToolMapping],
+) -> list[dict]:
+    item_type = item.get("type")
+    call_id = item.get("call_id") or f"call_{uuid.uuid4().hex[:24]}"
+    if item_type == "function_call":
+        return [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": _model_name_for_response_call(item, tool_map),
+                    "arguments": item.get("arguments") or "{}",
+                },
+            }
+        ]
+    if item_type == "custom_tool_call":
+        return [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": item.get("name") or "custom_tool",
+                    "arguments": json.dumps(
+                        {"input": item.get("input") or ""},
+                        ensure_ascii=False,
+                    ),
+                },
+            }
+        ]
+    if item_type == "tool_search_call":
+        arguments = item.get("arguments") or {}
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        return [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": _model_name_for_response_name("tool_search", tool_map),
+                    "arguments": arguments,
+                },
+            }
+        ]
+    if item_type == "local_shell_call":
+        return _local_shell_call_to_chat_message(item)["tool_calls"]
+    return []
 
 
 def _response_role_to_chat_role(role) -> str:
@@ -679,7 +767,17 @@ def _output_to_text(output) -> str:
     if output is None:
         return ""
     if isinstance(output, list):
-        return _content_to_text(output)
+        if all(
+            isinstance(item, str)
+            or (
+                isinstance(item, dict)
+                and item.get("type")
+                in {"input_text", "output_text", "text", "input_image"}
+            )
+            for item in output
+        ):
+            return _content_to_text(output)
+        return json.dumps(output, ensure_ascii=False)
     return json.dumps(output, ensure_ascii=False)
 
 

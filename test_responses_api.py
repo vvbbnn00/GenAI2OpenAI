@@ -367,6 +367,175 @@ def test_responses_text_parts_keep_protocol_order_without_added_newlines():
     ]
 
 
+def test_responses_replayed_reasoning_stays_with_adjacent_tool_calls():
+    second_tool = {
+        "type": "function",
+        "name": "get_forecast",
+        "description": "Get a weather forecast.",
+        "parameters": {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"],
+        },
+    }
+    context = convert_responses_to_openai_request(
+        {
+            "model": "deepseek-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "Check weather."},
+                {
+                    "id": "rs_1",
+                    "type": "reasoning",
+                    "content": [
+                        {"type": "reasoning_text", "text": "Call both tools."}
+                    ],
+                    "status": "completed",
+                },
+                {
+                    "type": "function_call",
+                    "name": "get_weather",
+                    "arguments": '{"location":"Shanghai"}',
+                    "call_id": "call_weather",
+                },
+                {
+                    "type": "function_call",
+                    "name": "get_forecast",
+                    "arguments": '{"location":"Shanghai"}',
+                    "call_id": "call_forecast",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_weather",
+                    "output": "Sunny.",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_forecast",
+                    "output": "Clear tomorrow.",
+                },
+            ],
+            "tools": [RESPONSES_WEATHER_TOOL, second_tool],
+            "reasoning": {"effort": "high"},
+        }
+    )
+
+    assistant = context.openai_request["messages"][1]
+    assert assistant["role"] == "assistant"
+    assert assistant["reasoning_content"] == "Call both tools."
+    assert [
+        tool_call["function"]["name"] for tool_call in assistant["tool_calls"]
+    ] == ["get_weather", "get_forecast"]
+    assert [
+        message["tool_call_id"]
+        for message in context.openai_request["messages"]
+        if message.get("role") == "tool"
+    ] == ["call_weather", "call_forecast"]
+
+    record = {
+        "aiType": "deepseek-chat",
+        "aiName": "DeepSeek-V4-Flash",
+        "descInfo": "DeepSeek V4 Flash",
+        "rootModelName": "Xinference",
+        "rootAiType": "xinference",
+        "enableDeepThink": 1,
+    }
+    service, _captured, _fake_post = make_service([], record=record)
+    prepared = service._prepare_chat_request(
+        context.openai_request,
+        count_usage=False,
+    )
+    assert "Call both tools." in json.dumps(
+        prepared.messages,
+        ensure_ascii=False,
+    )
+
+
+def test_responses_replayed_reasoning_falls_back_to_summary_text():
+    context = convert_responses_to_openai_request(
+        {
+            "model": "chatglm",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "content": [],
+                    "summary": [
+                        {"type": "summary_text", "text": "Prior plan."}
+                    ],
+                },
+                {"type": "message", "role": "user", "content": "Continue."},
+            ],
+        }
+    )
+
+    assert context.openai_request["messages"] == [
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "Prior plan.",
+        },
+        {"role": "user", "content": "Continue."},
+    ]
+
+
+def test_responses_tool_search_call_is_replayed_before_its_output():
+    context = convert_responses_to_openai_request(
+        {
+            "model": "chatglm",
+            "input": [
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_search",
+                    "arguments": {"query": "weather"},
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_search",
+                    "tools": [{"name": "get_weather"}],
+                },
+            ],
+            "tools": [
+                {
+                    "type": "tool_search",
+                    "description": "Find a client tool.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                }
+            ],
+        }
+    )
+
+    assistant, output = context.openai_request["messages"]
+    assert assistant["tool_calls"] == [
+        {
+            "id": "call_search",
+            "type": "function",
+            "function": {
+                "name": "tool_search",
+                "arguments": '{"query": "weather"}',
+            },
+        }
+    ]
+    assert output["role"] == "tool"
+    assert output["tool_call_id"] == "call_search"
+    assert json.loads(output["content"]) == [{"name": "get_weather"}]
+
+    empty_output = convert_responses_to_openai_request(
+        {
+            "model": "chatglm",
+            "input": [
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_empty",
+                    "tools": [],
+                }
+            ],
+        }
+    ).openai_request["messages"][0]
+    assert empty_output["content"] == "[]"
+
+
 def test_responses_uses_resolved_qwen_record_for_visual_transport():
     data_url = (
         "data:image/png;base64,"
