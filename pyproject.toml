@@ -16,5 +16,10 @@ dependencies = [
     "urllib3>=2.5.0,<3",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2,<10",
+]
+
 [tool.uv.sources]
 shanghaitech-ids-passkey = { git = "https://github.com/vvbbnn00/shanghaitech-ids-passkey.git", branch = "main" }
