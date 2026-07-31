@@ -28,13 +28,13 @@ def _config_from_env() -> AppConfig:
     return AppConfig(
         token=os.environ.get("GENAI_TOKEN") or None,
         keystore=os.environ.get("KEYSTORE_PATH") or None,
-        port=int(os.environ.get("APP_PORT", 5000)),
+        port=int(os.environ.get("APP_PORT", "5000")),
         debug=os.environ.get("APP_DEBUG", "0") == "1",
         api_key=os.environ.get("API_KEY") or None,
         token_check_interval=max(0, _int_env("TOKEN_CHECK_INTERVAL", 60)),
-        claude_haiku_model=os.environ.get("CLAUDE_HAIKU_MODEL", "qwen-instruct"),
-        claude_sonnet_model=os.environ.get("CLAUDE_SONNET_MODEL", "qwen-instruct"),
-        claude_opus_model=os.environ.get("CLAUDE_OPUS_MODEL", "deepseek-v3:671b"),
+        claude_haiku_model=os.environ.get("CLAUDE_HAIKU_MODEL", "deepseek-chat"),
+        claude_sonnet_model=os.environ.get("CLAUDE_SONNET_MODEL", "chatglm"),
+        claude_opus_model=os.environ.get("CLAUDE_OPUS_MODEL", "chatglm"),
         genai_max_retries=max(0, _int_env("GENAI_MAX_RETRIES", DEFAULT_MAX_RETRIES)),
         genai_retry_backoff=max(
             0.0,
