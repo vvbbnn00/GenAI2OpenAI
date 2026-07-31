@@ -15,6 +15,7 @@ services:
       TOKEN_CHECK_INTERVAL: ${TOKEN_CHECK_INTERVAL:-60}
       GENAI_MAX_RETRIES: ${GENAI_MAX_RETRIES:-10}
       GENAI_RETRY_BACKOFF: ${GENAI_RETRY_BACKOFF:-0.5}
+      GENAI_MODEL_CACHE: ${GENAI_MODEL_CACHE:-/app/.cache/models/models.json}
       GENAI_TOKENIZER_CACHE: ${GENAI_TOKENIZER_CACHE:-/app/.cache/tokenizers}
       API_KEY: ${PROXY_API_KEY:-}
       APP_DEBUG: ${APP_DEBUG:-0}
@@ -34,6 +35,7 @@ services:
         target: /app/docker-deploy.keystore
         read_only: false
       - tokenizer-cache:/app/.cache/tokenizers
+      - model-cache:/app/.cache/models
     command:
       - /bin/sh
       - -lc
@@ -78,3 +80,4 @@ services:
 
 volumes:
   tokenizer-cache:
+  model-cache:

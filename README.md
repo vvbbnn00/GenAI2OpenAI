@@ -71,6 +71,7 @@ docker compose down
 | `TOKEN_CHECK_INTERVAL` | 后台检查 token 过期时间并同步共享缓存的间隔秒数；`0` 表示关闭 | `60` |
 | `GENAI_MAX_RETRIES` | GenAI 聊天、模型列表和计费请求遇到临时网络故障、HTTP 408/425/429/500/502/503/504、无效响应或意外断流时的最大重试次数；`0` 表示关闭 | `10` |
 | `GENAI_RETRY_BACKOFF` | 首次重试等待秒数，后续每次翻倍并封顶 5 秒；`0` 表示立即重试 | `0.5` |
+| `GENAI_MODEL_CACHE` | 最近一次有效 GenAI 模型表的持久化缓存文件 | `~/.cache/genai2openai/models.json` |
 | `GENAI_TOKENIZER_CACHE` | 经 SHA-256 校验的官方 tokenizer/template 缓存目录 | `~/.cache/genai2openai/tokenizers` |
 | `APP_PORT` | 容器内和映射到宿主机的监听端口 | `5000` |
 | `HOST_PORT` | 宿主机暴露端口 | `5000` |
@@ -88,6 +89,8 @@ docker compose down
 | `GUNICORN_MAX_REQUESTS_JITTER` | worker 轮换抖动 | `0` |
 
 `docker-compose.yml` 默认使用 `gunicorn + gthread`，比直接跑 Flask 开发服务器更适合本项目这种“请求会长时间阻塞在上游 LLM SSE 输出上”的代理场景。
+
+模型表使用 stale-while-revalidate：内存缓存过期后，`/v1/models` 和模型解析会立即返回最后一次有效结果，并由单个后台线程刷新，不再让请求同步等待上游重试。成功获取的模型表会原子写入 `GENAI_MODEL_CACHE`，所以进程或容器重启后仍可使用；Docker Compose 默认把该文件放在独立持久卷中。上游暂时不可用、返回异常数据或 token 刷新失败时会继续提供缓存，冷启动且尚无缓存时则提供内置基础模型表，并按 30 秒冷却周期后台重试。
 
 ### 启动服务
 
