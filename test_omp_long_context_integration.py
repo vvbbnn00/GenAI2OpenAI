@@ -343,13 +343,21 @@ until NEXT=NONE. Wait for each read result before using its NEXT value. Do not
 infer filenames from the directory listing, guess unseen tokens, or skip a stage.
 Order the output by CHAIN_INDEX.
 
+A read result with NEXT=<filename> proves that the chain is still incomplete,
+and the next action must be a read of that exact filename. Do not use the write
+tool until a read result contains the literal NEXT=NONE and you have collected
+exactly {stages} CHAIN_TOKEN values. If either condition is false, continue the
+chain instead of summarizing or writing a partial result.
+
 After reading all {stages} stages, use the write tool to create result.json as
 valid JSON with exactly these keys:
 {{"sentinels": [three values in archive order], "stage_tokens": [all chain tokens in stage order]}}
 
 Read result.json back with the read tool. If it is not exact, fix it and read it
 again. Then write COMPLETE.txt containing only {PASS_MARKER}, read COMPLETE.txt
-back, and finish with exactly {PASS_MARKER}.
+back, and finish with exactly {PASS_MARKER}. The final assistant message is
+checked by exact string equality: do not add Markdown, a table, an explanation,
+punctuation, a prefix, or a suffix.
 """,
         encoding="utf-8",
     )
