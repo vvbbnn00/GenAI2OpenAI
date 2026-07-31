@@ -2,8 +2,12 @@
 
 import json
 
-from genai_proxy.models.hf_assets import Artifact, TokenizerSpec
-from genai_proxy.models.hf_assets import load_template, tokenizer_error
+from genai_proxy.models.hf_assets import (
+    Artifact,
+    TokenizerSpec,
+    load_template,
+    tokenizer_error,
+)
 
 MINIMAX_M2_7_SPEC = TokenizerSpec(
     family="minimax_m2_7",

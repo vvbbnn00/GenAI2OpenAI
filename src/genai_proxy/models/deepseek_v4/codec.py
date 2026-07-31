@@ -3,8 +3,12 @@
 import json
 
 from genai_proxy.errors import ProxyError
-from genai_proxy.models.hf_assets import Artifact, TokenizerSpec
-from genai_proxy.models.hf_assets import load_python_encoder, tokenizer_error
+from genai_proxy.models.hf_assets import (
+    Artifact,
+    TokenizerSpec,
+    load_python_encoder,
+    tokenizer_error,
+)
 
 DEEPSEEK_V4_PRO_SPEC = TokenizerSpec(
     family="deepseek_v4_pro",

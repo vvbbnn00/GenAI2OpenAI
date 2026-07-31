@@ -3,8 +3,12 @@
 import json
 import math
 
-from genai_proxy.models.hf_assets import Artifact, TokenizerSpec
-from genai_proxy.models.hf_assets import load_template, tokenizer_error
+from genai_proxy.models.hf_assets import (
+    Artifact,
+    TokenizerSpec,
+    load_template,
+    tokenizer_error,
+)
 
 QWEN_3_5_SPEC = TokenizerSpec(
     family="qwen_3_5",

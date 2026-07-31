@@ -9,68 +9,17 @@ import urllib.parse
 from dataclasses import dataclass
 from types import MappingProxyType
 
-import requests
 from PIL import Image, ImageFile, UnidentifiedImageError
 from urllib3 import HTTPConnectionPool, HTTPSConnectionPool, Timeout
 from urllib3.exceptions import HTTPError
 
 from genai_proxy.errors import ProxyError
-from genai_proxy.models.deepseek_v4.codec import (
-    DEEPSEEK_V4_FLASH_SPEC,
-    DEEPSEEK_V4_PRO_SPEC,
-    official_reasoning_prefix as _deepseek_reasoning_prefix,
-    official_tool_prompt as _deepseek_tool_prompt,
-    official_transport_messages as _deepseek_transport_messages,
-    serialize_completion as _serialize_deepseek_completion,
-)
-from genai_proxy.models.glm52.codec import (
-    GLM_5_1_SPEC,
-    GLM_5_2_SPEC,
-    official_tool_prompt as _glm_tool_prompt,
-    serialize_completion as _serialize_glm_completion,
-)
-from genai_proxy.models.hf_assets import (
-    Artifact,
-    ArtifactChecksumError,
-    HF_BASE_URL,
-    TOKENIZER_CACHE_ENV,
-    TokenizerSpec,
-    artifact_path as _artifact_path,
-    download_artifact as _download_artifact,
-    load_python_encoder as _load_python_encoder,
-    load_template as _load_template,
-    load_tokenizer as _load_hf_tokenizer,
-    sha256 as _sha256,
-    tokenizer_error as _tokenizer_error,
-)
-from genai_proxy.models.kimi_k3.codec import (
-    IMAGE_IN_PATCH_LIMIT as KIMI_IMAGE_IN_PATCH_LIMIT,
-    IMAGE_MERGE_KERNEL_SIZE as KIMI_IMAGE_MERGE_KERNEL_SIZE,
-    IMAGE_PATCH_LIMIT as KIMI_IMAGE_PATCH_LIMIT,
-    IMAGE_PATCH_SIZE as KIMI_IMAGE_PATCH_SIZE,
-    KIMI_K3_SPEC,
-    PATTERN as KIMI_PAT_STR,
-    SPECIAL_TOKEN_OVERRIDES as KIMI_SPECIAL_TOKEN_OVERRIDES,
-    build_tokenizer as _build_kimi_tokenizer,
-    image_token_count as _kimi_codec_image_token_count,
-)
-from genai_proxy.models.legacy.minimax_codec import (
-    MINIMAX_M2_7_SPEC,
-    official_default_system_prompt as _minimax_default_system_prompt,
-    official_tool_prompt as _minimax_tool_prompt,
-    serialize_completion as _serialize_minimax_completion,
-)
-from genai_proxy.models.qwen35.codec import (
-    IMAGE_MAX_ASPECT_RATIO as QWEN_IMAGE_MAX_ASPECT_RATIO,
-    IMAGE_MAX_PIXELS as QWEN_IMAGE_MAX_PIXELS,
-    IMAGE_MERGE_SIZE as QWEN_IMAGE_MERGE_SIZE,
-    IMAGE_MIN_PIXELS as QWEN_IMAGE_MIN_PIXELS,
-    IMAGE_PATCH_SIZE as QWEN_IMAGE_PATCH_SIZE,
-    QWEN_3_5_SPEC,
-    image_token_count as _qwen_codec_image_token_count,
-    official_tool_prompt as _qwen_tool_prompt,
-    serialize_completion as _serialize_qwen_completion,
-)
+from genai_proxy.models import hf_assets as _hf_assets
+from genai_proxy.models.deepseek_v4 import codec as _deepseek_codec
+from genai_proxy.models.glm52 import codec as _glm_codec
+from genai_proxy.models.kimi_k3 import codec as _kimi_codec
+from genai_proxy.models.legacy import minimax_codec as _minimax_codec
+from genai_proxy.models.qwen35 import codec as _qwen_codec
 from genai_proxy.models.registry import (
     DEEPSEEK_V4_FLASH_ADAPTER,
     DEEPSEEK_V4_PRO_ADAPTER,
@@ -80,6 +29,58 @@ from genai_proxy.models.registry import (
     MINIMAX_ADAPTER,
     QWEN_3_5_ADAPTER,
 )
+
+# Keep the token_usage facade stable while implementations live with their
+# model families. These bindings also make every re-export explicit to linters.
+DEEPSEEK_V4_FLASH_SPEC = _deepseek_codec.DEEPSEEK_V4_FLASH_SPEC
+DEEPSEEK_V4_PRO_SPEC = _deepseek_codec.DEEPSEEK_V4_PRO_SPEC
+_deepseek_reasoning_prefix = _deepseek_codec.official_reasoning_prefix
+_deepseek_tool_prompt = _deepseek_codec.official_tool_prompt
+_deepseek_transport_messages = _deepseek_codec.official_transport_messages
+_serialize_deepseek_completion = _deepseek_codec.serialize_completion
+
+GLM_5_1_SPEC = _glm_codec.GLM_5_1_SPEC
+GLM_5_2_SPEC = _glm_codec.GLM_5_2_SPEC
+_glm_tool_prompt = _glm_codec.official_tool_prompt
+_serialize_glm_completion = _glm_codec.serialize_completion
+
+HF_BASE_URL = _hf_assets.HF_BASE_URL
+TOKENIZER_CACHE_ENV = _hf_assets.TOKENIZER_CACHE_ENV
+Artifact = _hf_assets.Artifact
+ArtifactChecksumError = _hf_assets.ArtifactChecksumError
+TokenizerSpec = _hf_assets.TokenizerSpec
+_artifact_path = _hf_assets.artifact_path
+_download_artifact = _hf_assets.download_artifact
+_load_hf_tokenizer = _hf_assets.load_tokenizer
+_load_python_encoder = _hf_assets.load_python_encoder
+_load_template = _hf_assets.load_template
+_sha256 = _hf_assets.sha256
+_tokenizer_error = _hf_assets.tokenizer_error
+
+KIMI_K3_SPEC = _kimi_codec.KIMI_K3_SPEC
+KIMI_IMAGE_IN_PATCH_LIMIT = _kimi_codec.IMAGE_IN_PATCH_LIMIT
+KIMI_IMAGE_MERGE_KERNEL_SIZE = _kimi_codec.IMAGE_MERGE_KERNEL_SIZE
+KIMI_IMAGE_PATCH_LIMIT = _kimi_codec.IMAGE_PATCH_LIMIT
+KIMI_IMAGE_PATCH_SIZE = _kimi_codec.IMAGE_PATCH_SIZE
+KIMI_PAT_STR = _kimi_codec.PATTERN
+KIMI_SPECIAL_TOKEN_OVERRIDES = _kimi_codec.SPECIAL_TOKEN_OVERRIDES
+_build_kimi_tokenizer = _kimi_codec.build_tokenizer
+_kimi_codec_image_token_count = _kimi_codec.image_token_count
+
+MINIMAX_M2_7_SPEC = _minimax_codec.MINIMAX_M2_7_SPEC
+_minimax_default_system_prompt = _minimax_codec.official_default_system_prompt
+_minimax_tool_prompt = _minimax_codec.official_tool_prompt
+_serialize_minimax_completion = _minimax_codec.serialize_completion
+
+QWEN_3_5_SPEC = _qwen_codec.QWEN_3_5_SPEC
+QWEN_IMAGE_MAX_ASPECT_RATIO = _qwen_codec.IMAGE_MAX_ASPECT_RATIO
+QWEN_IMAGE_MAX_PIXELS = _qwen_codec.IMAGE_MAX_PIXELS
+QWEN_IMAGE_MERGE_SIZE = _qwen_codec.IMAGE_MERGE_SIZE
+QWEN_IMAGE_MIN_PIXELS = _qwen_codec.IMAGE_MIN_PIXELS
+QWEN_IMAGE_PATCH_SIZE = _qwen_codec.IMAGE_PATCH_SIZE
+_qwen_codec_image_token_count = _qwen_codec.image_token_count
+_qwen_tool_prompt = _qwen_codec.official_tool_prompt
+_serialize_qwen_completion = _qwen_codec.serialize_completion
 
 KIMI_IMAGE_MAX_BYTES = 50 * 1024 * 1024
 KIMI_IMAGE_MAX_REDIRECTS = 5

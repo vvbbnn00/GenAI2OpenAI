@@ -2,8 +2,12 @@
 
 import json
 
-from genai_proxy.models.hf_assets import Artifact, TokenizerSpec
-from genai_proxy.models.hf_assets import load_template, tokenizer_error
+from genai_proxy.models.hf_assets import (
+    Artifact,
+    TokenizerSpec,
+    load_template,
+    tokenizer_error,
+)
 
 GLM_5_2_SPEC = TokenizerSpec(
     family="glm_5_2",
