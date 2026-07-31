@@ -7,6 +7,10 @@ from genai_proxy.optimizations.registry import KIMI_K3_ADAPTER, QWEN_3_5_ADAPTER
 _VISUAL_ADAPTERS = frozenset({KIMI_K3_ADAPTER, QWEN_3_5_ADAPTER})
 
 
+def adapter_supports_vision(adapter: str) -> bool:
+    return adapter in _VISUAL_ADAPTERS
+
+
 def normalize_message_contents(messages: list[dict], *, adapter: str) -> list[dict]:
     """Return copied messages with OpenAI content parts in canonical form."""
     return [_normalize_message(message, adapter=adapter) for message in messages]
@@ -54,7 +58,7 @@ def _normalize_content(content, *, role, adapter: str):
             raise _unsupported_content(
                 f"Unsupported message content part type: {part_type!r}"
             )
-        if adapter not in _VISUAL_ADAPTERS:
+        if not adapter_supports_vision(adapter):
             raise _unsupported_content(
                 "This model accepts only text message content"
             )

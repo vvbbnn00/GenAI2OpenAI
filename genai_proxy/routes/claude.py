@@ -72,7 +72,14 @@ def create_message():
         }
         if mapped_model != original_model:
             req_data = {**req_data, "model": mapped_model}
-        openai_request = convert_claude_to_openai(req_data, model_manager)
+        model_context = (
+            service.resolve_model_context(mapped_model) if mapped_model else None
+        )
+        openai_request = convert_claude_to_openai(
+            req_data,
+            model_manager,
+            resolved_model=(model_context.model if model_context else None),
+        )
 
         logger.info(
             "[%s] claude-model=%s mapped-model=%s stream=%s messages=%d",
@@ -86,11 +93,17 @@ def create_message():
         stream = bool(openai_request.get("stream"))
         if stream:
             original_req_with_estimator["_input_tokens"] = (
-                service.count_openai_input_tokens(openai_request)
+                service.count_openai_input_tokens(
+                    openai_request,
+                    model_context=model_context,
+                )
             )
             gen = prime_stream(
                 stream_openai_to_claude(
-                    service.stream_openai_completion(openai_request),
+                    service.stream_openai_completion(
+                        openai_request,
+                        model_context=model_context,
+                    ),
                     original_req_with_estimator,
                     logger,
                 )
@@ -109,7 +122,10 @@ def create_message():
                 },
             )
 
-        response = service.build_openai_completion(openai_request)
+        response = service.build_openai_completion(
+            openai_request,
+            model_context=model_context,
+        )
         return jsonify(
             convert_openai_to_claude_response(response, original_req_with_estimator)
         )
@@ -142,9 +158,21 @@ def count_tokens():
             "max_tokens": req_data.get("max_tokens", 1),
             "stream": False,
         }
-        openai_request = convert_claude_to_openai(converted_request, model_manager)
+        model_context = (
+            service.resolve_model_context(mapped_model) if mapped_model else None
+        )
+        openai_request = convert_claude_to_openai(
+            converted_request,
+            model_manager,
+            resolved_model=(model_context.model if model_context else None),
+        )
         return jsonify(
-            {"input_tokens": service.count_openai_input_tokens(openai_request)}
+            {
+                "input_tokens": service.count_openai_input_tokens(
+                    openai_request,
+                    model_context=model_context,
+                )
+            }
         )
     except ProxyError as exc:
         return claude_error(exc.message, exc.error_type, exc.status)

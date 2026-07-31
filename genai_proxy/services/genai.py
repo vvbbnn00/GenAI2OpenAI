@@ -38,7 +38,7 @@ from genai_proxy.compat.responses import (
     response_reasoning_text_done,
 )
 from genai_proxy.errors import ProxyError
-from genai_proxy.messages import normalize_message_contents
+from genai_proxy.messages import adapter_supports_vision, normalize_message_contents
 from genai_proxy.optimizations import (
     DEEPSEEK_V4_ADAPTERS,
     GLM_5_2_ADAPTER,
@@ -121,6 +121,7 @@ class PreparedChatRequest:
     messages: list
     model: str
     root_model_name: str | None
+    root_ai_type: str
     max_tokens: int
     has_tools: bool
     tools: list
@@ -133,6 +134,20 @@ class PreparedChatRequest:
     thinking: bool | None
     image_sizes: tuple[tuple[int, int], ...] | None
     generated_usage: dict | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedModelContext:
+    requested_model: str
+    model: str
+    model_record: dict | None
+    tool_adapter: str
+    tokenizer_family: str
+    supports_vision: bool
+    supports_thinking_toggle: bool
+    transport: str
+    root_ai_type: str
+    root_model_name: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,19 +257,100 @@ class GenAIService:
         self._kimi_history_locks = {}
         self._kimi_history_locks_guard = threading.Lock()
 
-    def build_openai_completion(self, req_data):
-        prepared = self._prepare_chat_request(req_data)
+    def build_openai_completion(
+        self,
+        req_data,
+        *,
+        model_context: ResolvedModelContext | None = None,
+    ):
+        prepared = self._prepare_chat_request(
+            req_data,
+            model_context=model_context,
+        )
         return self._build_openai_completion(prepared)
 
-    def stream_openai_completion(self, req_data):
-        prepared = self._prepare_chat_request(req_data, count_usage=False)
+    def stream_openai_completion(
+        self,
+        req_data,
+        *,
+        model_context: ResolvedModelContext | None = None,
+    ):
+        prepared = self._prepare_chat_request(
+            req_data,
+            count_usage=False,
+            model_context=model_context,
+        )
         return self._stream_prepared_openai_completion(prepared)
 
-    def count_openai_input_tokens(self, req_data) -> int:
-        prompt_tokens = self._prepare_chat_request(req_data).prompt_tokens
+    def count_openai_input_tokens(
+        self,
+        req_data,
+        *,
+        model_context: ResolvedModelContext | None = None,
+    ) -> int:
+        prompt_tokens = self._prepare_chat_request(
+            req_data,
+            model_context=model_context,
+        ).prompt_tokens
         if prompt_tokens is None:
             raise RuntimeError("Input token counting completed without a token count")
         return prompt_tokens
+
+    def count_responses_input_tokens(self, req_data) -> int:
+        context, model_context = self._convert_responses_request(req_data)
+        return self.count_openai_input_tokens(
+            context.openai_request,
+            model_context=model_context,
+        )
+
+    def resolve_model_context(self, requested_model: str) -> ResolvedModelContext:
+        if not isinstance(requested_model, str):
+            raise ProxyError("'model' must be a string")
+        resolve_model_record = getattr(
+            self._model_manager,
+            "resolve_model_record",
+            None,
+        )
+        if callable(resolve_model_record):
+            model, model_record = resolve_model_record(requested_model)
+        else:
+            model = self._model_manager.resolve_model(requested_model)
+            model_record = self._model_manager.get_model_record(model)
+        tool_adapter = select_tool_adapter(model, model_record)
+        root_ai_type = (model_record or {}).get("rootAiType")
+        if not root_ai_type:
+            root_ai_type = self._model_manager.root_ai_type_for(model)
+        return ResolvedModelContext(
+            requested_model=requested_model,
+            model=model,
+            model_record=model_record,
+            tool_adapter=tool_adapter,
+            tokenizer_family=tokenizer_family_for_model(
+                model,
+                model_record,
+                tool_adapter,
+            ),
+            supports_vision=adapter_supports_vision(tool_adapter),
+            supports_thinking_toggle=tool_adapter in DEEPSEEK_V4_ADAPTERS,
+            transport=(
+                "kimi_web" if tool_adapter == KIMI_K3_ADAPTER else "genai_chat"
+            ),
+            root_ai_type=str(root_ai_type),
+            root_model_name=(model_record or {}).get("rootModelName"),
+        )
+
+    def _convert_responses_request(self, req_data):
+        if not isinstance(req_data, dict):
+            raise ProxyError("Request body must be a JSON object")
+        requested_model = req_data.get("model", "GPT-4.1")
+        model_context = self.resolve_model_context(requested_model)
+        context = convert_responses_to_openai_request(
+            req_data,
+            keep_tools_after_output=(
+                model_context.tool_adapter == KIMI_K3_ADAPTER
+            ),
+        )
+        return context, model_context
 
     def build_response(self, req_data):
         response = None
@@ -296,7 +392,7 @@ class GenAIService:
         return response
 
     def stream_responses(self, req_data, *, buffer_upstream=False):
-        context = convert_responses_to_openai_request(req_data)
+        context, model_context = self._convert_responses_request(req_data)
         openai_request = dict(context.openai_request)
         openai_request["stream"] = True
 
@@ -429,7 +525,11 @@ class GenAIService:
         # Responses always reports exact usage, but prompt tokenization does
         # not need to delay the upstream request or the first streamed event.
         # _usage() fills it lazily once the model has finished.
-        prepared = self._prepare_chat_request(openai_request, count_usage=False)
+        prepared = self._prepare_chat_request(
+            openai_request,
+            count_usage=False,
+            model_context=model_context,
+        )
         openai_stream = self._stream_prepared_openai_completion(
             prepared,
             buffer_until_complete=buffer_upstream,
@@ -746,6 +846,7 @@ class GenAIService:
         req_data,
         *,
         count_usage: bool = True,
+        model_context: ResolvedModelContext | None = None,
     ) -> PreparedChatRequest:
         if not req_data or "messages" not in req_data:
             raise ProxyError("Missing 'messages' field in request body")
@@ -760,7 +861,14 @@ class GenAIService:
         requested_model = req_data.get("model", "GPT-4.1")
         if not isinstance(requested_model, str):
             raise ProxyError("'model' must be a string")
-        model = self._model_manager.resolve_model(requested_model)
+        if model_context is None:
+            model_context = self.resolve_model_context(requested_model)
+        elif requested_model.casefold() not in {
+            model_context.requested_model.casefold(),
+            model_context.model.casefold(),
+        }:
+            raise RuntimeError("Resolved model context does not match the request")
+        model = model_context.model
         max_tokens = req_data.get("max_tokens", 30000)
         tools = req_data.get("tools") or []
         if not isinstance(tools, list) or any(
@@ -780,8 +888,8 @@ class GenAIService:
             ):
                 raise ProxyError("Function tool parameters must be an object")
         tool_choice = req_data.get("tool_choice")
-        model_record = self._model_manager.get_model_record(model)
-        tool_adapter = select_tool_adapter(model, model_record)
+        model_record = model_context.model_record
+        tool_adapter = model_context.tool_adapter
         messages = normalize_message_contents(messages, adapter=tool_adapter)
         messages = _normalize_messages_for_model_template(
             messages,
@@ -840,7 +948,7 @@ class GenAIService:
         )
         prompt_tokens = None
         image_sizes = None
-        family = tokenizer_family_for_model(model, model_record, tool_adapter)
+        family = model_context.tokenizer_family
         if family == "kimi_k3":
             image_sizes = kimi_image_sizes_for_messages(messages)
         if count_usage:
@@ -857,7 +965,8 @@ class GenAIService:
         return PreparedChatRequest(
             messages=messages,
             model=model,
-            root_model_name=(model_record or {}).get("rootModelName"),
+            root_model_name=model_context.root_model_name,
+            root_ai_type=model_context.root_ai_type,
             max_tokens=max_tokens,
             has_tools=has_tools,
             tools=tools if has_tools else [],
@@ -1323,7 +1432,7 @@ class GenAIService:
     ):
         if stream_reasoning and not buffer_until_complete:
             raise ValueError("stream_reasoning requires buffered completion content")
-        root_ai_type = self._model_manager.root_ai_type_for(prepared.model)
+        root_ai_type = prepared.root_ai_type
         messages = messages if messages is not None else prepared.messages
         transport_messages, chat_info, image_fields = _genai_transport_input(
             messages,

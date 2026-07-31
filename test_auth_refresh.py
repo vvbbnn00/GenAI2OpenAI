@@ -169,6 +169,10 @@ class AuthRefreshTests(unittest.TestCase):
 
         self.assertEqual(manager.resolve_model("kimi-k3"), "Kimi-k3")
         self.assertIs(manager.get_model_record("KIMI-K3"), record)
+        self.assertEqual(
+            manager.resolve_model_record("kimi-K3"),
+            ("Kimi-k3", record),
+        )
 
     def test_model_list_refreshes_once_when_cached_token_is_rejected(self):
         token_manager = FakeTokenManager()

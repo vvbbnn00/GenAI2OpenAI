@@ -5,11 +5,6 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from genai_proxy.errors import ProxyError
-from genai_proxy.optimizations.registry import (
-    KIMI_K3_ADAPTER,
-    QWEN_3_5_ADAPTER,
-    select_tool_adapter,
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +24,8 @@ class ResponsesRequestContext:
 
 def convert_responses_to_openai_request(
     req_data: dict | None,
+    *,
+    keep_tools_after_output: bool = False,
 ) -> ResponsesRequestContext:
     if not isinstance(req_data, dict):
         raise ProxyError("Request body must be a JSON object")
@@ -43,11 +40,12 @@ def convert_responses_to_openai_request(
     request_tools.extend(_additional_tools_from_input(input_items))
     openai_tools, tool_map = _convert_responses_tools(request_tools)
     model = req_data.get("model", "GPT-4.1")
-    adapter = select_tool_adapter(model) if isinstance(model, str) else None
-    is_kimi_k3 = adapter == KIMI_K3_ADAPTER
-    preserve_images = adapter in {KIMI_K3_ADAPTER, QWEN_3_5_ADAPTER}
     tool_choice = req_data.get("tool_choice")
-    if tool_choice is None and _input_has_tool_output(input_items) and not is_kimi_k3:
+    if (
+        tool_choice is None
+        and _input_has_tool_output(input_items)
+        and not keep_tools_after_output
+    ):
         tool_choice = "none"
 
     messages = []
@@ -55,13 +53,7 @@ def convert_responses_to_openai_request(
     if isinstance(instructions, str) and instructions:
         messages.append({"role": "system", "content": instructions})
 
-    messages.extend(
-        _convert_response_input_items(
-            input_items,
-            tool_map,
-            preserve_images=preserve_images,
-        )
-    )
+    messages.extend(_convert_response_input_items(input_items, tool_map))
 
     openai_request = {
         "model": model,
@@ -532,8 +524,6 @@ def _input_has_tool_output(input_items: list) -> bool:
 def _convert_response_input_items(
     input_items: list,
     tool_map: dict[str, ResponseToolMapping],
-    *,
-    preserve_images: bool = False,
 ) -> list[dict]:
     messages = []
     for item in input_items:
@@ -544,11 +534,7 @@ def _convert_response_input_items(
             continue
         if _is_response_message_item(item):
             role = _response_role_to_chat_role(item.get("role"))
-            content = (
-                _content_to_chat_content(item.get("content"))
-                if preserve_images
-                else _content_to_text(item.get("content"))
-            )
+            content = _content_to_chat_content(item.get("content"))
             if content:
                 messages.append({"role": role, "content": content})
         elif item_type == "function_call":
@@ -684,7 +670,7 @@ def _content_to_chat_content(content):
 
     if has_image:
         return chat_parts
-    return "\n".join(part for part in text_parts if part)
+    return "".join(text_parts)
 
 
 def _output_to_text(output) -> str:

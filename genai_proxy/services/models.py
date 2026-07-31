@@ -74,13 +74,17 @@ class ModelManager:
             self._models_cache, self._models_cache_at = cached
 
     def resolve_model(self, model: str) -> str:
+        return self.resolve_model_record(model)[0]
+
+    def resolve_model_record(self, model: str) -> tuple[str, dict | None]:
+        """Resolve an ID and its record from one stable catalog snapshot."""
         requested = model or DEFAULT_MODEL
         requested_key = requested.casefold()
         for record in self.list_genai_models():
             ai_type = record.get("aiType")
             if isinstance(ai_type, str) and ai_type.casefold() == requested_key:
-                return ai_type
-        return requested
+                return ai_type, record
+        return requested, None
 
     def root_ai_type_for(self, model: str) -> str:
         record = self.get_model_record(model)

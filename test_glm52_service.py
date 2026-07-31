@@ -1257,6 +1257,26 @@ def test_claude_messages_accepts_system_role_message_from_harness():
     ]
 
 
+def test_claude_converter_reuses_a_resolved_model():
+    class UnexpectedResolver:
+        def resolve_model(self, _model):
+            raise AssertionError("model must not be resolved twice")
+
+    request = {
+        "model": "claude-alias",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "Hello"}],
+    }
+
+    openai_request = convert_claude_to_openai(
+        request,
+        UnexpectedResolver(),
+        resolved_model="chatglm",
+    )
+
+    assert openai_request["model"] == "chatglm"
+
+
 def test_claude_rejects_non_official_output_config_effort():
     model_manager = FakeModelManager()
     claude_request = {

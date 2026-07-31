@@ -11,7 +11,6 @@ from flask import (
 )
 
 from genai_proxy.compat.openai import openai_error
-from genai_proxy.compat.responses import convert_responses_to_openai_request
 from genai_proxy.errors import ProxyError
 from genai_proxy.routes import prime_stream
 
@@ -171,12 +170,11 @@ def responses():
 def response_input_tokens():
     service = current_app.extensions["genai_service"]
     try:
-        context = convert_responses_to_openai_request(request.get_json(silent=True))
         return jsonify(
             {
                 "object": "response.input_tokens",
-                "input_tokens": service.count_openai_input_tokens(
-                    context.openai_request
+                "input_tokens": service.count_responses_input_tokens(
+                    request.get_json(silent=True)
                 ),
             }
         )

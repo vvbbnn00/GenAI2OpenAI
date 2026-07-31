@@ -56,7 +56,12 @@ def claude_error(message, error_type="invalid_request_error", status=400):
     )
 
 
-def convert_claude_to_openai(req_data, model_manager):
+def convert_claude_to_openai(
+    req_data,
+    model_manager,
+    *,
+    resolved_model: str | None = None,
+):
     if not isinstance(req_data, dict):
         raise ProxyError("Request body must be a JSON object")
 
@@ -70,6 +75,8 @@ def convert_claude_to_openai(req_data, model_manager):
         raise ProxyError("Missing 'max_tokens' field in request body")
     if messages is None:
         raise ProxyError("Missing 'messages' field in request body")
+    if resolved_model is not None and not isinstance(resolved_model, str):
+        raise ProxyError("'model' must be a string")
     if not isinstance(messages, list) or any(
         not isinstance(message, dict) for message in messages
     ):
@@ -105,7 +112,11 @@ def convert_claude_to_openai(req_data, model_manager):
             raise ProxyError(f"Unsupported Claude message role: {role}")
 
     openai_request = {
-        "model": model_manager.resolve_model(model),
+        "model": (
+            resolved_model
+            if resolved_model is not None
+            else model_manager.resolve_model(model)
+        ),
         "messages": openai_messages,
         "max_tokens": max_tokens,
         "stream": bool(req_data.get("stream", False)),

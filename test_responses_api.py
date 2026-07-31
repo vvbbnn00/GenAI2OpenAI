@@ -3,8 +3,11 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from genai_proxy.app import create_app
 from genai_proxy.compat.responses import convert_responses_to_openai_request
+from genai_proxy.errors import ProxyError
 from genai_proxy.services.genai import GenAIService
 
 RESPONSES_WEATHER_TOOL = {
@@ -62,16 +65,18 @@ class FakeTokenManager:
 
 
 class FakeModelManager:
-    def __init__(self):
-        self.record = {
+    def __init__(self, record=None):
+        self.record = record or {
             "aiType": "chatglm",
             "aiName": "GLM",
             "descInfo": "GLM 5.2",
             "rootModelName": "Xinference",
             "rootAiType": "xinference",
         }
+        self.resolve_calls = 0
 
     def resolve_model(self, model):
+        self.resolve_calls += 1
         return model or "chatglm"
 
     def get_model_record(self, model):
@@ -99,7 +104,7 @@ class FakeResponse:
         pass
 
 
-def make_service(lines):
+def make_service(lines, *, record=None):
     captured = []
 
     def fake_post(_url, **kwargs):
@@ -109,7 +114,7 @@ def make_service(lines):
     service = GenAIService(
         logging.getLogger("test_responses_api"),
         FakeTokenManager(),
-        FakeModelManager(),
+        FakeModelManager(record),
     )
     return service, captured, fake_post
 
@@ -310,7 +315,7 @@ def test_responses_input_image_is_preserved_as_openai_vision_content():
     ]
 
 
-def test_responses_image_preservation_is_scoped_to_visual_models():
+def test_responses_converter_preserves_images_until_model_validation():
     context = convert_responses_to_openai_request(
         {
             "model": "GPT-4.1",
@@ -331,9 +336,129 @@ def test_responses_image_preservation_is_scoped_to_visual_models():
     assert context.openai_request["messages"] == [
         {
             "role": "user",
-            "content": "[image: https://example.test/image.png]",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.test/image.png"},
+                }
+            ],
         }
     ]
+
+
+def test_responses_text_parts_keep_protocol_order_without_added_newlines():
+    context = convert_responses_to_openai_request(
+        {
+            "model": "chatglm",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "first"},
+                        {"type": "input_text", "text": "second"},
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert context.openai_request["messages"] == [
+        {"role": "user", "content": "firstsecond"}
+    ]
+
+
+def test_responses_uses_resolved_qwen_record_for_visual_transport():
+    data_url = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    record = {
+        "aiType": "campus-vision",
+        "aiName": "Qwen3.5-397B-A17B",
+        "rootModelName": "Xinference",
+        "rootAiType": "xinference",
+    }
+    service, captured, fake_post = make_service(
+        [genai_sse({"content": "Visible."}), genai_sse({}, "stop")],
+        record=record,
+    )
+    request = {
+        "model": "campus-vision",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Describe it."},
+                    {"type": "input_image", "image_url": data_url},
+                ],
+            }
+        ],
+        "stream": True,
+    }
+
+    with patch("genai_proxy.services.genai.requests.post", fake_post):
+        list(service.stream_responses(request))
+
+    assert captured[0]["messages"][-1]["content"] == [
+        {"type": "text", "text": "Describe it."},
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ]
+    assert service._model_manager.resolve_calls == 1
+    assert "chatGroupId" not in captured[0]
+
+
+def test_responses_non_visual_record_rejects_image_before_upstream():
+    service, _, _ = make_service([])
+    request = {
+        "model": "chatglm",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "https://example.test/image.png",
+                    }
+                ],
+            }
+        ],
+        "stream": True,
+    }
+
+    with patch("genai_proxy.services.genai.requests.post") as post:
+        with pytest.raises(ProxyError) as exc_info:
+            list(service.stream_responses(request))
+
+    assert exc_info.value.status == 400
+    assert exc_info.value.code == "unsupported_content_type"
+    post.assert_not_called()
+
+
+def test_responses_resolved_kimi_adapter_keeps_tools_after_tool_output():
+    record = {
+        "aiType": "campus-assistant",
+        "aiName": "Kimi-K3",
+        "rootModelName": "Xinference",
+        "rootAiType": "xinference",
+    }
+    service, _, _ = make_service([], record=record)
+    context, model_context = service._convert_responses_request(
+        {
+            "model": "campus-assistant",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "done",
+                }
+            ],
+            "tools": [RESPONSES_WEATHER_TOOL],
+        }
+    )
+
+    assert model_context.tool_adapter == "kimi_k3"
+    assert context.openai_request.get("tool_choice") != "none"
 
 
 def test_responses_qwen_image_is_preserved_for_official_visual_template():
@@ -628,7 +753,10 @@ def test_responses_kimi_function_output_keeps_tools_available_by_default():
         "tools": [RESPONSES_WEATHER_TOOL],
     }
 
-    context = convert_responses_to_openai_request(request)
+    context = convert_responses_to_openai_request(
+        request,
+        keep_tools_after_output=True,
+    )
 
     assert context.openai_request["tool_choice"] == "auto"
     service, _captured, _fake_post = make_service([])
@@ -653,7 +781,10 @@ def test_responses_kimi_function_output_keeps_tools_available_by_default():
     )
 
     request["tool_choice"] = "none"
-    explicit_none = convert_responses_to_openai_request(request)
+    explicit_none = convert_responses_to_openai_request(
+        request,
+        keep_tools_after_output=True,
+    )
     assert explicit_none.openai_request["tool_choice"] == "none"
 
 
