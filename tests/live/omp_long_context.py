@@ -15,7 +15,7 @@ from werkzeug.serving import WSGIRequestHandler, make_server
 
 from genai_proxy.app import create_app
 from genai_proxy.config import AppConfig
-from genai_proxy.optimizations.registry import select_tool_adapter
+from genai_proxy.models.registry import select_tool_adapter
 from genai_proxy.token_usage import count_openai_request_tokens
 
 # This is an opt-in keystore-backed OMP integration runner, not an offline test.

@@ -14,10 +14,10 @@ from unittest.mock import patch
 
 from PIL import Image
 
-import genai_proxy.services.genai as genai_module
+import genai_proxy.upstream.transport as upstream_transport
 from genai_proxy.app import create_app
 from genai_proxy.config import AppConfig
-from genai_proxy.optimizations.registry import (
+from genai_proxy.models.registry import (
     DEEPSEEK_V4_FLASH_ADAPTER,
     DEEPSEEK_V4_PRO_ADAPTER,
 )
@@ -177,8 +177,8 @@ class LiveTransportAudit:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._original_post = genai_module.requests.post
-        self._original_get = genai_module.requests.get
+        self._original_post = upstream_transport.requests.post
+        self._original_get = upstream_transport.requests.get
         self._chat_requests = []
         self._history_list_requests = 0
         self._successful_history_deletes = 0
@@ -187,12 +187,12 @@ class LiveTransportAudit:
     def installed(self):
         with (
             patch.object(
-                genai_module.requests,
+                upstream_transport.requests,
                 "post",
                 side_effect=self._post,
             ),
             patch.object(
-                genai_module.requests,
+                upstream_transport.requests,
                 "get",
                 side_effect=self._get,
             ),
@@ -237,7 +237,7 @@ class LiveTransportAudit:
             }
 
     def _post(self, url, *args, **kwargs):
-        if url == genai_module.GENAI_URL:
+        if url == upstream_transport.GENAI_URL:
             payload = kwargs.get("json")
             if not isinstance(payload, dict):
                 raise AssertionError("GenAI chat request did not use a JSON object")
@@ -279,10 +279,10 @@ class LiveTransportAudit:
 
     def _get(self, url, *args, **kwargs):
         response = self._original_get(url, *args, **kwargs)
-        if url == genai_module.GENAI_HISTORY_LIST_URL:
+        if url == upstream_transport.GENAI_HISTORY_LIST_URL:
             with self._lock:
                 self._history_list_requests += 1
-        elif url == genai_module.GENAI_HISTORY_DELETE_URL:
+        elif url == upstream_transport.GENAI_HISTORY_DELETE_URL:
             if _successful_genai_response(response):
                 with self._lock:
                     self._successful_history_deletes += 1

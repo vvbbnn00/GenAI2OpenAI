@@ -5,21 +5,21 @@ from types import SimpleNamespace
 
 import pytest
 
-import genai_proxy.services.genai as genai_module
-from genai_proxy.services.genai import (
+import genai_proxy.upstream.transport as upstream_transport
+from genai_proxy.upstream.transport import (
     GENAI_HISTORY_DELETE_URL,
     GENAI_HISTORY_LIST_URL,
     GENAI_URL,
 )
-from test_allowed_models_integration import (
+from tests.live import allowed_models as live_models
+from tests.live.allowed_models import (
     ALLOWED_MODELS,
-    LiveTransportAudit,
     LiveCaseTimeout,
+    LiveTransportAudit,
     _deepseek_max_prefixes,
     assert_optional_responses_reasoning_preserved,
     live_case_deadline,
     quiet_integration_logger,
-    tests_for_model as _tests_for_model,
 )
 
 
@@ -53,7 +53,7 @@ def test_live_model_matrix_covers_protocols_capabilities_and_continuations():
     vision = {"openai_vision", "responses_vision", "claude_vision"}
 
     for model in ALLOWED_MODELS:
-        names = [name for name, _function in _tests_for_model(model)]
+        names = [name for name, _function in live_models.tests_for_model(model)]
         assert len(names) == len(set(names)), f"duplicate live tests for {model}"
 
         expected = set(common)
@@ -163,8 +163,8 @@ def test_live_audit_records_sanitized_transport_metadata():
 
 
 def test_live_audit_installs_and_restores_request_wrappers():
-    original_post = genai_module.requests.post
-    original_get = genai_module.requests.get
+    original_post = upstream_transport.requests.post
+    original_get = upstream_transport.requests.get
     post_response = object()
     get_response = SimpleNamespace(
         status_code=200,
@@ -176,7 +176,7 @@ def test_live_audit_installs_and_restores_request_wrappers():
 
     with audit.installed():
         assert (
-            genai_module.requests.post(
+            upstream_transport.requests.post(
                 GENAI_URL,
                 json={
                     "aiType": "chatglm",
@@ -187,10 +187,10 @@ def test_live_audit_installs_and_restores_request_wrappers():
             )
             is post_response
         )
-        assert genai_module.requests.get(GENAI_HISTORY_LIST_URL) is get_response
+        assert upstream_transport.requests.get(GENAI_HISTORY_LIST_URL) is get_response
 
-    assert genai_module.requests.post is original_post
-    assert genai_module.requests.get is original_get
+    assert upstream_transport.requests.post is original_post
+    assert upstream_transport.requests.get is original_get
 
 
 @pytest.mark.parametrize(

@@ -5,11 +5,11 @@ from unittest.mock import patch
 
 import pytest
 
+from genai_proxy.api.openai.service import GenAIService
 from genai_proxy.errors import ProxyError
-from genai_proxy.services.genai import (
+from genai_proxy.upstream.transport import (
     GENAI_HISTORY_DELETE_URL,
     GENAI_HISTORY_LIST_URL,
-    GenAIService,
 )
 
 
@@ -159,10 +159,10 @@ def test_kimi_deletes_only_the_new_history_group_before_terminal_chunk():
     upstream = FakeStreamResponse(completion_events())
     with (
         patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=upstream,
         ) as post,
-        patch("genai_proxy.services.genai.requests.get", side_effect=fake_get),
+        patch("genai_proxy.upstream.transport.requests.get", side_effect=fake_get),
     ):
         stream = service().stream_openai_completion(request())
         content_chunk = next(stream)
@@ -187,8 +187,8 @@ def test_kimi_deletes_only_the_new_history_group_before_terminal_chunk():
 def test_non_kimi_never_reads_or_deletes_history():
     upstream = FakeStreamResponse(completion_events())
     with (
-        patch("genai_proxy.services.genai.requests.post", return_value=upstream),
-        patch("genai_proxy.services.genai.requests.get") as get,
+        patch("genai_proxy.upstream.transport.requests.post", return_value=upstream),
+        patch("genai_proxy.upstream.transport.requests.get") as get,
     ):
         chunks = list(
             service().stream_openai_completion(
@@ -204,10 +204,10 @@ def test_kimi_cleanup_can_be_disabled_without_changing_transport():
     upstream = FakeStreamResponse(completion_events())
     with (
         patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=upstream,
         ) as post,
-        patch("genai_proxy.services.genai.requests.get") as get,
+        patch("genai_proxy.upstream.transport.requests.get") as get,
     ):
         chunks = list(service(cleanup=False).stream_openai_completion(request()))
 
@@ -226,8 +226,8 @@ def test_kimi_does_not_delete_before_successful_completion():
         return history_response([])
 
     with (
-        patch("genai_proxy.services.genai.requests.post", return_value=upstream),
-        patch("genai_proxy.services.genai.requests.get", side_effect=fake_get),
+        patch("genai_proxy.upstream.transport.requests.post", return_value=upstream),
+        patch("genai_proxy.upstream.transport.requests.get", side_effect=fake_get),
     ):
         chunks = list(service().stream_openai_completion(request()))
 
@@ -239,9 +239,9 @@ def test_kimi_client_disconnect_releases_lock_without_deleting():
     upstream = FakeStreamResponse(completion_events())
     instance = service()
     with (
-        patch("genai_proxy.services.genai.requests.post", return_value=upstream),
+        patch("genai_proxy.upstream.transport.requests.post", return_value=upstream),
         patch(
-            "genai_proxy.services.genai.requests.get",
+            "genai_proxy.upstream.transport.requests.get",
             return_value=history_response([]),
         ) as get,
     ):
@@ -276,11 +276,11 @@ def test_kimi_waits_for_delayed_history_visibility():
 
     with (
         patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamResponse(completion_events()),
         ),
-        patch("genai_proxy.services.genai.requests.get", side_effect=fake_get),
-        patch("genai_proxy.services.genai.time.sleep") as sleep,
+        patch("genai_proxy.upstream.transport.requests.get", side_effect=fake_get),
+        patch("genai_proxy.upstream.kimi_history.time.sleep") as sleep,
     ):
         chunks = list(service().stream_openai_completion(request()))
 
@@ -313,10 +313,10 @@ def test_kimi_scans_all_history_pages_before_deleting_new_group():
 
     with (
         patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamResponse(completion_events()),
         ),
-        patch("genai_proxy.services.genai.requests.get", side_effect=fake_get),
+        patch("genai_proxy.upstream.transport.requests.get", side_effect=fake_get),
     ):
         chunks = list(service().stream_openai_completion(request()))
 
@@ -343,10 +343,10 @@ def test_kimi_skips_ambiguous_history_deletion():
 
     with (
         patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamResponse(completion_events()),
         ),
-        patch("genai_proxy.services.genai.requests.get", side_effect=fake_get),
+        patch("genai_proxy.upstream.transport.requests.get", side_effect=fake_get),
     ):
         chunks = list(service().stream_openai_completion(request()))
 
@@ -378,10 +378,10 @@ def test_kimi_delete_failure_does_not_corrupt_completed_response():
 
     with (
         patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamResponse(completion_events()),
         ),
-        patch("genai_proxy.services.genai.requests.get", side_effect=fake_get),
+        patch("genai_proxy.upstream.transport.requests.get", side_effect=fake_get),
     ):
         chunks = list(service().stream_openai_completion(request()))
 
@@ -392,11 +392,11 @@ def test_kimi_delete_failure_does_not_corrupt_completed_response():
 def test_kimi_snapshot_failure_does_not_attempt_unsafe_deletion():
     with (
         patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamResponse(completion_events()),
         ),
         patch(
-            "genai_proxy.services.genai.requests.get",
+            "genai_proxy.upstream.transport.requests.get",
             return_value=FakeJsonResponse({}, status_code=400),
         ) as get,
     ):
@@ -428,10 +428,10 @@ def test_kimi_malformed_snapshot_records_never_delete_an_old_matching_group():
 
     with (
         patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamResponse(completion_events()),
         ),
-        patch("genai_proxy.services.genai.requests.get", side_effect=fake_get),
+        patch("genai_proxy.upstream.transport.requests.get", side_effect=fake_get),
     ):
         chunks = list(service().stream_openai_completion(request()))
 
@@ -466,10 +466,10 @@ def test_kimi_ignores_malformed_history_entries_and_response_codes():
 
     with (
         patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamResponse(completion_events()),
         ),
-        patch("genai_proxy.services.genai.requests.get", side_effect=fake_get),
+        patch("genai_proxy.upstream.transport.requests.get", side_effect=fake_get),
     ):
         chunks = list(service().stream_openai_completion(request()))
 
@@ -481,11 +481,11 @@ def test_kimi_ignores_malformed_history_entries_and_response_codes():
 def test_kimi_malformed_history_payload_is_nonfatal_and_not_deleted():
     with (
         patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamResponse(completion_events()),
         ),
         patch(
-            "genai_proxy.services.genai.requests.get",
+            "genai_proxy.upstream.transport.requests.get",
             return_value=FakeJsonResponse([]),
         ) as get,
     ):

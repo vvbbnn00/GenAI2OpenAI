@@ -11,17 +11,17 @@ import pytest
 import requests
 from PIL import Image
 
+from genai_proxy.api.anthropic.compat import convert_claude_to_openai
+from genai_proxy.api.openai.service import GenAIService
 from genai_proxy.app import create_app
-from genai_proxy.compat.claude import convert_claude_to_openai
 from genai_proxy.errors import ProxyError
-from genai_proxy.optimizations.deepseek import (
+from genai_proxy.models.deepseek_v4.tooling import (
     inject_deepseek_reasoning_prompt,
     inject_deepseek_tool_prompt,
 )
-from genai_proxy.optimizations.glm import inject_glm_tool_prompt
-from genai_proxy.optimizations.minimax import inject_minimax_tool_prompt
-from genai_proxy.optimizations.qwen import inject_qwen35_tool_prompt
-from genai_proxy.services.genai import GenAIService
+from genai_proxy.models.glm52.tooling import inject_glm_tool_prompt
+from genai_proxy.models.legacy.minimax import inject_minimax_tool_prompt
+from genai_proxy.models.qwen35.tooling import inject_qwen35_tool_prompt
 from genai_proxy.token_usage import (
     DEEPSEEK_V4_PRO_SPEC,
     GLM_5_1_SPEC,
@@ -1119,7 +1119,7 @@ def test_kimi_transport_splits_current_visual_input_for_genai():
     )
 
     with patch(
-        "genai_proxy.services.genai.requests.post",
+        "genai_proxy.upstream.transport.requests.post",
         return_value=upstream,
     ) as post:
         chunks = list(
@@ -1162,7 +1162,7 @@ def test_kimi_transport_preserves_multiple_current_images_in_order():
     assert prepared.image_sizes == ((56, 28), (29, 28))
 
     with patch(
-        "genai_proxy.services.genai.requests.post",
+        "genai_proxy.upstream.transport.requests.post",
         return_value=upstream,
     ) as post:
         chunks = list(app.extensions["genai_service"].stream_openai_completion(request))
@@ -1379,7 +1379,7 @@ def test_kimi_active_tools_use_validated_bridge_without_chat_group_id():
     }
 
     with patch(
-        "genai_proxy.services.genai.requests.post", return_value=upstream
+        "genai_proxy.upstream.transport.requests.post", return_value=upstream
     ) as post:
         response = client.post(
             "/v1/chat/completions",
@@ -1451,7 +1451,7 @@ def test_kimi_auto_never_executes_a_plain_json_answer():
     )
 
     with patch(
-        "genai_proxy.services.genai.requests.post", return_value=upstream
+        "genai_proxy.upstream.transport.requests.post", return_value=upstream
     ) as post:
         response = (
             _app()
@@ -1502,7 +1502,7 @@ def test_kimi_auto_retries_unwrapped_response_as_required_action():
     }
 
     with patch(
-        "genai_proxy.services.genai.requests.post",
+        "genai_proxy.upstream.transport.requests.post",
         side_effect=[first, second],
     ) as post:
         response = (
@@ -1577,7 +1577,7 @@ def test_kimi_bridge_stream_waits_for_complete_action_then_emits_tool_chunks():
         "stream_options": {"include_usage": True},
     }
 
-    with patch("genai_proxy.services.genai.requests.post", return_value=upstream):
+    with patch("genai_proxy.upstream.transport.requests.post", return_value=upstream):
         body = "".join(
             _app().extensions["genai_service"].stream_openai_completion(request)
         )
@@ -1630,7 +1630,7 @@ def test_kimi_bridge_rejects_malformed_tagged_action():
         ]
     )
 
-    with patch("genai_proxy.services.genai.requests.post", return_value=upstream):
+    with patch("genai_proxy.upstream.transport.requests.post", return_value=upstream):
         response = (
             _app()
             .test_client()
@@ -1666,7 +1666,7 @@ def test_kimi_bridge_enforces_required_tool_choice():
         ]
     )
 
-    with patch("genai_proxy.services.genai.requests.post", return_value=upstream):
+    with patch("genai_proxy.upstream.transport.requests.post", return_value=upstream):
         response = (
             _app()
             .test_client()
@@ -1734,7 +1734,7 @@ def test_kimi_bridge_retries_required_tool_choice_twice():
     app = _app()
 
     with patch(
-        "genai_proxy.services.genai.requests.post",
+        "genai_proxy.upstream.transport.requests.post",
         side_effect=[first_failure, second_failure, success],
     ) as post:
         response = app.test_client().post(
@@ -1810,7 +1810,7 @@ def test_kimi_auto_accepts_explicit_final_after_tool_result():
     }
 
     with patch(
-        "genai_proxy.services.genai.requests.post",
+        "genai_proxy.upstream.transport.requests.post",
         return_value=upstream,
     ) as post:
         response = (
@@ -1858,7 +1858,7 @@ def test_kimi_auto_accepts_normal_text_that_mentions_tool_and_argument_names():
     }
 
     with patch(
-        "genai_proxy.services.genai.requests.post",
+        "genai_proxy.upstream.transport.requests.post",
         return_value=upstream,
     ) as post:
         response = (
@@ -1908,7 +1908,7 @@ def test_kimi_malformed_action_retries_with_structural_prompt():
     }
 
     with patch(
-        "genai_proxy.services.genai.requests.post",
+        "genai_proxy.upstream.transport.requests.post",
         side_effect=[first, second],
     ) as post:
         response = (
@@ -1968,7 +1968,7 @@ def test_kimi_tool_bridge_counting_is_consistent_across_compatibility_routes():
         ),
     ]
 
-    with patch("genai_proxy.services.genai.requests.post") as post:
+    with patch("genai_proxy.upstream.transport.requests.post") as post:
         for path, payload in cases:
             response = client.post(path, json=payload)
             assert response.status_code == 200
@@ -2036,7 +2036,7 @@ def test_kimi_tool_bridge_generation_is_consistent_across_compatibility_routes()
     }
 
     with patch(
-        "genai_proxy.services.genai.requests.post",
+        "genai_proxy.upstream.transport.requests.post",
         side_effect=[upstream(), upstream()],
     ) as post:
         responses_response = app.test_client().post(
@@ -2090,7 +2090,7 @@ def test_kimi_tool_history_result_becomes_nonempty_current_input():
         ]
     )
     with patch(
-        "genai_proxy.services.genai.requests.post", return_value=upstream
+        "genai_proxy.upstream.transport.requests.post", return_value=upstream
     ) as post:
         response = app.test_client().post(
             "/v1/chat/completions",
@@ -2221,7 +2221,7 @@ def test_kimi_tool_history_sends_only_latest_reasoning_as_continuation_state():
     }
 
     with patch(
-        "genai_proxy.services.genai.requests.post",
+        "genai_proxy.upstream.transport.requests.post",
         return_value=fake_completion("<k3_final>Inspection complete.</k3_final>"),
     ) as post:
         response = (
@@ -2923,7 +2923,7 @@ def test_nonstream_usage_covers_all_supported_model_families():
             ]
         )
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=upstream,
         ):
             response = service.build_openai_completion(
@@ -2954,7 +2954,7 @@ def test_responses_usage_uses_exact_qwen_counts():
             ).encode()
         ]
     )
-    with patch("genai_proxy.services.genai.requests.post", return_value=upstream):
+    with patch("genai_proxy.upstream.transport.requests.post", return_value=upstream):
         response = service.build_response({"model": "qwen3.5", "input": "Hello"})
 
     assert response["usage"] == {
@@ -2981,7 +2981,7 @@ def test_anthropic_nonstream_usage_uses_exact_qwen_counts():
             ).encode()
         ]
     )
-    with patch("genai_proxy.services.genai.requests.post", return_value=upstream):
+    with patch("genai_proxy.upstream.transport.requests.post", return_value=upstream):
         response = (
             _app()
             .test_client()
@@ -3017,7 +3017,7 @@ def test_anthropic_stream_usage_uses_exact_qwen_counts():
             ).encode()
         ]
     )
-    with patch("genai_proxy.services.genai.requests.post", return_value=upstream):
+    with patch("genai_proxy.upstream.transport.requests.post", return_value=upstream):
         response = (
             _app()
             .test_client()
@@ -3281,7 +3281,7 @@ def test_chat_stream_include_usage_counts_reasoning_and_content():
             json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]}).encode(),
         ]
     )
-    with patch("genai_proxy.services.genai.requests.post", return_value=upstream):
+    with patch("genai_proxy.upstream.transport.requests.post", return_value=upstream):
         body = "".join(
             service.stream_openai_completion(
                 {
@@ -3323,7 +3323,7 @@ def test_chat_stream_without_usage_skips_tokenizer_counting():
         ]
     )
     with (
-        patch("genai_proxy.services.genai.requests.post", return_value=upstream),
+        patch("genai_proxy.upstream.transport.requests.post", return_value=upstream),
         patch(
             "genai_proxy.chat.preparation.count_openai_request_tokens"
         ) as prepare_count_request,
@@ -3373,7 +3373,7 @@ def test_chat_stream_defers_requested_usage_until_after_first_delta():
         ]
     )
     with (
-        patch("genai_proxy.services.genai.requests.post", return_value=upstream),
+        patch("genai_proxy.upstream.transport.requests.post", return_value=upstream),
         patch(
             "genai_proxy.chat.preparation.count_openai_request_tokens",
         ) as prepare_count_request,
@@ -3426,7 +3426,7 @@ def test_chat_usage_propagates_length_finish_reason():
         "model": "qwen3.5",
         "messages": [{"role": "user", "content": "Hello"}],
     }
-    with patch("genai_proxy.services.genai.requests.post", return_value=upstream):
+    with patch("genai_proxy.upstream.transport.requests.post", return_value=upstream):
         response = service.build_openai_completion(request)
 
     assert response["choices"][0]["finish_reason"] == "length"
@@ -3468,7 +3468,7 @@ def test_parsed_qwen_tool_call_usage_counts_raw_generated_syntax():
             }
         ],
     }
-    with patch("genai_proxy.services.genai.requests.post", return_value=upstream):
+    with patch("genai_proxy.upstream.transport.requests.post", return_value=upstream):
         response = service.build_openai_completion(request)
 
     assert response["choices"][0]["finish_reason"] == "tool_calls"

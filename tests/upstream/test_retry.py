@@ -10,6 +10,9 @@ from unittest.mock import patch
 import requests
 from flask import Flask
 
+from genai_proxy.api.openai.routes import bp as openai_bp
+from genai_proxy.api.openai.service import GenAIService
+from genai_proxy.chat.streaming import GENAI_TIMEOUT_MAX_RETRIES
 from genai_proxy.config import parse_args
 from genai_proxy.errors import ProxyError
 from genai_proxy.retry import (
@@ -17,13 +20,8 @@ from genai_proxy.retry import (
     is_retryable_business_error,
     retry_delay,
 )
-from genai_proxy.routes.openai import bp as openai_bp
-from genai_proxy.services.genai import (
-    GENAI_STREAM_TIMEOUT,
-    GENAI_TIMEOUT_MAX_RETRIES,
-    GenAIService,
-)
-from genai_proxy.services.models import ModelManager
+from genai_proxy.upstream.catalog import ModelManager
+from genai_proxy.upstream.transport import GENAI_STREAM_TIMEOUT
 
 
 class FakeTokenManager:
@@ -129,7 +127,7 @@ class GenAIRetryTests(unittest.TestCase):
         success = FakeResponse(completion_lines())
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             side_effect=[
                 requests.ConnectionError("[Errno 101] Network is unreachable"),
                 success,
@@ -146,7 +144,7 @@ class GenAIRetryTests(unittest.TestCase):
         success = FakeResponse(completion_lines())
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             side_effect=[requests.ConnectTimeout("connect timed out"), success],
         ) as post:
             chunks = list(service.stream_openai_completion(make_request()))
@@ -159,7 +157,7 @@ class GenAIRetryTests(unittest.TestCase):
         service = make_service(max_retries=10)
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             side_effect=requests.ReadTimeout("upstream stalled"),
         ) as post:
             with self.assertRaises(ProxyError) as raised:
@@ -179,7 +177,7 @@ class GenAIRetryTests(unittest.TestCase):
         success = FakeResponse(completion_lines())
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             side_effect=[unavailable, success],
         ) as post:
             chunks = list(service.stream_openai_completion(make_request()))
@@ -193,7 +191,7 @@ class GenAIRetryTests(unittest.TestCase):
         service = make_service(max_retries=2)
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             side_effect=requests.ConnectionError("connection refused"),
         ) as post:
             with self.assertRaises(ProxyError) as raised:
@@ -215,7 +213,7 @@ class GenAIRetryTests(unittest.TestCase):
 
         response = InterruptedResponse()
         with patch(
-            "genai_proxy.services.genai.requests.post", return_value=response
+            "genai_proxy.upstream.transport.requests.post", return_value=response
         ) as post:
             chunks = list(service.stream_openai_completion(make_request()))
 
@@ -237,7 +235,7 @@ class GenAIRetryTests(unittest.TestCase):
         }
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeResponse(completion_lines()),
         ):
             chunks = list(service.stream_openai_completion(request))
@@ -264,7 +262,7 @@ class GenAIRetryTests(unittest.TestCase):
         request = {**make_request(), "stream": False}
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             side_effect=[interrupted, success],
         ) as post:
             response = service.build_openai_completion(request)
@@ -280,7 +278,7 @@ class GenAIRetryTests(unittest.TestCase):
         request = {**make_request(), "stream": False}
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             side_effect=[incomplete, success],
         ) as post:
             response = service.build_openai_completion(request)
@@ -307,7 +305,7 @@ class GenAIRetryTests(unittest.TestCase):
         success = FakeResponse(completion_lines())
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             side_effect=[business_error, success],
         ) as post:
             chunks = list(service.stream_openai_completion(make_request()))
@@ -335,7 +333,7 @@ class GenAIRetryTests(unittest.TestCase):
                 )
 
                 with patch(
-                    "genai_proxy.services.genai.requests.post",
+                    "genai_proxy.upstream.transport.requests.post",
                     return_value=business_error,
                 ) as post:
                     with self.assertRaises(ProxyError) as raised:
@@ -373,7 +371,7 @@ class GenAIRetryTests(unittest.TestCase):
         }
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             side_effect=[
                 InterruptedResponse(),
                 FakeResponse(completion_lines("complete")),
@@ -421,7 +419,7 @@ class GenAIRetryTests(unittest.TestCase):
         }
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=InterruptedResponse(),
         ) as post:
             chunks = list(service.stream_openai_completion(request))
@@ -468,7 +466,7 @@ class GenAIRetryTests(unittest.TestCase):
         )
 
         with patch(
-            "genai_proxy.services.models.requests.get",
+            "genai_proxy.upstream.catalog.requests.get",
             side_effect=[
                 requests.ConnectionError("connection reset"),
                 FakeResponse(status_code=502, text="bad gateway"),
@@ -491,7 +489,7 @@ class GenAIRetryTests(unittest.TestCase):
         manager._models_cache_at = 0
 
         with patch(
-            "genai_proxy.services.models.requests.get",
+            "genai_proxy.upstream.catalog.requests.get",
             side_effect=requests.ConnectionError("connection reset"),
         ) as get:
             models = manager.list_genai_models(force_refresh=True)
@@ -510,7 +508,7 @@ class GenAIRetryTests(unittest.TestCase):
         manager._models_cache_at = 0
 
         with patch(
-            "genai_proxy.services.models.requests.get",
+            "genai_proxy.upstream.catalog.requests.get",
             return_value=FakeResponse(status_code=401),
         ):
             models = manager.list_genai_models(force_refresh=True)

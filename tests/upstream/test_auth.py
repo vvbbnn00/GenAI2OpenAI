@@ -10,18 +10,18 @@ from unittest.mock import patch
 
 from flask import Flask
 
-from genai_proxy.compat.claude import stream_openai_to_claude
-from genai_proxy.compat.openai import make_error_chunk
+from genai_proxy.api.anthropic.compat import stream_openai_to_claude
+from genai_proxy.api.openai.errors import make_error_chunk
+from genai_proxy.api.openai.routes import bp as openai_bp
+from genai_proxy.api.openai.service import GenAIService
 from genai_proxy.errors import ProxyError
-from genai_proxy.routes.openai import bp as openai_bp
-from genai_proxy.services.genai import GenAIService
-from genai_proxy.services.models import ModelManager
-from genai_proxy.services.token_manager import (
+from genai_proxy.upstream.auth import (
     GENAI_LEGACY_CAS_SERVICE_URL,
     GENAI_LOGIN_URL,
     TokenManager,
     is_genai_auth_failure,
 )
+from genai_proxy.upstream.catalog import ModelManager
 
 
 def make_jwt(exp: int | None = None) -> str:
@@ -204,7 +204,7 @@ class AuthRefreshTests(unittest.TestCase):
         ]
 
         with patch(
-            "genai_proxy.services.models.requests.get", side_effect=responses
+            "genai_proxy.upstream.catalog.requests.get", side_effect=responses
         ) as mocked_get:
             models = manager.list_genai_models(force_refresh=True)
 
@@ -242,7 +242,7 @@ class AuthRefreshTests(unittest.TestCase):
         )
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=response,
         ):
             with self.assertRaises(ProxyError) as raised:
@@ -290,7 +290,7 @@ class AuthRefreshTests(unittest.TestCase):
         }
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamingResponse(
                 [json.dumps(auth_failure, ensure_ascii=False).encode()]
             ),
@@ -319,7 +319,7 @@ class AuthRefreshTests(unittest.TestCase):
         }
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamingResponse(
                 [json.dumps(auth_failure, ensure_ascii=False).encode()]
             ),
@@ -365,7 +365,7 @@ class AuthRefreshTests(unittest.TestCase):
         )
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamingResponse([completion_line.encode()]),
         ):
             response = service.build_openai_completion(
@@ -394,7 +394,7 @@ class AuthRefreshTests(unittest.TestCase):
         }
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamingResponse([json.dumps(business_error).encode()]),
         ):
             with self.assertRaises(ProxyError) as raised:
@@ -426,7 +426,7 @@ class AuthRefreshTests(unittest.TestCase):
         }
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamingResponse([json.dumps(business_error).encode()]),
         ):
             stream = service.stream_openai_completion(
@@ -467,7 +467,7 @@ class AuthRefreshTests(unittest.TestCase):
         ]
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamingResponse(lines),
         ):
             stream = service.stream_openai_completion(
@@ -515,7 +515,7 @@ class AuthRefreshTests(unittest.TestCase):
         ]
 
         with patch(
-            "genai_proxy.services.genai.requests.post",
+            "genai_proxy.upstream.transport.requests.post",
             return_value=FakeStreamingResponse(lines),
         ):
             with self.assertRaises(ProxyError) as raised:
@@ -695,7 +695,7 @@ class AuthRefreshTests(unittest.TestCase):
         ]
 
         with patch(
-            "genai_proxy.services.genai.requests.get", side_effect=responses
+            "genai_proxy.upstream.transport.requests.get", side_effect=responses
         ) as mocked_get:
             result = service.fetch_openai_billing_subscription()
 
@@ -744,7 +744,7 @@ class AuthRefreshTests(unittest.TestCase):
         ]
 
         with patch(
-            "genai_proxy.services.genai.requests.get", side_effect=responses
+            "genai_proxy.upstream.transport.requests.get", side_effect=responses
         ) as mocked_get:
             service.fetch_openai_billing_subscription()
             usage = service.fetch_openai_billing_usage()
@@ -766,7 +766,7 @@ class AuthRefreshTests(unittest.TestCase):
         service = GenAIService(self.logger, token_manager, None)
 
         with patch(
-            "genai_proxy.services.genai.requests.get",
+            "genai_proxy.upstream.transport.requests.get",
             return_value=FakeResponse(
                 {
                     "success": True,
@@ -786,7 +786,7 @@ class AuthRefreshTests(unittest.TestCase):
         manager = ModelManager(self.logger, token_manager, max_retries=0)
 
         with patch(
-            "genai_proxy.services.models.requests.get",
+            "genai_proxy.upstream.catalog.requests.get",
             return_value=FakeResponse({"success": True, "code": 200, "result": None}),
         ):
             models = manager.list_genai_models(force_refresh=True)

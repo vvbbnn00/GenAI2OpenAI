@@ -1,6 +1,6 @@
 import json
 
-from test_omp_long_context_integration import (
+from tests.live.omp_long_context import (
     PASS_MARKER,
     _consume_omp_line,
     _write_workspace,

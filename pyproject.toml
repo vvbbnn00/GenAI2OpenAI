@@ -31,6 +31,13 @@ dev = [
 [tool.uv.sources]
 shanghaitech-ids-passkey = { git = "https://github.com/vvbbnn00/shanghaitech-ids-passkey.git", branch = "main" }
 
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib", "--strict-markers"]
+testpaths = ["tests"]
+markers = [
+    "live: requires an explicit opt-in and access to the real upstream service",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/genai_proxy"]
 

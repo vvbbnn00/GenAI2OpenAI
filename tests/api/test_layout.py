@@ -39,7 +39,7 @@ def test_openai_service_composes_protocol_and_chat_layers():
 
 
 def test_chat_layer_does_not_import_api_or_compat_modules():
-    chat_dir = Path(__file__).parent / "src" / "genai_proxy" / "chat"
+    chat_dir = Path(__file__).parents[2] / "src" / "genai_proxy" / "chat"
     forbidden_prefixes = ("genai_proxy.api", "genai_proxy.compat")
     assert chat_dir.is_dir()
 

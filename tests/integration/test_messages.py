@@ -4,17 +4,16 @@ from unittest.mock import patch
 
 import pytest
 
+from genai_proxy.api.openai.service import GenAIService
 from genai_proxy.errors import ProxyError
 from genai_proxy.messages import normalize_message_contents
-from genai_proxy.optimizations.registry import (
+from genai_proxy.models.registry import (
     DEEPSEEK_V4_FLASH_ADAPTER,
     DEEPSEEK_V4_PRO_ADAPTER,
     GLM_5_2_ADAPTER,
     KIMI_K3_ADAPTER,
     QWEN_3_5_ADAPTER,
 )
-from genai_proxy.services.genai import GenAIService
-
 
 WEATHER_TOOL = {
     "type": "function",
@@ -357,7 +356,7 @@ def test_deepseek_text_parts_reach_upstream_identically(
     if with_tools:
         request["tools"] = [WEATHER_TOOL]
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         if stream:
             list(service.stream_openai_completion(request))
         else:
@@ -419,7 +418,7 @@ def test_invalid_content_is_rejected_consistently_before_upstream(stream):
         ],
     }
 
-    with patch("genai_proxy.services.genai.requests.post") as post:
+    with patch("genai_proxy.upstream.transport.requests.post") as post:
         with pytest.raises(ProxyError) as exc_info:
             if stream:
                 service.stream_openai_completion(request)

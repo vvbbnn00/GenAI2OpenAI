@@ -1,6 +1,6 @@
 #!/bin/bash
 # 快速 curl 测试 tool calling
-# 用法: bash test_curl.sh
+# 用法: bash scripts/smoke/curl.sh
 
 BASE_URL="${1:-http://localhost:5000}"
 echo "Testing: $BASE_URL"

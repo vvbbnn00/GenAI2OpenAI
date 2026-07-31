@@ -5,14 +5,14 @@ from unittest.mock import patch
 
 import pytest
 
-from genai_proxy.compat.claude import (
+from genai_proxy.api.anthropic.compat import (
     convert_claude_to_openai,
     convert_openai_to_claude_response,
     stream_openai_to_claude,
 )
+from genai_proxy.api.anthropic.routes import map_claude_model_alias
+from genai_proxy.api.openai.service import GenAIService
 from genai_proxy.errors import ProxyError
-from genai_proxy.routes.claude import map_claude_model_alias
-from genai_proxy.services.genai import GenAIService
 from genai_proxy.token_usage import (
     official_reasoning_prefix_for_adapter,
     render_chat_prompt,
@@ -221,7 +221,7 @@ def test_glm52_uses_official_default_max_without_duplicate_directive():
         "reasoning": {"effort": "low"},
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = service.build_openai_completion(request)
 
     assert response["choices"][0]["message"]["content"] == "Done."
@@ -249,7 +249,7 @@ def test_glm52_max_request_does_not_duplicate_template_owned_directive():
         "reasoning": {"effort": "max"},
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = service.build_openai_completion(request)
 
     assert response["choices"][0]["message"]["content"] == "Done."
@@ -275,7 +275,7 @@ def test_glm52_high_alias_falls_back_to_only_available_upstream_max():
         "reasoning_effort": "high",
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = service.build_openai_completion(request)
 
     assert response["choices"][0]["message"]["content"] == "Done."
@@ -310,7 +310,7 @@ def test_deepseek_v4_reasoning_effort_is_normalized_before_prompt_injection():
         "reasoning": {"effort": "xhigh"},
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = service.build_openai_completion(request)
 
     assert response["choices"][0]["message"]["content"] == "Done."
@@ -355,7 +355,7 @@ def test_deepseek_v4_tool_prompt_accepts_openai_text_content_parts():
         "tools": [OPENAI_BASH_TOOL],
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = service.build_openai_completion(request)
 
     assert response["choices"][0]["message"]["content"] == "Done."
@@ -436,7 +436,7 @@ def test_deepseek_v4_thinking_and_effort_mapping_matches_upstream_capability():
         if effort is not None:
             request["reasoning"] = {"effort": effort}
 
-        with patch("genai_proxy.services.genai.requests.post", fake_post):
+        with patch("genai_proxy.upstream.transport.requests.post", fake_post):
             service.build_openai_completion(request)
 
         payload = captured[0]
@@ -473,7 +473,7 @@ def test_glm52_openai_non_stream_xml_tool_call_uses_official_default_max():
         "reasoning": {"effort": "high"},
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = service.build_openai_completion(request)
 
     tool_call = first_tool_call(response)
@@ -516,7 +516,7 @@ def test_glm52_openai_stream_bash_tool_call_uses_default_reasoning_max():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_openai_events(service.stream_openai_completion(request))
 
     tool_chunks = [
@@ -557,7 +557,7 @@ def test_glm52_required_tool_choice_accepts_xml_tool_call():
         "tool_choice": "required",
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = service.build_openai_completion(request)
 
     assert first_tool_call(response)["function"]["name"] == "get_weather"
@@ -603,7 +603,7 @@ def test_required_tool_choice_retries_discarded_prose_without_leaking_it():
         "tool_choice": "required",
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = service.build_openai_completion(request)
 
     message = response["choices"][0]["message"]
@@ -670,7 +670,7 @@ def test_required_tool_retry_follows_the_latest_tool_result():
         "tool_choice": "required",
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = service.build_openai_completion(request)
 
     assert first_tool_call(response)["function"]["name"] == "get_weather"
@@ -731,7 +731,7 @@ def test_named_tool_choice_retries_a_different_valid_tool_call():
         },
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = service.build_openai_completion(request)
 
     assert first_tool_call(response)["function"]["name"] == "get_weather"
@@ -763,7 +763,7 @@ def test_required_tool_stream_does_not_retry_after_reasoning_is_visible():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         rendered = "".join(service.stream_openai_completion(request))
 
     assert len(captured) == 1
@@ -793,7 +793,7 @@ def test_required_tool_choice_exhaustion_returns_an_error_not_prose():
     }
 
     with (
-        patch("genai_proxy.services.genai.requests.post", fake_post),
+        patch("genai_proxy.upstream.transport.requests.post", fake_post),
         pytest.raises(ProxyError, match="required tool call"),
     ):
         service.build_openai_completion(request)
@@ -815,7 +815,7 @@ def test_glm52_tool_choice_none_does_not_return_tool_calls():
         "tool_choice": "none",
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = service.build_openai_completion(request)
 
     message = response["choices"][0]["message"]
@@ -855,7 +855,7 @@ def test_glm52_tool_result_turn_returns_final_text():
         "tools": [OPENAI_WEATHER_TOOL],
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = service.build_openai_completion(request)
 
     message = response["choices"][0]["message"]
@@ -904,7 +904,7 @@ def test_glm52_native_upstream_tool_call_deltas_are_preserved():
         "tools": [OPENAI_WEATHER_TOOL],
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = service.build_openai_completion(request)
 
     tool_call = first_tool_call(response)
@@ -926,7 +926,7 @@ def test_glm52_openai_stream_reasoning_content_passes_through_without_tools():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_openai_events(service.stream_openai_completion(request))
 
     assert any(
@@ -955,7 +955,7 @@ def test_upstream_reasoning_alias_is_forwarded_without_buffering():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         stream = service.stream_openai_completion(request)
         first_event = parse_openai_events([next(stream)])[0]
         remaining = parse_openai_events(stream)
@@ -984,7 +984,7 @@ def test_upstream_sse_reader_requests_single_byte_chunks():
         "stream": True,
     }
     with patch(
-        "genai_proxy.services.genai.requests.post",
+        "genai_proxy.upstream.transport.requests.post",
         return_value=TrackingResponse([]),
     ):
         list(service.stream_openai_completion(request))
@@ -1008,7 +1008,7 @@ def test_split_think_tags_are_parsed_incrementally_without_leaking_markup():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_openai_events(service.stream_openai_completion(request))
 
     reasoning = "".join(
@@ -1041,7 +1041,7 @@ def test_mid_answer_think_tags_remain_literal_content():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_openai_events(service.stream_openai_completion(request))
 
     reasoning = "".join(
@@ -1072,7 +1072,7 @@ def test_native_reasoning_field_disables_think_tag_fallback():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_openai_events(service.stream_openai_completion(request))
 
     reasoning = "".join(
@@ -1119,7 +1119,7 @@ def test_tool_stream_forwards_reasoning_before_tool_output_is_consumed():
     }
 
     with patch(
-        "genai_proxy.services.genai.requests.post",
+        "genai_proxy.upstream.transport.requests.post",
         return_value=IncrementalResponse([]),
     ):
         chunks = service.stream_openai_completion(request)
@@ -1176,7 +1176,7 @@ def test_claude_output_config_effort_maps_to_glm52_openai_reasoning_and_tool_use
     openai_request = convert_claude_to_openai(claude_request, model_manager)
     assert openai_request["reasoning"] == {"effort": "high"}
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         openai_response = service.build_openai_completion(openai_request)
 
     response = convert_openai_to_claude_response(
@@ -1227,7 +1227,7 @@ def test_claude_streaming_tool_use_survives_glm52_reasoning_effort():
     openai_request = convert_claude_to_openai(claude_request, model_manager)
     assert openai_request["reasoning"] == {"effort": "max"}
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_claude_events(
             stream_openai_to_claude(
                 service.stream_openai_completion(openai_request),
@@ -1303,7 +1303,7 @@ def test_claude_streaming_bare_required_tool_name_is_forwarded_as_tool_use():
     }
     openai_request = convert_claude_to_openai(claude_request, model_manager)
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_claude_events(
             stream_openai_to_claude(
                 service.stream_openai_completion(openai_request),
@@ -1407,7 +1407,7 @@ def test_claude_non_stream_bash_tool_preserves_shell_string_arguments():
         }
         openai_request = convert_claude_to_openai(claude_request, model_manager)
 
-        with patch("genai_proxy.services.genai.requests.post", fake_post):
+        with patch("genai_proxy.upstream.transport.requests.post", fake_post):
             openai_response = service.build_openai_completion(openai_request)
 
         response = convert_openai_to_claude_response(
@@ -1451,7 +1451,7 @@ def test_claude_streaming_bash_tool_preserves_heredoc_input_json_delta():
     }
     openai_request = convert_claude_to_openai(claude_request, model_manager)
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_claude_events(
             stream_openai_to_claude(
                 service.stream_openai_completion(openai_request),
@@ -1563,7 +1563,7 @@ def test_claude_thinking_control_maps_to_deepseek_upstream_switch():
             [sse_line({"content": "Done."}, "stop")],
             record=record,
         )
-        with patch("genai_proxy.services.genai.requests.post", fake_post):
+        with patch("genai_proxy.upstream.transport.requests.post", fake_post):
             service.build_openai_completion(openai_request)
         assert captured[0]["thinking"] is expected_thinking
         assert "chatGroupId" not in captured[0]
@@ -1679,7 +1679,7 @@ def test_claude_route_preserves_shell_strings_across_target_adapters():
         }
         openai_request = convert_claude_to_openai(claude_request, model_manager)
 
-        with patch("genai_proxy.services.genai.requests.post", fake_post):
+        with patch("genai_proxy.upstream.transport.requests.post", fake_post):
             openai_response = service.build_openai_completion(openai_request)
 
         response = convert_openai_to_claude_response(

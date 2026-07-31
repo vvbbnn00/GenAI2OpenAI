@@ -1,12 +1,22 @@
 import importlib
 import importlib.metadata
+import importlib.util
 import sys
 from pathlib import Path
 
 import genai_proxy
 import genai_proxy.cli
 import genai_proxy.runtime
-import main as legacy_main
+
+
+def _load_root_main():
+    path = Path(__file__).resolve().parents[2] / "main.py"
+    spec = importlib.util.spec_from_file_location("genai2openai_root_main", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_distribution_and_import_package_names_are_preserved():
@@ -17,6 +27,7 @@ def test_distribution_and_import_package_names_are_preserved():
 
 
 def test_root_main_is_a_thin_cli_compatibility_entrypoint():
+    legacy_main = _load_root_main()
     assert legacy_main.main is genai_proxy.cli.main
     assert not hasattr(legacy_main, "app")
 

@@ -1,6 +1,6 @@
 """
 Tool Calling 测试脚本
-用法: uv run test_tool_calling.py [--base-url http://localhost:5000] [--model GPT-4.1]
+用法: uv run python scripts/smoke/tool_calling.py [--base-url http://localhost:5000] [--model GPT-4.1]
 
 测试场景:
   1. 单次 tool call (天气查询)

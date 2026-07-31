@@ -43,7 +43,7 @@ class ProgramVersionTests(unittest.TestCase):
         )
 
     def test_reads_full_hash_and_commit_time_from_current_git_checkout(self):
-        repository_root = Path(__file__).resolve().parent
+        repository_root = Path(__file__).resolve().parents[2]
         missing_metadata = repository_root / "missing-build-version.json"
         version = get_program_version(
             metadata_path=missing_metadata,

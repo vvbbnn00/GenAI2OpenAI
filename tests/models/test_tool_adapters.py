@@ -1,8 +1,10 @@
 import json
 
-from genai_proxy.compat.openai import extract_tool_calls, tag_prefix_len
+import genai_proxy.optimizations as legacy_models
+from genai_proxy.chat.tool_loop import _tool_start_tags_for_request
+from genai_proxy.chat.tool_protocol import extract_tool_calls, tag_prefix_len
 from genai_proxy.errors import ProxyError
-from genai_proxy.optimizations import (
+from genai_proxy.models import (
     DEEPSEEK_LEGACY_ADAPTER,
     DEEPSEEK_V4_FLASH_ADAPTER,
     DEEPSEEK_V4_PRO_ADAPTER,
@@ -15,20 +17,19 @@ from genai_proxy.optimizations import (
     QWEN_3_5_ADAPTER,
     select_tool_adapter,
 )
-from genai_proxy.optimizations.deepseek import (
+from genai_proxy.models.deepseek_v4.tooling import (
     inject_deepseek_reasoning_prompt,
     inject_deepseek_tool_prompt,
 )
-from genai_proxy.optimizations.glm import inject_glm_tool_prompt
-from genai_proxy.optimizations.kimi import (
+from genai_proxy.models.glm52.tooling import inject_glm_tool_prompt
+from genai_proxy.models.kimi_k3.tooling import (
     extract_kimi_final_response,
     inject_kimi_tool_prompt,
     kimi_tool_retry_messages,
 )
-from genai_proxy.optimizations.minimax import inject_minimax_tool_prompt
-from genai_proxy.optimizations.qwen import inject_qwen35_tool_prompt
+from genai_proxy.models.legacy.minimax import inject_minimax_tool_prompt
+from genai_proxy.models.qwen35.tooling import inject_qwen35_tool_prompt
 from genai_proxy.reasoning import normalize_reasoning_for_adapter
-from genai_proxy.services.genai import _tool_start_tags_for_request
 from genai_proxy.token_usage import official_reasoning_prefix_for_adapter
 
 DEEPSEEK_V4_REASONING_EFFORT_MAX = official_reasoning_prefix_for_adapter(
@@ -217,6 +218,7 @@ ANYOF_SCHEMA_TOOL = {
 
 
 def test_genai_model_record_mapping():
+    assert legacy_models.select_tool_adapter is select_tool_adapter
     assert (
         select_tool_adapter(
             "deepseek-chat",

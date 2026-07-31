@@ -331,15 +331,15 @@ print(resp)
 基础离线检查：
 
 ```bash
-uv run --with pytest python -m pytest -q
-uv run python -m compileall genai_proxy test_tool_adapters.py test_allowed_models_integration.py
-uv run python test_tool_adapters.py
+uv run pytest -q
+uv run python -m compileall -q src/genai_proxy tests
+uv run pytest -q tests/models/test_tool_adapters.py
 ```
 
 使用 `docker-deploy.keystore` 对 DeepSeek V4 Flash、DeepSeek V4 Pro、GLM-5.2、Qwen3.5、Kimi-K3 做 20 轮变体集成测试：
 
 ```bash
-uv run python test_allowed_models_integration.py --repeat 20 --models deepseek-chat deepseek-pro chatglm qwen-instruct kimi-k3
+uv run python tests/live/allowed_models.py --repeat 20 --models deepseek-chat deepseek-pro chatglm qwen-instruct kimi-k3
 ```
 
 该集成测试只允许调用 `deepseek-chat`、`deepseek-pro`、`chatglm`、`qwen-instruct`、`kimi-k3`。前四个模型覆盖 OpenAI 和 Claude Messages 两种调用风格下的非流式工具调用、流式工具调用、Claude Code 风格 `Bash` 工具、工具结果回合和无需工具的普通回答；支持 reasoning 流的模型还会验证 OpenAI `reasoning_content` 与 Responses 完整 reasoning item 事件链。Kimi-K3 覆盖 OpenAI/Claude 文本、OpenAI/Responses/Claude 视觉、token usage，以及外部操作桥接的 OpenAI 非流式和流式工具调用、Claude 流式工具调用和 Responses 长历史三轮工具链；三轮链路会验证空白续轮仍能流式调用下一项工具，最后再正常收敛。为限制 Kimi-K3 实时测试流量，其默认只执行 1 轮，不跟随通用 `--repeat`；确需重复时显式传入 `--kimi-repeat N`。成功完成的 Kimi-K3 测试历史会自动清理。
@@ -347,7 +347,7 @@ uv run python test_allowed_models_integration.py --repeat 20 --models deepseek-c
 对 GLM-5.2、DeepSeek V4 Flash 和 DeepSeek V4 Pro 做隔离的 OMP 长上下文工具链测试：
 
 ```bash
-uv run python test_omp_long_context_integration.py \
+uv run python tests/live/omp_long_context.py \
   --models chatglm deepseek-chat deepseek-pro \
   --min-context-tokens 150000 \
   --stages 12
@@ -359,15 +359,13 @@ uv run python test_omp_long_context_integration.py \
 
 项目按职责分为以下几层：
 
-- `main.py`：负责参数解析、日志初始化和服务启动
-- `genai_proxy/app.py`：应用装配
-- `genai_proxy/auth.py`：API Key 鉴权
-- `genai_proxy/services/token_manager.py`：JWT / passkey 刷新
-- `genai_proxy/services/genai.py`：GenAI 上游调用与 OpenAI SSE 转换
-- `genai_proxy/compat/openai.py`：OpenAI tool calling 兼容逻辑
-- `genai_proxy/compat/claude.py`：Claude Messages API 转换逻辑
-- `genai_proxy/optimizations/`：模型专用 tool calling 适配与解析逻辑
-- `genai_proxy/routes/`：OpenAI / Claude 路由
+- `main.py`：直接从源码运行时的简短兼容入口
+- `src/genai_proxy/api/`：OpenAI 与 Anthropic 公共协议
+- `src/genai_proxy/chat/`：请求准备、流式转发和工具回合编排
+- `src/genai_proxy/models/`：模型能力、官方 prompt codec 和工具适配器
+- `src/genai_proxy/upstream/`：认证、模型目录、HTTP/SSE transport 和 Kimi 历史清理
+- `tests/`：按上述职责镜像组织的离线测试与显式 live runner
+- `scripts/smoke/`：针对已启动服务的手工 smoke 脚本
 
 ## Token 与 Passkey
 

@@ -5,10 +5,10 @@ from unittest.mock import patch
 
 import pytest
 
+from genai_proxy.api.openai.responses import convert_responses_to_openai_request
+from genai_proxy.api.openai.service import GenAIService
 from genai_proxy.app import create_app
-from genai_proxy.compat.responses import convert_responses_to_openai_request
 from genai_proxy.errors import ProxyError
-from genai_proxy.services.genai import GenAIService
 
 RESPONSES_WEATHER_TOOL = {
     "type": "function",
@@ -177,7 +177,7 @@ def test_responses_text_stream_emits_codex_events_and_reasoning_delta():
         "reasoning": {"effort": "high"},
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_response_events(service.stream_responses(request))
 
     assert [event["event"] for event in events][:4] == [
@@ -241,7 +241,7 @@ def test_responses_created_event_precedes_prompt_token_counting():
     }
 
     with (
-        patch("genai_proxy.services.genai.requests.post", fake_post),
+        patch("genai_proxy.upstream.transport.requests.post", fake_post),
         patch(
             "genai_proxy.chat.preparation.count_openai_request_tokens",
         ) as prepare_count_tokens,
@@ -277,7 +277,7 @@ def test_responses_input_accepts_easy_message_without_type():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_response_events(service.stream_responses(request))
 
     assert completed_event(events)["end_turn"] is True
@@ -571,7 +571,7 @@ def test_responses_uses_resolved_qwen_record_for_visual_transport():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         list(service.stream_responses(request))
 
     assert captured[0]["messages"][-1]["content"] == [
@@ -600,7 +600,7 @@ def test_responses_non_visual_record_rejects_image_before_upstream():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post") as post:
+    with patch("genai_proxy.upstream.transport.requests.post") as post:
         with pytest.raises(ProxyError) as exc_info:
             list(service.stream_responses(request))
 
@@ -695,7 +695,7 @@ def test_responses_local_shell_call_preserves_command_argv():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_response_events(service.stream_responses(request))
 
     assert completed_event(events)["end_turn"] is True
@@ -787,7 +787,7 @@ def test_responses_function_tool_call_from_glm_xml_is_codex_function_call_item()
         "reasoning": {"effort": "high"},
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_response_events(service.stream_responses(request))
 
     function_items = [
@@ -876,7 +876,7 @@ def test_responses_function_call_output_turn_returns_final_message():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_response_events(service.stream_responses(request))
 
     message_items = [item for item in output_items(events) if item["type"] == "message"]
@@ -1020,7 +1020,7 @@ def test_responses_custom_apply_patch_tool_becomes_custom_tool_call_with_input_d
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_response_events(service.stream_responses(request))
 
     delta_events = [
@@ -1074,7 +1074,7 @@ def test_responses_namespace_tool_flattens_for_model_and_restores_namespace():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_response_events(service.stream_responses(request))
 
     function_items = [
@@ -1104,7 +1104,7 @@ def test_responses_route_streams_sse():
     )
     app.extensions["genai_service"] = service
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = app.test_client().post(
             "/v1/responses",
             json={
@@ -1145,7 +1145,7 @@ def test_responses_route_defaults_to_non_stream_json():
     )
     app.extensions["genai_service"] = service
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         response = app.test_client().post(
             "/v1/responses",
             json={
@@ -1185,7 +1185,7 @@ def test_responses_ignores_hosted_tools_codex_may_send_by_default():
         "stream": True,
     }
 
-    with patch("genai_proxy.services.genai.requests.post", fake_post):
+    with patch("genai_proxy.upstream.transport.requests.post", fake_post):
         events = parse_response_events(service.stream_responses(request))
 
     message_items = [item for item in output_items(events) if item["type"] == "message"]
