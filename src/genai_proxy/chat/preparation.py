@@ -6,7 +6,11 @@ from genai_proxy.chat.tool_choice import tool_choice_is_none as _tool_choice_is_
 from genai_proxy.chat.tool_protocol import inject_tool_prompt
 from genai_proxy.chat.types import PreparedChatRequest, ResolvedModelContext
 from genai_proxy.errors import ProxyError
-from genai_proxy.messages import adapter_supports_vision, normalize_message_contents
+from genai_proxy.messages import (
+    adapter_supports_vision,
+    disambiguate_genai_tool_result_contents,
+    normalize_message_contents,
+)
 from genai_proxy.models import (
     DEEPSEEK_V4_ADAPTERS,
     GLM_5_2_ADAPTER,
@@ -117,6 +121,8 @@ class ChatPreparationMixin:
         model_record = model_context.model_record
         tool_adapter = model_context.tool_adapter
         messages = normalize_message_contents(messages, adapter=tool_adapter)
+        if model_context.transport == "genai_chat":
+            messages = disambiguate_genai_tool_result_contents(messages)
         messages = _normalize_messages_for_model_template(
             messages,
             model,

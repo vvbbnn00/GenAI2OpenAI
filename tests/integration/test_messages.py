@@ -6,7 +6,11 @@ import pytest
 
 from genai_proxy.api.openai.service import GenAIService
 from genai_proxy.errors import ProxyError
-from genai_proxy.messages import normalize_message_contents
+from genai_proxy.messages import (
+    GENAI_TOOL_RESULT_TEXT_PREFIX,
+    disambiguate_genai_tool_result_contents,
+    normalize_message_contents,
+)
 from genai_proxy.models.registry import (
     DEEPSEEK_V4_FLASH_ADAPTER,
     DEEPSEEK_V4_PRO_ADAPTER,
@@ -288,6 +292,99 @@ def test_missing_assistant_content_is_not_added_during_normalization():
         [message],
         adapter=GLM_5_2_ADAPTER,
     ) == [message]
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "[not JSON]",
+        '{"broken": ]}',
+        " \n[not JSON]\n ",
+        "[NaN]",
+        "[" * 1100 + "0" + "]" * 1100,
+    ),
+)
+def test_invalid_json_looking_tool_results_are_marked_as_text(content):
+    messages = [{"role": "tool", "tool_call_id": "call_1", "content": content}]
+
+    normalized = disambiguate_genai_tool_result_contents(messages)
+
+    assert normalized == [
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": GENAI_TOOL_RESULT_TEXT_PREFIX + content,
+        }
+    ]
+    assert messages[0]["content"] == content
+    assert normalized[0] is not messages[0]
+
+
+@pytest.mark.parametrize(
+    "role,content",
+    (
+        ("tool", "ordinary text"),
+        ("tool", "[]"),
+        ("tool", '{"valid": true}'),
+        ("tool", "[not JSON}"),
+        ("user", "[not JSON]"),
+        ("assistant", "{not JSON}"),
+    ),
+)
+def test_unambiguous_or_non_tool_content_is_unchanged(role, content):
+    message = {"role": role, "content": content}
+
+    normalized = disambiguate_genai_tool_result_contents([message])
+
+    assert normalized == [message]
+    assert normalized[0] is not message
+
+
+@pytest.mark.parametrize("model,adapter,record", MODEL_CASES)
+def test_genai_preparation_disambiguates_tool_results_before_templates(
+    model,
+    adapter,
+    record,
+):
+    original = "[read output that is not JSON]"
+    prepared = make_service(record)._prepare_chat_request(
+        {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "Inspect the project."},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_read",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city":"Shanghai"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_read",
+                    "content": original,
+                },
+                {"role": "user", "content": "Continue."},
+            ],
+            "tools": [WEATHER_TOOL],
+        }
+    )
+
+    assert prepared.tool_adapter == adapter
+    prepared_text = "\n".join(
+        str(message.get("content") or "") for message in prepared.messages
+    )
+    if adapter == KIMI_K3_ADAPTER:
+        assert GENAI_TOOL_RESULT_TEXT_PREFIX not in prepared_text
+    else:
+        assert GENAI_TOOL_RESULT_TEXT_PREFIX + original in prepared_text
 
 
 @pytest.mark.parametrize("model,adapter,record", MODEL_CASES)

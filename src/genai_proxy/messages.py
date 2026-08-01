@@ -1,9 +1,11 @@
+import json
 from urllib.parse import urlsplit
 
 from genai_proxy.errors import ProxyError
 from genai_proxy.models.registry import KIMI_K3_ADAPTER, QWEN_3_5_ADAPTER
 
 _VISUAL_ADAPTERS = frozenset({KIMI_K3_ADAPTER, QWEN_3_5_ADAPTER})
+GENAI_TOOL_RESULT_TEXT_PREFIX = "Tool output (verbatim):\n"
 
 
 def adapter_supports_vision(adapter: str) -> bool:
@@ -13,6 +15,39 @@ def adapter_supports_vision(adapter: str) -> bool:
 def normalize_message_contents(messages: list[dict], *, adapter: str) -> list[dict]:
     """Return copied messages with OpenAI content parts in canonical form."""
     return [_normalize_message(message, adapter=adapter) for message in messages]
+
+
+def disambiguate_genai_tool_result_contents(messages: list[dict]) -> list[dict]:
+    """Keep invalid JSON-looking tool output on GenAI's plain-text path."""
+    normalized = []
+    for message in messages:
+        copied = dict(message)
+        content = copied.get("content")
+        if copied.get("role") == "tool" and isinstance(content, str):
+            candidate = content.strip()
+            if _looks_like_json_container(candidate) and not _is_strict_json(candidate):
+                copied["content"] = GENAI_TOOL_RESULT_TEXT_PREFIX + content
+        normalized.append(copied)
+    return normalized
+
+
+def _looks_like_json_container(content: str) -> bool:
+    return len(content) >= 2 and (content[0], content[-1]) in {
+        ("[", "]"),
+        ("{", "}"),
+    }
+
+
+def _is_strict_json(content: str) -> bool:
+    try:
+        json.loads(content, parse_constant=_reject_json_constant)
+    except (RecursionError, ValueError):
+        return False
+    return True
+
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-finite JSON number: {value}")
 
 
 def _normalize_message(message: dict, *, adapter: str) -> dict:
