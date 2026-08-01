@@ -1,6 +1,8 @@
 import base64
 import json
 import logging
+import subprocess
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -110,6 +112,31 @@ def test_log_codes_allow_only_http_style_numbers():
     assert safe_log_code(123456789) == "int"
     assert safe_log_code(SENSITIVE_MARKER) == "str"
     assert safe_log_code(f"400\n{SENSITIVE_MARKER}") == "str"
+
+
+def test_debug_logging_is_limited_to_application_loggers():
+    script = "\n".join(
+        (
+            "import logging",
+            "from genai_proxy.logging_utils import setup_logging",
+            "logger = setup_logging(True)",
+            'logger.debug("APPLICATION_DEBUG_VISIBLE")',
+            'third_party = logging.getLogger("urllib3.connectionpool")',
+            'third_party.debug("THIRD_PARTY_DEBUG_HIDDEN")',
+            'third_party.info("THIRD_PARTY_INFO_VISIBLE")',
+        )
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    output = completed.stdout + completed.stderr
+
+    assert "APPLICATION_DEBUG_VISIBLE" in output
+    assert "THIRD_PARTY_DEBUG_HIDDEN" not in output
+    assert "THIRD_PARTY_INFO_VISIBLE" in output
 
 
 def test_startup_and_passkey_logs_redact_identity_and_paths(caplog, tmp_path):
