@@ -20,7 +20,9 @@ services:
       GENAI_MAX_RETRIES: ${GENAI_MAX_RETRIES:-10}
       GENAI_RETRY_BACKOFF: ${GENAI_RETRY_BACKOFF:-0.5}
       GENAI_MODEL_CACHE: ${GENAI_MODEL_CACHE:-/app/.cache/models/models.json}
-      GENAI_TOKENIZER_CACHE: ${GENAI_TOKENIZER_CACHE:-/app/.cache/tokenizers}
+      GENAI_TOKENIZER_CACHE: /opt/genai2openai/hf-assets
+      GENAI_TOKENIZER_OFFLINE: "1"
+      HF_HUB_OFFLINE: "1"
       API_KEY: ${PROXY_API_KEY:-}
       APP_DEBUG: ${APP_DEBUG:-0}
       CLAUDE_HAIKU_MODEL: ${CLAUDE_HAIKU_MODEL:-deepseek-chat}
@@ -38,7 +40,6 @@ services:
         source: ${KEYSTORE_HOST_PATH:-./docker-deploy.keystore}
         target: /app/docker-deploy.keystore
         read_only: false
-      - tokenizer-cache:/app/.cache/tokenizers
       - model-cache:/app/.cache/models
     command:
       - /bin/sh
@@ -83,5 +84,4 @@ services:
       start_period: 20s
 
 volumes:
-  tokenizer-cache:
   model-cache:

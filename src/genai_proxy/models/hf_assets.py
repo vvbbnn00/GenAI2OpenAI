@@ -27,6 +27,10 @@ from genai_proxy.retry import (
 
 HF_BASE_URL = "https://huggingface.co"
 TOKENIZER_CACHE_ENV = "GENAI_TOKENIZER_CACHE"
+TOKENIZER_OFFLINE_ENV = "GENAI_TOKENIZER_OFFLINE"
+HF_HUB_OFFLINE_ENV = "HF_HUB_OFFLINE"
+
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
 _logger = logging.getLogger(__name__)
 _artifact_lock = threading.RLock()
@@ -56,17 +60,29 @@ class ArtifactChecksumError(ValueError):
     pass
 
 
-def artifact_path(spec: TokenizerSpec, artifact: Artifact) -> Path:
+def artifact_path(
+    spec: TokenizerSpec,
+    artifact: Artifact,
+    *,
+    allow_download: bool | None = None,
+) -> Path:
     cache_dir = Path(
         os.environ.get(TOKENIZER_CACHE_ENV)
         or Path.home() / ".cache" / "genai2openai" / "tokenizers"
     )
-    filename = f"{artifact.sha256[:12]}-{Path(artifact.path).name}"
+    filename = artifact_cache_name(artifact)
     destination = cache_dir / filename
 
     with _artifact_lock:
         if destination.is_file() and sha256(destination) == artifact.sha256:
             return destination
+        if allow_download is False or (
+            allow_download is None and artifacts_are_offline()
+        ):
+            raise tokenizer_error(
+                spec,
+                f"load verified cached {artifact.path} while offline",
+            )
         cache_dir.mkdir(parents=True, exist_ok=True)
         url = f"{HF_BASE_URL}/{spec.repository}/resolve/{spec.revision}/{artifact.path}"
         retry_count = 0
@@ -97,6 +113,17 @@ def artifact_path(spec: TokenizerSpec, artifact: Artifact) -> Path:
                     f"download {artifact.path}",
                     exc,
                 ) from exc
+
+
+def artifact_cache_name(artifact: Artifact) -> str:
+    return f"{artifact.sha256[:12]}-{Path(artifact.path).name}"
+
+
+def artifacts_are_offline() -> bool:
+    return any(
+        os.environ.get(name, "").strip().lower() in _TRUE_VALUES
+        for name in (TOKENIZER_OFFLINE_ENV, HF_HUB_OFFLINE_ENV)
+    )
 
 
 def download_artifact(
@@ -240,10 +267,14 @@ def _strftime_now(format_string):
 __all__ = [
     "Artifact",
     "ArtifactChecksumError",
+    "HF_HUB_OFFLINE_ENV",
     "HF_BASE_URL",
     "TOKENIZER_CACHE_ENV",
+    "TOKENIZER_OFFLINE_ENV",
     "TokenizerSpec",
+    "artifact_cache_name",
     "artifact_path",
+    "artifacts_are_offline",
     "download_artifact",
     "load_python_encoder",
     "load_template",

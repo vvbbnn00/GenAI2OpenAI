@@ -7,7 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_INDEX_URL=https://mirrors.ustc.edu.cn/pypi/simple
+    PIP_INDEX_URL=https://mirrors.ustc.edu.cn/pypi/simple \
+    GENAI_TOKENIZER_CACHE=/opt/genai2openai/hf-assets
 
 WORKDIR /app
 
@@ -53,6 +54,17 @@ RUN python -m pip install \
 
 COPY pyproject.toml README.md ./
 COPY src ./src
+
+RUN PYTHONPATH=/app/src \
+    python -m genai_proxy.models.hf_prefetch \
+    && GENAI_TOKENIZER_OFFLINE=1 \
+        HF_HUB_OFFLINE=1 \
+        PYTHONPATH=/app/src \
+        python -m genai_proxy.models.hf_prefetch --verify-only \
+    && chmod -R a-w "${GENAI_TOKENIZER_CACHE}"
+
+ENV GENAI_TOKENIZER_OFFLINE=1 \
+    HF_HUB_OFFLINE=1
 
 ARG GENAI_BUILD_COMMIT=""
 ARG GENAI_BUILD_COMMIT_TIME=""

@@ -32,7 +32,9 @@ CLI 的 `--api-key` 或环境变量 `API_KEY` 用于保护代理。Docker Compos
 | `--genai-model-cache` | `GENAI_MODEL_CACHE` | `~/.cache/genai2openai/models.json` | 持久模型目录缓存 |
 
 `GENAI_TOKENIZER_CACHE` 没有对应 CLI 参数。它指定经 hash 校验的 Hugging Face
-资源缓存目录，默认使用用户缓存目录。
+资源缓存目录，默认使用用户缓存目录。直接运行时可设置
+`GENAI_TOKENIZER_OFFLINE=1`，要求只使用已经通过校验的缓存；缓存缺失或损坏时请求
+直接失败，不会尝试下载。`HF_HUB_OFFLINE=1` 具有同样的离线约束。
 
 重试次数不是流式重放许可。只要客户端已收到任何增量，本轮就不会从头重试，详情见
 [可靠性与失败边界](reliability.md)。
@@ -63,6 +65,10 @@ Docker Compose 还支持：
 | `GUNICORN_KEEPALIVE` | `10` |
 | `GUNICORN_MAX_REQUESTS` | `0` |
 | `GUNICORN_MAX_REQUESTS_JITTER` | `0` |
+
+Compose 固定使用镜像内的 `/opt/genai2openai/hf-assets`，并设置
+`GENAI_TOKENIZER_OFFLINE=1` 和 `HF_HUB_OFFLINE=1`。该目录不是 volume，不能在运行时
+用空卷遮住构建期资源。
 
 模型请求会长期占用上游 SSE 连接。线程数决定单个 worker 可同时承载的阻塞连接数；
 调整时同时考虑内存、文件描述符和反向代理超时。

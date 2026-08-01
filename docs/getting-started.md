@@ -107,11 +107,15 @@ print(response.choices[0].message.content)
 
 未配置代理 API key 时，SDK 仍要求一个非空字符串，但服务端不会校验它。
 
-## 首次使用模型
+## Hugging Face 资源
 
 GLM、DeepSeek、Qwen 和 Kimi 的精确 token 计数依赖固定 revision 的官方
-Hugging Face 资源。第一次使用对应模型时，代理会下载资源、校验 SHA-256 后写入
-`GENAI_TOKENIZER_CACHE`。生产部署应使用持久缓存，避免每次重建容器后重新下载。
+Hugging Face 资源。直接运行源码时，第一次使用对应模型会下载资源、校验 SHA-256
+后写入 `GENAI_TOKENIZER_CACHE`。
+
+Docker build 会预先下载当前维护模型的全部资源，并实际加载 tokenizer、chat template
+和 Python encoder。任何资源下载、hash 或加载错误都会使构建失败。镜像运行时使用只读
+缓存和离线模式，因此容器启动及首次请求都不会再访问 Hugging Face。
 
 下一步可阅读 [配置参考](operations/configuration.md) 和
 [模型适配总览](models/index.md)。

@@ -22,8 +22,9 @@ cp .env.example .env
 `pyproject.toml`、`README.md` 和 `src/`。`.dockerignore` 同时排除 `.git`、docs、
 tests、smoke 脚本、环境文件和 keystore。
 
-模型目录缓存和 tokenizer 缓存使用独立 volume。keystore 使用 bind mount，且必须
-可写，因为认证器会更新 passkey 计数器。
+模型目录缓存使用独立 volume。官方 Hugging Face 资源在镜像构建阶段下载、校验并
+加载，之后保存在镜像内的只读目录；容器运行时强制离线读取，不使用 tokenizer volume。
+keystore 使用 bind mount，且必须可写，因为认证器会更新 passkey 计数器。
 
 ## 版本日志
 
