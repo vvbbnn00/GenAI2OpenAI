@@ -5,6 +5,7 @@ from genai_proxy.errors import ProxyError
 DEFAULT_MAX_RETRIES = 10
 DEFAULT_RETRY_BACKOFF = 0.5
 MAX_RETRY_DELAY = 5.0
+OPAQUE_BUSINESS_ERROR_MAX_RETRIES = 1
 
 RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 TRANSIENT_UPSTREAM_ERROR_CODE = "upstream_transient_error"
@@ -22,6 +23,28 @@ NON_RETRYABLE_BUSINESS_ERROR_MARKERS = (
     "invalid parameter",
     "invalid request",
 )
+TRANSIENT_BUSINESS_ERROR_MARKERS = (
+    "temporary",
+    "temporarily",
+    "transient",
+    "try again",
+    "please retry",
+    "retry later",
+    "retryable",
+    "busy",
+    "overloaded",
+    "timeout",
+    "timed out",
+    "service unavailable",
+    "gateway timeout",
+    "暂时",
+    "临时",
+    "稍后重试",
+    "请重试",
+    "繁忙",
+    "超时",
+    "服务不可用",
+)
 
 
 def retry_delay(backoff: float, retry_count: int) -> float:
@@ -36,20 +59,33 @@ def is_retryable_status(status_code) -> bool:
 
 
 def is_retryable_business_error(status_code, message: str = "") -> bool:
-    if not is_retryable_status(status_code):
-        return False
+    return business_error_retry_limit(status_code, message, 1) > 0
+
+
+def business_error_retry_limit(
+    status_code,
+    message: str,
+    configured_max_retries: int,
+) -> int:
+    retry_limit = max(0, int(configured_max_retries))
+    if retry_limit == 0 or not is_retryable_status(status_code):
+        return 0
 
     try:
         is_generic_server_error = int(status_code) == 500
     except (TypeError, ValueError):
-        return False
+        return 0
     if not is_generic_server_error:
-        return True
+        return retry_limit
 
     normalized_message = str(message or "").lower()
-    return not any(
+    if any(
         marker in normalized_message for marker in NON_RETRYABLE_BUSINESS_ERROR_MARKERS
-    )
+    ):
+        return 0
+    if any(marker in normalized_message for marker in TRANSIENT_BUSINESS_ERROR_MARKERS):
+        return retry_limit
+    return min(retry_limit, OPAQUE_BUSINESS_ERROR_MAX_RETRIES)
 
 
 def schedule_retry(

@@ -16,7 +16,7 @@ from genai_proxy.errors import ProxyError
 from genai_proxy.logging_utils import safe_log_code
 from genai_proxy.models import DEEPSEEK_V4_ADAPTERS, KIMI_K3_ADAPTER
 from genai_proxy.retry import (
-    is_retryable_business_error,
+    business_error_retry_limit,
     is_retryable_status,
     schedule_retry,
 )
@@ -265,6 +265,7 @@ class ChatStreamingMixin:
             genai_data["rootModelName"] = prepared.root_model_name
 
         if self._logger.isEnabledFor(logging.DEBUG):
+            prompt_tokens = self._prompt_tokens(prepared)
             self._logger.debug("=== GenAI Request ===")
             self._logger.debug(
                 "Model: %s, rootAiType: %s, rootModelName: %s, tool_prompt: %s",
@@ -273,7 +274,19 @@ class ChatStreamingMixin:
                 prepared.root_model_name,
                 prepared.has_tools,
             )
-            self._logger.debug("Messages count: %d", len(transport_messages))
+            self._logger.debug(
+                "Request metrics: prompt_tokens=%s, messages=%d, tools=%d, "
+                "max_output_tokens=%s, payload_bytes=%d",
+                prompt_tokens,
+                len(transport_messages),
+                len(prepared.tools),
+                (
+                    genai_data["maxToken"]
+                    if type(genai_data["maxToken"]) is int
+                    else type(genai_data["maxToken"]).__name__
+                ),
+                len(json.dumps(genai_data, allow_nan=False).encode("utf-8")),
+            )
             for index, message in enumerate(transport_messages):
                 role = message.get("role", "?")
                 content = message.get("content", "")
@@ -418,12 +431,16 @@ class ChatStreamingMixin:
                             "GenAI business error (code=%s)",
                             safe_log_code(err_code),
                         )
-                        if is_retryable_business_error(
-                            err_code, err_msg
-                        ) and self._schedule_chat_retry(
+                        retry_limit = business_error_retry_limit(
+                            err_code,
+                            err_msg,
+                            self._max_retries,
+                        )
+                        if self._schedule_chat_retry(
                             network_retry_count,
                             f"stream business error {safe_log_code(err_code)}",
                             sent_any_chunk=sent_any_chunk,
+                            max_retries=retry_limit,
                         ):
                             network_retry_count += 1
                             retry_after_transient_error = True

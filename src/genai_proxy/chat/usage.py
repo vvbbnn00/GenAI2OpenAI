@@ -9,6 +9,19 @@ from genai_proxy.token_usage import (
 
 
 class ChatUsageMixin:
+    def _prompt_tokens(self, prepared: PreparedChatRequest) -> int:
+        if prepared.prompt_tokens is None:
+            prepared.prompt_tokens = count_openai_request_tokens(
+                prepared.messages,
+                prepared.model,
+                model_record=prepared.model_record,
+                tool_adapter=prepared.tool_adapter,
+                reasoning_config=prepared.token_reasoning_config,
+                thinking=prepared.thinking,
+                image_sizes=prepared.image_sizes,
+            )
+        return prepared.prompt_tokens
+
     def _completion_tokens(
         self,
         prepared: PreparedChatRequest,
@@ -35,16 +48,7 @@ class ChatUsageMixin:
         *,
         finish_reason: str = "stop",
     ) -> dict:
-        if prepared.prompt_tokens is None:
-            prepared.prompt_tokens = count_openai_request_tokens(
-                prepared.messages,
-                prepared.model,
-                model_record=prepared.model_record,
-                tool_adapter=prepared.tool_adapter,
-                reasoning_config=prepared.token_reasoning_config,
-                thinking=prepared.thinking,
-                image_sizes=prepared.image_sizes,
-            )
+        prompt_tokens = self._prompt_tokens(prepared)
         completion_tokens = self._completion_tokens(
             prepared,
             message,
@@ -61,9 +65,9 @@ class ChatUsageMixin:
             image_sizes=prepared.image_sizes,
         )
         return {
-            "prompt_tokens": prepared.prompt_tokens,
+            "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
-            "total_tokens": prepared.prompt_tokens + completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
             "prompt_tokens_details": {"cached_tokens": 0},
             "completion_tokens_details": {"reasoning_tokens": reasoning_tokens},
         }

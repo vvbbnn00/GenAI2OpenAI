@@ -352,6 +352,11 @@ def test_chat_debug_logs_keep_metadata_without_request_or_response_content(caplo
     assert "chatGroupId" not in post.call_args.args[1]
     assert SENSITIVE_MARKER not in caplog.text
     assert "content_kind=text" in caplog.text
+    assert "Request metrics: prompt_tokens=" in caplog.text
+    assert "prompt_tokens=None" not in caplog.text
+    assert "messages=1, tools=0" in caplog.text
+    assert "max_output_tokens=30000" in caplog.text
+    assert "payload_bytes=" in caplog.text
     assert "SSE line" in caplog.text
     assert "structured error (status=400, code=missing)" in caplog.text
     assert "JSON decode error (JSONDecodeError" in caplog.text
