@@ -612,17 +612,13 @@ def test_required_tool_choice_retries_discarded_prose_without_leaking_it():
     assert len(captured) == 2
     assert captured[0]["messages"][-1]["content"] == "Use a weather tool."
     assert "explicit tool_choice" in captured[1]["messages"][-1]["content"]
-    assert request["messages"] == [
-        {"role": "user", "content": "Use a weather tool."}
-    ]
+    assert request["messages"] == [{"role": "user", "content": "Use a weather tool."}]
 
 
 def test_required_tool_retry_follows_the_latest_tool_result():
     responses = iter(
         [
-            FakeResponse(
-                [sse_line({"content": "Not yet."}), sse_line({}, "stop")]
-            ),
+            FakeResponse([sse_line({"content": "Not yet."}), sse_line({}, "stop")]),
             FakeResponse(
                 [
                     sse_line(
@@ -736,8 +732,9 @@ def test_named_tool_choice_retries_a_different_valid_tool_call():
 
     assert first_tool_call(response)["function"]["name"] == "get_weather"
     assert len(captured) == 2
-    assert 'Call exactly the function "get_weather"' in (
-        captured[1]["messages"][-1]["content"]
+    assert (
+        'Call exactly the function "get_weather"'
+        in (captured[1]["messages"][-1]["content"])
     )
 
 

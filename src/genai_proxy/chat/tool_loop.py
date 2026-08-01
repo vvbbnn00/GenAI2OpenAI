@@ -112,9 +112,8 @@ class ToolLoopMixin:
         choice_satisfied = False
         final_response = False
         invalid_syntax = False
-        hold_attempt_reasoning = (
-            prepared.tool_adapter == KIMI_K3_ADAPTER
-            and bool(prepared.kimi_completed_actions)
+        hold_attempt_reasoning = prepared.tool_adapter == KIMI_K3_ADAPTER and bool(
+            prepared.kimi_completed_actions
         )
         if prepared.tool_adapter == KIMI_K3_ADAPTER:
             max_attempts = KIMI_TOOL_ATTEMPTS
@@ -130,9 +129,7 @@ class ToolLoopMixin:
                 for event_type, value in self._iter_tool_attempt_events(
                     prepared,
                     attempt_messages,
-                    stream_reasoning=(
-                        stream_reasoning and not hold_attempt_reasoning
-                    ),
+                    stream_reasoning=(stream_reasoning and not hold_attempt_reasoning),
                 ):
                     if event_type == "reasoning":
                         if hold_attempt_reasoning:
@@ -215,10 +212,7 @@ class ToolLoopMixin:
                 )
                 or not should_retry
                 or attempt_index == max_attempts - 1
-                or (
-                    prepared.tool_adapter != KIMI_K3_ADAPTER
-                    and sent_role
-                )
+                or (prepared.tool_adapter != KIMI_K3_ADAPTER and sent_role)
             )
             if stop_attempting:
                 accepted_attempt = choice_satisfied or (
@@ -418,6 +412,7 @@ class ToolLoopMixin:
                 else [],
             },
         )
+
 
 def _tool_start_tags_for_request(adapter: str, tools: list | None) -> tuple[str, ...]:
     tags = list(tool_start_tags(adapter))

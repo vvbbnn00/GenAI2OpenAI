@@ -76,7 +76,9 @@ class TokenManager:
             if token_check_interval is None
             else max(0, token_check_interval)
         )
-        self._token_cache_path = f"{keystore_path}.token.json" if keystore_path else None
+        self._token_cache_path = (
+            f"{keystore_path}.token.json" if keystore_path else None
+        )
         self._token_exp = None
         self._user_id = None
         self._lock = threading.Lock()
@@ -256,7 +258,9 @@ class TokenManager:
                 type(exc).__name__,
             )
 
-    def _refresh_token(self, force: bool = False, rejected_token: str | None = None) -> None:
+    def _refresh_token(
+        self, force: bool = False, rejected_token: str | None = None
+    ) -> None:
         if not self._keystore_path:
             self._logger.warning(
                 "Token expired or missing, but no keystore configured for refresh"
@@ -266,7 +270,9 @@ class TokenManager:
         lock_fd = self._with_process_refresh_lock()
         try:
             if force:
-                if rejected_token is not None and self._load_cached_token(rejected_token=rejected_token):
+                if rejected_token is not None and self._load_cached_token(
+                    rejected_token=rejected_token
+                ):
                     self._last_refresh_failure_at = 0.0
                     return
                 self._delete_cached_token()
@@ -300,7 +306,9 @@ class TokenManager:
             )
             token_payload = token_response.json()
             token_result = token_payload.get("result")
-            real_token = token_result.get("token") if isinstance(token_result, dict) else None
+            real_token = (
+                token_result.get("token") if isinstance(token_result, dict) else None
+            )
 
             if not real_token:
                 raise RuntimeError(
@@ -401,14 +409,20 @@ class TokenManager:
             if self._shutdown_done or self._stop_event.is_set():
                 return False
 
-            if rejected_token is not None and self._token and self._token != rejected_token:
+            if (
+                rejected_token is not None
+                and self._token
+                and self._token != rejected_token
+            ):
                 self._logger.info(
                     "Skipping token refresh for %s because another refresh already replaced it",
                     reason,
                 )
                 return True
 
-            self._logger.warning("GenAI token was rejected by upstream (%s); refreshing", reason)
+            self._logger.warning(
+                "GenAI token was rejected by upstream (%s); refreshing", reason
+            )
             try:
                 self._refresh_token(force=True, rejected_token=rejected_token)
             except Exception as exc:
@@ -439,7 +453,8 @@ class TokenManager:
     def _recent_refresh_failure(self) -> bool:
         return (
             self._last_refresh_failure_at > 0
-            and time.time() - self._last_refresh_failure_at < self.REFRESH_FAILURE_RETRY_INTERVAL
+            and time.time() - self._last_refresh_failure_at
+            < self.REFRESH_FAILURE_RETRY_INTERVAL
         )
 
     @property

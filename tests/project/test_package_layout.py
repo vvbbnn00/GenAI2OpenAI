@@ -49,9 +49,7 @@ def test_wiki_is_shipped_in_sdist_but_excluded_from_runtime_artifacts():
     project_root = Path(__file__).resolve().parents[2]
     project = tomllib.loads((project_root / "pyproject.toml").read_text())
 
-    assert "docs" in project["tool"]["hatch"]["build"]["targets"]["sdist"][
-        "include"
-    ]
+    assert "docs" in project["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
     assert project["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == [
         "src/genai_proxy"
     ]

@@ -492,9 +492,7 @@ class ChatStreamingMixin:
                                     buffered_delta["tool_calls"] = tool_calls
                                 if reasoning:
                                     sent_any_chunk = True
-                                    yield make_chunk(
-                                        {"reasoning_content": reasoning}
-                                    )
+                                    yield make_chunk({"reasoning_content": reasoning})
                                 if buffered_delta:
                                     attempt_chunks.append(make_chunk(buffered_delta))
                             else:

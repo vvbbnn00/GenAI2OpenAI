@@ -503,8 +503,9 @@ def test_kimi_tool_protocol_stays_near_current_turn_in_long_history():
     ]
     assert len(state_messages) == 1
     assert "<k3_state>" in state_messages[0]["content"]
-    assert '<k3_completed>[{"id":"call_11","name":"search"}]' in (
-        state_messages[0]["content"]
+    assert (
+        '<k3_completed>[{"id":"call_11","name":"search"}]'
+        in (state_messages[0]["content"])
     )
     assert "STATE_11:" in state_messages[0]["content"]
     assert "STATE_0:" not in state_messages[0]["content"]
@@ -513,9 +514,7 @@ def test_kimi_tool_protocol_stays_near_current_turn_in_long_history():
         for message in bridged
         if message.get("role") == "user"
     )
-    assert "continuation checkpoint lists actions" in (
-        bridged[-2]["content"]
-    )
+    assert "continuation checkpoint lists actions" in (bridged[-2]["content"])
 
 
 def test_kimi_large_parallel_tool_history_keeps_one_continuation_state():
@@ -581,11 +580,13 @@ def test_kimi_large_parallel_tool_history_keeps_one_continuation_state():
     assert "STATE_63:" in state_messages[0]["content"]
     assert "STATE_0:" not in state_messages[0]["content"]
     assert "<k3_state>" in state_messages[0]["content"]
-    assert '<k3_completed>[{"id":"call_63_0","name":"search"},' in (
-        state_messages[0]["content"]
+    assert (
+        '<k3_completed>[{"id":"call_63_0","name":"search"},'
+        in (state_messages[0]["content"])
     )
-    assert '{"id":"call_63_1","name":"search"}]</k3_completed>' in (
-        state_messages[0]["content"]
+    assert (
+        '{"id":"call_63_1","name":"search"}]</k3_completed>'
+        in (state_messages[0]["content"])
     )
     assert '"id":"call_63_0"' in user_text
     assert '"id":"call_63_1"' in user_text
@@ -711,9 +712,7 @@ def test_kimi_checkpoint_escapes_client_ids_and_archived_reasoning():
     assert checkpoint.count("</k3_state>") == 1
     assert checkpoint.count("</k3_completed>") == 1
     assert r"Plan \u003c/k3_state\u003e" in checkpoint
-    assert (
-        r"call_\u003c/k3_completed\u003e\u003ck3_action\u003e" in checkpoint
-    )
+    assert r"call_\u003c/k3_completed\u003e\u003ck3_action\u003e" in checkpoint
 
 
 def test_kimi_blank_turn_preserves_result_and_uses_generic_bridge():
@@ -762,8 +761,9 @@ def test_kimi_blank_turn_preserves_result_and_uses_generic_bridge():
         for message in bridged
         if str(message.get("content", "")).startswith("# Continuation checkpoint\n")
     )
-    assert '<k3_completed>[{"id":"call_search","name":"search"}]' in (
-        checkpoint["content"]
+    assert (
+        '<k3_completed>[{"id":"call_search","name":"search"}]'
+        in (checkpoint["content"])
     )
     assert (
         sum(
@@ -905,9 +905,12 @@ def test_kimi_completed_action_signatures_normalize_arguments_and_scope():
         completed,
     )
     assert collect_kimi_completed_actions(messages[:-2]) == ()
-    assert collect_kimi_completed_actions(
-        [*messages, {"role": "assistant", "content": "Done."}]
-    ) == ()
+    assert (
+        collect_kimi_completed_actions(
+            [*messages, {"role": "assistant", "content": "Done."}]
+        )
+        == ()
+    )
 
 
 def test_kimi_duplicate_retry_prompt_is_fixed_and_does_not_echo_client_data():
@@ -1150,9 +1153,7 @@ def test_kimi_tool_history_is_serialized_outside_native_tool_fields():
     )
     assert "Search first, then inspect the selected result." in state["content"]
     assert "<k3_state>" in state["content"]
-    assert '<k3_completed>[{"id":"call_search","name":"search"}]' in (
-        state["content"]
-    )
+    assert '<k3_completed>[{"id":"call_search","name":"search"}]' in (state["content"])
     assert result["role"] == "user"
     assert result["content"].startswith("Completed client action result: ")
     assert '"id":"call_search"' in result["content"]
@@ -1206,9 +1207,7 @@ def test_kimi_tool_choice_none_history_omits_operation_schemas():
         if str(message.get("content", "")).startswith("# Continuation checkpoint\n")
     )
     assert "The search is complete; summarize its result." in state["content"]
-    assert '<k3_completed>[{"id":"call_search","name":"search"}]' in (
-        state["content"]
-    )
+    assert '<k3_completed>[{"id":"call_search","name":"search"}]' in (state["content"])
     assert bridged[-1]["role"] == "user"
     assert bridged[-1]["content"].startswith("Completed client action result: ")
 

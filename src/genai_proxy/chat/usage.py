@@ -82,6 +82,7 @@ class ChatUsageMixin:
         )
         return prepared.generated_usage
 
+
 def responses_usage(openai_usage: dict | None) -> dict | None:
     if not openai_usage:
         return None

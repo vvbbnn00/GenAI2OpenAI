@@ -391,9 +391,7 @@ def test_responses_replayed_reasoning_stays_with_adjacent_tool_calls():
                 {
                     "id": "rs_1",
                     "type": "reasoning",
-                    "content": [
-                        {"type": "reasoning_text", "text": "Call both tools."}
-                    ],
+                    "content": [{"type": "reasoning_text", "text": "Call both tools."}],
                     "status": "completed",
                 },
                 {
@@ -427,9 +425,10 @@ def test_responses_replayed_reasoning_stays_with_adjacent_tool_calls():
     assistant = context.openai_request["messages"][1]
     assert assistant["role"] == "assistant"
     assert assistant["reasoning_content"] == "Call both tools."
-    assert [
-        tool_call["function"]["name"] for tool_call in assistant["tool_calls"]
-    ] == ["get_weather", "get_forecast"]
+    assert [tool_call["function"]["name"] for tool_call in assistant["tool_calls"]] == [
+        "get_weather",
+        "get_forecast",
+    ]
     assert [
         message["tool_call_id"]
         for message in context.openai_request["messages"]
@@ -463,9 +462,7 @@ def test_responses_replayed_reasoning_falls_back_to_summary_text():
                 {
                     "type": "reasoning",
                     "content": [],
-                    "summary": [
-                        {"type": "summary_text", "text": "Prior plan."}
-                    ],
+                    "summary": [{"type": "summary_text", "text": "Prior plan."}],
                 },
                 {"type": "message", "role": "user", "content": "Continue."},
             ],

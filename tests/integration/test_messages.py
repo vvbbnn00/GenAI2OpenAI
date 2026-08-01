@@ -364,13 +364,9 @@ def test_deepseek_text_parts_reach_upstream_identically(
 
     assert captured
     user_messages = [
-        message
-        for message in captured[0]["messages"]
-        if message.get("role") == "user"
+        message for message in captured[0]["messages"] if message.get("role") == "user"
     ]
-    assert user_messages[-1]["content"] == (
-        "Attached file contents.\nAnswer it."
-    )
+    assert user_messages[-1]["content"] == ("Attached file contents.\nAnswer it.")
     assert "chatGroupId" not in captured[0]
 
 

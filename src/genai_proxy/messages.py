@@ -39,9 +39,7 @@ def _normalize_content(content, *, role, adapter: str):
     has_image = False
     for part in content:
         if not isinstance(part, dict):
-            raise _unsupported_content(
-                "Message content arrays must contain objects"
-            )
+            raise _unsupported_content("Message content arrays must contain objects")
         part_type = part.get("type")
         if part_type == "text":
             text = part.get("text")
@@ -58,9 +56,7 @@ def _normalize_content(content, *, role, adapter: str):
                 f"Unsupported message content part type: {part_type!r}"
             )
         if not adapter_supports_vision(adapter):
-            raise _unsupported_content(
-                "This model accepts only text message content"
-            )
+            raise _unsupported_content("This model accepts only text message content")
         if role != "user":
             raise _invalid_image("Image content is allowed only in user messages")
         _validate_image_source(part)

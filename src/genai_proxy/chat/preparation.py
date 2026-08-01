@@ -62,9 +62,7 @@ class ChatPreparationMixin:
             ),
             supports_vision=adapter_supports_vision(tool_adapter),
             supports_thinking_toggle=tool_adapter in DEEPSEEK_V4_ADAPTERS,
-            transport=(
-                "kimi_web" if tool_adapter == KIMI_K3_ADAPTER else "genai_chat"
-            ),
+            transport=("kimi_web" if tool_adapter == KIMI_K3_ADAPTER else "genai_chat"),
             root_ai_type=str(root_ai_type),
             root_model_name=(model_record or {}).get("rootModelName"),
         )
@@ -416,9 +414,7 @@ def _normalize_messages_for_model_template(
         return messages
 
     normalized = [
-        {**message, "role": "system"}
-        if message.get("role") == "developer"
-        else message
+        {**message, "role": "system"} if message.get("role") == "developer" else message
         for message in messages
     ]
     if family not in {"qwen_3_5", "minimax_m2_7"}:

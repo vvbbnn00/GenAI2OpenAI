@@ -75,10 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--genai-model-cache",
         type=str,
-        default=(
-            os.environ.get("GENAI_MODEL_CACHE")
-            or DEFAULT_MODEL_CACHE_PATH
-        ),
+        default=(os.environ.get("GENAI_MODEL_CACHE") or DEFAULT_MODEL_CACHE_PATH),
         help="Persistent cache file for the last valid GenAI model list",
     )
     parser.add_argument(

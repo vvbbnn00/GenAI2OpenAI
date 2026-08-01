@@ -180,10 +180,7 @@ def extract_kimi_tool_calls(
 def extract_kimi_final_response(content) -> tuple[bool, str | None]:
     if not isinstance(content, str):
         return False, content
-    if (
-        content.count(KIMI_FINAL_OPEN) != 1
-        or content.count(KIMI_FINAL_CLOSE) != 1
-    ):
+    if content.count(KIMI_FINAL_OPEN) != 1 or content.count(KIMI_FINAL_CLOSE) != 1:
         return False, content
 
     start = content.find(KIMI_FINAL_OPEN)
@@ -442,8 +439,7 @@ def _completed_action_checkpoint(
     completed_actions: tuple[tuple[str, str, str], ...],
 ) -> list[dict]:
     return [
-        {"id": call_id, "name": name}
-        for call_id, name, _arguments in completed_actions
+        {"id": call_id, "name": name} for call_id, name, _arguments in completed_actions
     ]
 
 
@@ -664,9 +660,7 @@ def _parse_kimi_call(call: str, tools):
         key = argument_attrs.get("key")
         if not key or key in arguments:
             return None
-        value = _parse_xtml_value(
-            match.group("value"), argument_attrs.get("type")
-        )
+        value = _parse_xtml_value(match.group("value"), argument_attrs.get("type"))
         if value is _INVALID_XTML_VALUE:
             return None
         arguments[key] = value
@@ -714,8 +708,7 @@ def _parse_xtml_value(value: str, value_type: str | None):
     expected_type = {
         "boolean": lambda item: isinstance(item, bool),
         "bool": lambda item: isinstance(item, bool),
-        "integer": lambda item: isinstance(item, int)
-        and not isinstance(item, bool),
+        "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
         "number": lambda item: isinstance(item, (int, float))
         and not isinstance(item, bool),
         "object": lambda item: isinstance(item, dict),

@@ -1849,9 +1849,7 @@ def test_kimi_repeated_completed_action_is_withheld_before_next_action():
         )
 
     events = [
-        json.loads(line[6:])
-        for line in body.splitlines()
-        if line.startswith("data: {")
+        json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: {")
     ]
     deltas = [
         choice.get("delta", {})
@@ -1859,17 +1857,13 @@ def test_kimi_repeated_completed_action_is_withheld_before_next_action():
         for choice in event.get("choices", [])
     ]
     reasoning_indexes = [
-        index
-        for index, delta in enumerate(deltas)
-        if delta.get("reasoning_content")
+        index for index, delta in enumerate(deltas) if delta.get("reasoning_content")
     ]
     tool_indexes = [
         index for index, delta in enumerate(deltas) if delta.get("tool_calls")
     ]
     tool_calls = [
-        tool_call
-        for delta in deltas
-        for tool_call in delta.get("tool_calls", [])
+        tool_call for delta in deltas for tool_call in delta.get("tool_calls", [])
     ]
 
     assert post.call_count == 2
@@ -1890,15 +1884,7 @@ def test_kimi_held_continuation_reasoning_keeps_network_retry_safe():
     class InterruptedReasoning(FakeResponse):
         def iter_lines(self, *args, **kwargs):
             yield json.dumps(
-                {
-                    "choices": [
-                        {
-                            "delta": {
-                                "reasoning_content": "INTERRUPTED_REASONING"
-                            }
-                        }
-                    ]
-                }
+                {"choices": [{"delta": {"reasoning_content": "INTERRUPTED_REASONING"}}]}
             ).encode()
             raise requests.ConnectionError("stream interrupted")
 
@@ -1954,8 +1940,7 @@ def test_kimi_same_tool_with_different_arguments_is_not_withheld():
 
 def test_kimi_persistent_completed_action_repeat_is_bounded_and_released():
     raw_content = (
-        '<k3_action>{"name":"get_stage_one",'
-        '"arguments":{"marker":"alpha"}}</k3_action>'
+        '<k3_action>{"name":"get_stage_one","arguments":{"marker":"alpha"}}</k3_action>'
     )
     attempts = [
         fake_completion(
@@ -2491,11 +2476,13 @@ def test_kimi_tool_history_sends_only_latest_reasoning_as_continuation_state():
         in state_messages[0]["content"]
     )
     assert "<k3_state>" in state_messages[0]["content"]
-    assert '<k3_completed>[{"id":"call_src","name":"inspect"},' in (
-        state_messages[0]["content"]
+    assert (
+        '<k3_completed>[{"id":"call_src","name":"inspect"},'
+        in (state_messages[0]["content"])
     )
-    assert '{"id":"call_tests","name":"inspect"}]</k3_completed>' in (
-        state_messages[0]["content"]
+    assert (
+        '{"id":"call_tests","name":"inspect"}]</k3_completed>'
+        in (state_messages[0]["content"])
     )
     assert "STALE_PLAN" not in json.dumps(
         upstream_payload["messages"],

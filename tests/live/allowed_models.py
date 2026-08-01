@@ -239,8 +239,7 @@ class LiveTransportAudit:
             for observation in observations
         ), f"vision request reached the wrong upstream model: {observations}"
         assert all(observation["image_count"] == 1 for observation in observations), (
-            "vision request did not carry exactly one image: "
-            f"{observations}"
+            f"vision request did not carry exactly one image: {observations}"
         )
         if model.casefold() == "kimi-k3":
             assert all(
@@ -279,9 +278,7 @@ class LiveTransportAudit:
 
             messages = payload.get("messages") or []
             max_prefixes = (
-                _deepseek_max_prefixes()
-                if model.casefold() in DEEPSEEK_MODELS
-                else ()
+                _deepseek_max_prefixes() if model.casefold() in DEEPSEEK_MODELS else ()
             )
             has_max_prefix = any(
                 isinstance(message, dict)
@@ -358,9 +355,7 @@ def _safe_image_transport_metadata(payload, messages):
             width if isinstance(width, int) and not isinstance(width, bool) else None
         ),
         "image_height": (
-            height
-            if isinstance(height, int) and not isinstance(height, bool)
-            else None
+            height if isinstance(height, int) and not isinstance(height, bool) else None
         ),
     }
 
@@ -1588,8 +1583,7 @@ _RED_VISION_PATTERN = re.compile(_RED_VISION_SOURCE, re.IGNORECASE)
 _NON_AFFIRMATIVE_RED_PATTERN = re.compile(
     r"\b(?:cannot|can't|unable|unclear|unknown|uncertain)\b|"
     r"\b(?:(?:is|looks|appears|seems)\s+not|isn't|isnt|not|no)\s+"
-    r"(?:(?:predominantly|mainly|mostly|primarily|really)\s+)?"
-    + _RED_VISION_SOURCE,
+    r"(?:(?:predominantly|mainly|mostly|primarily|really)\s+)?" + _RED_VISION_SOURCE,
     re.IGNORECASE,
 )
 

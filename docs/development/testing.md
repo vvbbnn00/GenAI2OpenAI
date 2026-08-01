@@ -15,11 +15,16 @@ uv run pytest -q
 常用静态检查：
 
 ```bash
+UV_CACHE_DIR=/tmp/genai2openai-uv-cache uv run ruff check .
+UV_CACHE_DIR=/tmp/genai2openai-uv-cache uv run ruff format --check .
 UV_CACHE_DIR=/tmp/genai2openai-uv-cache uv run python -m compileall -q src tests
 UV_CACHE_DIR=/tmp/genai2openai-uv-cache uv lock --check
 docker compose config --quiet
 git diff --check
 ```
+
+修改 Python 文件后，可用 `uv run ruff format .` 统一格式。格式化只处理排版，功能变化
+仍应单独修改、测试和 review。
 
 构建产物检查：
 

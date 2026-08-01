@@ -191,9 +191,7 @@ def test_live_case_deadline_preserves_an_outer_deadline_without_extending_it():
             with live_case_deadline(0.03):
                 time.sleep(0.2)
 
-        restored_remaining, restored_interval = signal.getitimer(
-            signal.ITIMER_REAL
-        )
+        restored_remaining, restored_interval = signal.getitimer(signal.ITIMER_REAL)
         assert signal.getsignal(signal.SIGALRM) is outer_handler
         assert restored_remaining < outer_remaining - 0.015
         assert restored_interval == outer_interval
@@ -208,9 +206,7 @@ def test_optional_responses_reasoning_must_match_streamed_deltas():
         "output": [
             {
                 "type": "reasoning",
-                "content": [
-                    {"type": "reasoning_text", "text": "think again"}
-                ],
+                "content": [{"type": "reasoning_text", "text": "think again"}],
             }
         ]
     }

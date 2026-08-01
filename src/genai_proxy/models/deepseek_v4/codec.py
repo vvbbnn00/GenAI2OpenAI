@@ -35,9 +35,7 @@ DEEPSEEK_V4_FLASH_SPEC = TokenizerSpec(
 
 def official_tool_prompt(spec: TokenizerSpec, function_tools: list[dict]) -> str:
     encoder = load_python_encoder(spec)
-    return encoder["render_tools"](
-        encoder["tools_from_openai_format"](function_tools)
-    )
+    return encoder["render_tools"](encoder["tools_from_openai_format"](function_tools))
 
 
 def official_reasoning_prefix(spec: TokenizerSpec, effort: str | None) -> str:

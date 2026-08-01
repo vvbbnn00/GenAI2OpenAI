@@ -63,7 +63,9 @@ def build_tokenizer(path):
     mergeable_ranks = load_tiktoken_bpe(str(path))
     base_tokens = len(mergeable_ranks)
     special_tokens = {
-        SPECIAL_TOKEN_OVERRIDES.get(token_id, f"<|reserved_token_{token_id}|>"): token_id
+        SPECIAL_TOKEN_OVERRIDES.get(
+            token_id, f"<|reserved_token_{token_id}|>"
+        ): token_id
         for token_id in range(base_tokens, base_tokens + 256)
     }
     return tiktoken.Encoding(

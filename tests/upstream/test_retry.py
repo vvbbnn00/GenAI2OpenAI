@@ -191,9 +191,7 @@ class GenAIRetryTests(unittest.TestCase):
                         success,
                     ],
                 ) as post:
-                    chunks = list(
-                        service.stream_openai_completion(make_request(model))
-                    )
+                    chunks = list(service.stream_openai_completion(make_request(model)))
 
                 self.assertEqual(GENAI_DEEPSEEK_STREAM_TIMEOUT, (10, 60))
                 self.assertEqual(GENAI_DEEPSEEK_TIMEOUT_MAX_RETRIES, 2)
@@ -221,11 +219,7 @@ class GenAIRetryTests(unittest.TestCase):
             side_effect=requests.ReadTimeout("upstream stalled"),
         ) as post:
             with self.assertRaises(ProxyError) as raised:
-                list(
-                    service.stream_openai_completion(
-                        make_request("deepseek-chat")
-                    )
-                )
+                list(service.stream_openai_completion(make_request("deepseek-chat")))
 
         self.assertEqual(post.call_count, 3)
         self.assertEqual(
@@ -241,11 +235,7 @@ class GenAIRetryTests(unittest.TestCase):
             side_effect=requests.ConnectTimeout("connect timed out"),
         ) as post:
             with self.assertRaises(ProxyError):
-                list(
-                    service.stream_openai_completion(
-                        make_request("deepseek-chat")
-                    )
-                )
+                list(service.stream_openai_completion(make_request("deepseek-chat")))
 
         self.assertEqual(post.call_count, 2)
         self.assertTrue(
