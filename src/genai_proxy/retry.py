@@ -5,7 +5,7 @@ from genai_proxy.errors import ProxyError
 DEFAULT_MAX_RETRIES = 10
 DEFAULT_RETRY_BACKOFF = 0.5
 MAX_RETRY_DELAY = 5.0
-OPAQUE_BUSINESS_ERROR_MAX_RETRIES = 1
+BUSINESS_ERROR_500_MAX_RETRIES = 1
 
 RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 TRANSIENT_UPSTREAM_ERROR_CODE = "upstream_transient_error"
@@ -22,28 +22,6 @@ NON_RETRYABLE_BUSINESS_ERROR_MARKERS = (
     "unsupported model",
     "invalid parameter",
     "invalid request",
-)
-TRANSIENT_BUSINESS_ERROR_MARKERS = (
-    "temporary",
-    "temporarily",
-    "transient",
-    "try again",
-    "please retry",
-    "retry later",
-    "retryable",
-    "busy",
-    "overloaded",
-    "timeout",
-    "timed out",
-    "service unavailable",
-    "gateway timeout",
-    "暂时",
-    "临时",
-    "稍后重试",
-    "请重试",
-    "繁忙",
-    "超时",
-    "服务不可用",
 )
 
 
@@ -83,9 +61,7 @@ def business_error_retry_limit(
         marker in normalized_message for marker in NON_RETRYABLE_BUSINESS_ERROR_MARKERS
     ):
         return 0
-    if any(marker in normalized_message for marker in TRANSIENT_BUSINESS_ERROR_MARKERS):
-        return retry_limit
-    return min(retry_limit, OPAQUE_BUSINESS_ERROR_MAX_RETRIES)
+    return min(retry_limit, BUSINESS_ERROR_500_MAX_RETRIES)
 
 
 def schedule_retry(

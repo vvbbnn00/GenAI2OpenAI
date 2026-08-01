@@ -19,7 +19,7 @@ from genai_proxy.chat.streaming import (
 from genai_proxy.config import parse_args
 from genai_proxy.errors import ProxyError
 from genai_proxy.retry import (
-    OPAQUE_BUSINESS_ERROR_MAX_RETRIES,
+    BUSINESS_ERROR_500_MAX_RETRIES,
     TRANSIENT_UPSTREAM_ERROR_CODE,
     business_error_retry_limit,
     is_retryable_business_error,
@@ -130,13 +130,13 @@ class GenAIRetryTests(unittest.TestCase):
         self.assertFalse(is_retryable_business_error(500, "Invalid request parameters"))
         self.assertTrue(is_retryable_business_error(502, "bad gateway"))
 
-    def test_business_error_retry_limit_distinguishes_opaque_and_transient_500s(self):
-        self.assertEqual(OPAQUE_BUSINESS_ERROR_MAX_RETRIES, 1)
+    def test_business_error_retry_limit_caps_generic_500s(self):
+        self.assertEqual(BUSINESS_ERROR_500_MAX_RETRIES, 1)
         self.assertEqual(business_error_retry_limit(500, "", 10), 1)
         self.assertEqual(business_error_retry_limit(500, "internal error", 10), 1)
         self.assertEqual(
             business_error_retry_limit(500, "temporary upstream failure", 10),
-            10,
+            1,
         )
         self.assertEqual(business_error_retry_limit(500, "模型不存在", 10), 0)
         self.assertEqual(business_error_retry_limit(502, "bad gateway", 10), 10)
@@ -447,7 +447,7 @@ class GenAIRetryTests(unittest.TestCase):
         self.assertEqual(post.call_count, 2)
         self.assertTrue(any('"content": "ok"' in chunk for chunk in chunks))
 
-    def test_explicit_transient_business_error_uses_configured_retry_budget(self):
+    def test_non_500_transient_business_error_uses_configured_retry_budget(self):
         service = make_service(max_retries=3)
 
         def business_error():
@@ -458,7 +458,7 @@ class GenAIRetryTests(unittest.TestCase):
                         + json.dumps(
                             {
                                 "success": False,
-                                "code": 500,
+                                "code": 503,
                                 "message": "service temporarily busy; try again",
                             }
                         )
@@ -476,34 +476,39 @@ class GenAIRetryTests(unittest.TestCase):
         self.assertEqual(post.call_count, 4)
         self.assertTrue(any('"content": "ok"' in chunk for chunk in chunks))
 
-    def test_opaque_business_error_is_replayed_only_once(self):
-        service = make_service(max_retries=10)
+    def test_business_500_is_replayed_only_once_regardless_of_message(self):
+        for message in ("internal error", "service temporarily busy; try again"):
+            with self.subTest(message=message):
+                service = make_service(max_retries=10)
 
-        def business_error():
-            return FakeResponse(
-                [
-                    (
-                        "data: "
-                        + json.dumps(
-                            {
-                                "success": False,
-                                "code": 500,
-                                "message": "internal error",
-                            }
-                        )
-                    ).encode()
-                ]
-            )
+                def business_error():
+                    return FakeResponse(
+                        [
+                            (
+                                "data: "
+                                + json.dumps(
+                                    {
+                                        "success": False,
+                                        "code": 500,
+                                        "message": message,
+                                    }
+                                )
+                            ).encode()
+                        ]
+                    )
 
-        with patch(
-            "genai_proxy.upstream.transport.requests.post",
-            side_effect=[business_error(), business_error()],
-        ) as post:
-            with self.assertRaises(ProxyError) as raised:
-                list(service.stream_openai_completion(make_request()))
+                with patch(
+                    "genai_proxy.upstream.transport.requests.post",
+                    side_effect=[business_error(), business_error()],
+                ) as post:
+                    with self.assertRaises(ProxyError) as raised:
+                        list(service.stream_openai_completion(make_request()))
 
-        self.assertEqual(post.call_count, 2)
-        self.assertEqual(raised.exception.message, "Upstream error: internal error")
+                self.assertEqual(post.call_count, 2)
+                self.assertEqual(
+                    raised.exception.message,
+                    f"Upstream error: {message}",
+                )
 
     def test_does_not_retry_permanent_business_error_from_stream(self):
         for message in ("模型不存在", "未找到对应节点信息，请重新设置"):

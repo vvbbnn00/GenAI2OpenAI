@@ -427,14 +427,15 @@ class ChatStreamingMixin:
                             or "Unknown upstream error"
                         )
                         err_code = genai_json.get("code", 500)
-                        self._logger.warning(
-                            "GenAI business error (code=%s)",
-                            safe_log_code(err_code),
-                        )
                         retry_limit = business_error_retry_limit(
                             err_code,
                             err_msg,
                             self._max_retries,
+                        )
+                        self._logger.warning(
+                            "GenAI business error (code=%s, retry_limit=%d)",
+                            safe_log_code(err_code),
+                            retry_limit,
                         )
                         if self._schedule_chat_retry(
                             network_retry_count,
